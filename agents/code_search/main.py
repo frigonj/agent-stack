@@ -95,7 +95,7 @@ class CodeSearchAgent(BaseAgent):
 
         # Analyze via LLM
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=f"Code snippets:\n{snippets[:8000]}\n\nTask: {task}"),
         ]
         response = await self.llm.ainvoke(messages)

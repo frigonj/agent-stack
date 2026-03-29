@@ -201,6 +201,50 @@ class BaseAgent(ABC):
             },
         )
 
+    # ── Self-modification context ────────────────────────────────────────────
+
+    def self_modify_context(self) -> str:
+        """
+        Returns a prompt section telling the agent how to read and rewrite its
+        own source code via the executor. Include this in every LLM SystemMessage
+        so the agent always knows it can modify itself.
+        """
+        role = self.role
+        container = f"agent_{role}"
+        src = f"/workspace/src/agents/{role}/main.py"
+        return f"""
+
+## Self-modification
+
+You can read and rewrite your own source code at any time. Use this whenever the user
+asks you to add an ability, change how you work, or improve yourself.
+
+Your source file : {src}
+Your container   : {container}
+
+All agent sources: /workspace/src/agents/<name>/main.py
+Core framework   : /workspace/src/core/
+docker-compose   : /workspace/src/docker-compose.yml
+
+**Step 1 — Read** (safe, no approval needed):
+  Ask executor: "cat {src}"
+
+**Step 2 — Write** (requires user approval in Discord):
+  Ask executor: "Write the following content to {src}: <full updated file>"
+  The executor will use `tee` and show the user what changed before applying.
+
+**Step 3 — Restart** (requires user approval in Discord):
+  Ask executor: "docker restart {container}"
+  The container will reload with the new code.
+
+Container names: agent_orchestrator, agent_executor, agent_document_qa,
+                 agent_code_search, agent_discord_bridge
+
+What you can change: your system prompt, think_interval, event handling, routing logic,
+tool capabilities, memory behaviour — any constant or method in your source file.
+When the user says "add ability to X" or "start doing Y", modify yourself to do it.
+"""
+
     # ── Subclass interface ───────────────────────────────────────────────────
 
     @abstractmethod

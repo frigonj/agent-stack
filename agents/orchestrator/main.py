@@ -66,10 +66,40 @@ and are the sole point of contact between the user (via Discord) and the agent p
   conversational questions, anything you can answer without specialist help.
   This is the HIGHEST PRIORITY path — prefer it whenever possible.
 
+## Self-modification
+
+You can modify your own code, routing logic, system prompt, or any other agent's code at any time.
+This is a first-class capability — use it whenever the user asks you to change how you work.
+
+Your source file: /workspace/src/agents/orchestrator/main.py
+All agent sources:  /workspace/src/agents/<name>/main.py
+Core framework:     /workspace/src/core/
+
+**Workflow for modifying yourself:**
+1. Read current file:
+     task: "cat /workspace/src/agents/orchestrator/main.py"  → agent: executor
+2. Write the modified version (requires user approval in Discord):
+     task: "tee /workspace/src/agents/orchestrator/main.py with this content: <new content>"  → agent: executor
+3. Restart yourself (requires user approval in Discord):
+     task: "docker restart agent_orchestrator"  → agent: executor
+
+**What you can change:**
+- SYSTEM_PROMPT — add new abilities, change how you reason, add new routing rules
+- think_interval — how often you proactively think (currently 120 seconds)
+- SPECIALIST_ROLES — which agents you consider specialists
+- _route_task / _run_task logic — how tasks are planned and dispatched
+- Any behaviour in any agent file
+
+When the user says "add ability to X" or "change how you Y":
+1. Read your own source first so you know exactly what to modify
+2. Generate the full modified file
+3. Submit it via executor (approval gate will show the user the change before applying)
+4. Request restart after approval
+
 ## Parallel execution
 
 Break tasks into 1–4 independent subtasks. Return your plan as JSON only — no markdown:
-{"subtasks": [{"task": "...", "agent": "executor|document_qa|code_search|direct"}]}
+{"subtasks": [{"task": "...", "agent": "executor|document_qa|code_search|discord|direct"}]}
 
 Use agent="direct" for:
   - Greetings and social messages ("hello", "good morning")
@@ -166,7 +196,7 @@ class OrchestratorAgent(BaseAgent):
 
         # Generate a structured parallel plan
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=(
                 f"Task: {task}{context}\n\n"
                 "Return your subtask plan as JSON only — no markdown, no explanation:\n"
@@ -268,7 +298,7 @@ class OrchestratorAgent(BaseAgent):
             "Long-term memory: PostgreSQL + pgvector. Short-term memory: Redis Streams."
         )
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=(
                 f"Task (answer directly): {task}\n"
                 f"Agent status: {agent_status}"
@@ -398,7 +428,7 @@ class OrchestratorAgent(BaseAgent):
             f"[{source}]: {result}" for source, result in raw_results
         )
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=(
                 f"Original task: {original_task}{context}\n\n"
                 f"Information gathered:\n{combined}\n\n"
@@ -450,7 +480,7 @@ class OrchestratorAgent(BaseAgent):
         )
 
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=(
                 f"Recent context from long-term memory:\n{context}\n\n"
                 "Is there something I should proactively work on right now?\n"

@@ -80,7 +80,7 @@ class DocumentQAAgent(BaseAgent):
 
         # Answer via LLM
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
             HumanMessage(content=f"Document content:\n{doc_content[:8000]}\n\nQuestion: {task}"),
         ]
         response = await self.llm.ainvoke(messages)
