@@ -1,0 +1,177 @@
+services:
+  # ─── Redis Streams (short-term memory / event broker) ───────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: agent_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── PostgreSQL + pgvector (long-term memory) ────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=agent
+      - POSTGRES_PASSWORD=agent
+      - POSTGRES_DB=agentmem
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentmem"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ─── Orchestrator Agent ──────────────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: orchestrator
+    container_name: agent_orchestrator
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=orchestrator
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./agents/orchestrator:/app/agent
+      - ./core:/app/core
+      - agent_workspace:/workspace
+      - model_cache:/root/.cache/torch
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Document Q&A Agent ──────────────────────────────────────────────────────
+  document_qa:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: document_qa
+    container_name: agent_document_qa
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=document_qa
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DOCS_PATH=/workspace/docs
+    volumes:
+      - ./agents/document_qa:/app/agent
+      - ./core:/app/core
+      - agent_workspace:/workspace
+      - model_cache:/root/.cache/torch
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Code Search Agent ───────────────────────────────────────────────────────
+  code_search:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: code_search
+    container_name: agent_code_search
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=code_search
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REPO_PATH=/workspace/repos
+    volumes:
+      - ./agents/code_search:/app/agent
+      - ./core:/app/core
+      - agent_workspace:/workspace
+      - model_cache:/root/.cache/torch
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Discord Bridge ──────────────────────────────────────────────────────────
+  discord_bridge:
+    build:
+      context: .
+      dockerfile: docker/bridge.Dockerfile
+    container_name: agent_discord_bridge
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+  # ─── Tool Executor Agent ─────────────────────────────────────────────────────
+  executor:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: executor
+    container_name: agent_executor
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=executor
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./agents/executor:/app/agent
+      - ./core:/app/core
+      - agent_workspace:/workspace
+      - model_cache:/root/.cache/torch
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis_data:
+  postgres_data:
+  agent_workspace:
+  model_cache:

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+coverage.xml
+.coverage
+
+# Environment
+.env
+
+# Emrys local persistence (don't version agent memory)
+.persist/
+
+# Emrys source (cloned at setup time, not versioned)
+emrys-src/
+
+# Workspace data (mounted volumes — not versioned)
+workspace/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

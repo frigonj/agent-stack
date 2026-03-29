@@ -1,0 +1,35 @@
+# Agent orchestration
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-openai>=0.1.0       # Used for LM Studio OpenAI-compat API
+
+# Event streaming (short-term memory)
+redis>=5.0.0
+
+# Long-term memory (install from source — not yet on PyPI)
+# emrys[vectors] is installed separately via scripts/setup.sh
+
+# Long-term memory (PostgreSQL + pgvector)
+psycopg[async]>=3.1.0
+psycopg_pool>=3.1.0
+pgvector>=0.3.0
+
+# Discord bridge
+discord.py>=2.3.0
+
+# HTTP + async
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Config + env
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Observability
+structlog>=24.0.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=5.0.0
