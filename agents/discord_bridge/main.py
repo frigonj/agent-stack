@@ -51,6 +51,7 @@ VISIBLE_EVENTS = {
     "approval.required",
     "system.error",
     "agent.response",
+    "discord.action",
 }
 
 
@@ -115,10 +116,11 @@ class DiscordBridgeClient(discord.Client):
     tasks in discord.py 2.x — it runs before the bot starts processing events.
     """
 
-    def __init__(self, redis_url: str, task_channel_id: str, **kwargs):
+    def __init__(self, redis_url: str, task_channel_id: str, guild_id: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self.redis_url = redis_url
         self.task_channel_id = task_channel_id
+        self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
         # task_id → (channel_id, message_id) for ⏳→✅ reaction update
         self._pending_messages: dict[str, tuple[int, int]] = {}
@@ -140,6 +142,10 @@ class DiscordBridgeClient(discord.Client):
                 channel_name=channel.name,
                 guild=channel.guild.name,
             )
+            # Auto-detect guild_id from the task channel if not explicitly set
+            if not self.guild_id and hasattr(channel, "guild"):
+                self.guild_id = channel.guild.id
+                log.info("discord_bridge.guild_detected", guild_id=self.guild_id, guild=channel.guild.name)
         except Exception as exc:
             log.error(
                 "discord_bridge.channel_fetch_failed",
@@ -292,6 +298,123 @@ class DiscordBridgeClient(discord.Client):
             )
             await channel.send(embed=embed)
 
+        elif event_type == "discord.action":
+            await self._execute_discord_action(payload, data.get("event_id", ""))
+
+    async def _execute_discord_action(self, payload: dict, event_id: str) -> None:
+        """
+        Execute a Discord API action on behalf of an agent.
+
+        Supported actions (payload["action"]):
+          send_message     — send text/embed to a channel
+          create_channel   — create a text channel in the guild
+          delete_channel   — delete a channel by id or name
+          rename_channel   — rename a channel
+          set_topic        — set channel topic
+          create_category  — create a category
+          pin_message      — pin a message in a channel
+          list_channels    — reply with a list of guild channels
+        """
+        action  = payload.get("action", "")
+        task_id = payload.get("task_id", "")
+
+        async def _ack(result: str, ok: bool = True) -> None:
+            await self.redis.xadd(
+                "agents:broadcast",
+                {
+                    "event_id":  str(uuid.uuid4()),
+                    "type":      "discord.action.done",
+                    "source":    "discord_bridge",
+                    "task_id":   task_id,
+                    "timestamp": str(time.time()),
+                    "payload":   json.dumps({
+                        "action": action, "result": result, "ok": ok,
+                        "triggering_event_id": event_id,
+                    }),
+                },
+                maxlen=10_000,
+                approximate=True,
+            )
+            log.info("discord_bridge.action_done", action=action, ok=ok, result=result[:100])
+
+        guild = self.get_guild(self.guild_id) if self.guild_id else None
+        if not guild and action not in ("send_message",):
+            await _ack("Guild not found — set DISCORD_GUILD_ID in .env", ok=False)
+            return
+
+        try:
+            if action == "send_message":
+                ch_id  = payload.get("channel_id") or self.task_channel_id
+                text   = payload.get("content", "")
+                ch = await self.fetch_channel(int(ch_id))
+                await ch.send(text[:2000])
+                await _ack(f"Message sent to <#{ch_id}>")
+
+            elif action == "create_channel":
+                name      = payload.get("name", "new-channel")
+                topic     = payload.get("topic", "")
+                category_name = payload.get("category")
+                category  = None
+                if category_name:
+                    category = discord.utils.get(guild.categories, name=category_name)
+                ch = await guild.create_text_channel(name=name, topic=topic, category=category)
+                await _ack(f"Created #{ch.name} (id={ch.id})")
+
+            elif action == "delete_channel":
+                ch_id  = payload.get("channel_id")
+                ch_name = payload.get("name")
+                if ch_id:
+                    ch = await self.fetch_channel(int(ch_id))
+                elif ch_name:
+                    ch = discord.utils.get(guild.text_channels, name=ch_name)
+                else:
+                    await _ack("Provide channel_id or name", ok=False)
+                    return
+                if not ch:
+                    await _ack("Channel not found", ok=False)
+                    return
+                await ch.delete(reason=payload.get("reason", "Deleted by agent"))
+                await _ack(f"Deleted #{ch.name}")
+
+            elif action == "rename_channel":
+                ch_id  = payload.get("channel_id")
+                new_name = payload.get("name", "")
+                ch = await self.fetch_channel(int(ch_id))
+                old = ch.name
+                await ch.edit(name=new_name)
+                await _ack(f"Renamed #{old} → #{new_name}")
+
+            elif action == "set_topic":
+                ch_id  = payload.get("channel_id")
+                topic  = payload.get("topic", "")
+                ch = await self.fetch_channel(int(ch_id))
+                await ch.edit(topic=topic)
+                await _ack(f"Topic set on #{ch.name}")
+
+            elif action == "create_category":
+                name = payload.get("name", "New Category")
+                cat  = await guild.create_category(name=name)
+                await _ack(f"Created category '{cat.name}' (id={cat.id})")
+
+            elif action == "pin_message":
+                ch_id  = payload.get("channel_id")
+                msg_id = payload.get("message_id")
+                ch  = await self.fetch_channel(int(ch_id))
+                msg = await ch.fetch_message(int(msg_id))
+                await msg.pin()
+                await _ack(f"Pinned message {msg_id} in #{ch.name}")
+
+            elif action == "list_channels":
+                lines = [f"#{ch.name} (id={ch.id})" for ch in guild.text_channels]
+                await _ack("Channels:\n" + "\n".join(lines))
+
+            else:
+                await _ack(f"Unknown action: {action}", ok=False)
+
+        except Exception as exc:
+            log.error("discord_bridge.action_error", action=action, error=str(exc))
+            await _ack(f"Error: {exc}", ok=False)
+
     async def _post_approval(
         self, payload: dict, channel, source: str, icon: str
     ) -> None:
@@ -319,6 +442,7 @@ def main() -> None:
     redis_url        = os.environ["REDIS_URL"]
     bot_token        = os.environ["DISCORD_BOT_TOKEN"]
     task_channel_id  = os.environ["DISCORD_TASK_CHANNEL_ID"]
+    guild_id         = os.environ.get("DISCORD_GUILD_ID")  # Optional — auto-detected if absent
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -328,6 +452,7 @@ def main() -> None:
     client = DiscordBridgeClient(
         redis_url=redis_url,
         task_channel_id=task_channel_id,
+        guild_id=guild_id,
         intents=intents,
     )
 

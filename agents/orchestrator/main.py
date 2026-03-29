@@ -41,7 +41,26 @@ and are the sole point of contact between the user (via Discord) and the agent p
   (git, pip, curl, python, tee, docker) require Discord approval before running.
   Source files are at /workspace/src/. Docker containers can be restarted via
   `docker restart <container_name>`.
+  Mounted directories accessible to executor:
+    /workspace/src/      — agent stack source (read-write, self-modification)
+    /workspace/docs/     — document workspace
+    /workspace/repos/    — code repositories
+    /workspace/user/     — user's home directory (C:\\Users\\frigo)
+    /workspace/projects/ — user's coding projects (C:\\Users\\frigo\\Documents\\Coding Projects)
   Use for: file operations, running scripts, self-modification, service restarts.
+
+- **discord**: send a discord.action event to manage the Discord server directly.
+  The bot has FULL permissions on the server. You can:
+    create_channel   — create a text channel (payload: name, topic, category)
+    delete_channel   — delete a channel (payload: channel_id or name, reason)
+    rename_channel   — rename a channel (payload: channel_id, name)
+    set_topic        — set channel topic (payload: channel_id, topic)
+    create_category  — create a category (payload: name)
+    send_message     — send a message to any channel (payload: channel_id, content)
+    pin_message      — pin a message (payload: channel_id, message_id)
+    list_channels    — get a list of all channels
+  Emit an event of type discord.action with the action and payload fields.
+  You DO NOT need user approval to perform Discord actions — the bot is already authorised.
 
 - **direct**: YOU answer this yourself, right now. Use for: greetings, status checks,
   conversational questions, anything you can answer without specialist help.
@@ -174,13 +193,23 @@ class OrchestratorAgent(BaseAgent):
 
         log.info("orchestrator.plan", subtask_count=len(subtasks), task_id=task_id)
 
-        # Check if all subtasks are "direct" — handle entirely here
+        # Separate by agent type
         direct_subtasks = [s for s in subtasks if s.get("agent") == "direct"]
-        specialist_subtasks = [s for s in subtasks if s.get("agent") != "direct"]
+        discord_subtasks = [s for s in subtasks if s.get("agent") == "discord"]
+        specialist_subtasks = [
+            s for s in subtasks if s.get("agent") not in ("direct", "discord")
+        ]
+
+        # Execute Discord actions immediately (no approval needed — bot is pre-authorised)
+        for ds in discord_subtasks:
+            await self._execute_discord_subtask(ds["task"], task_id)
 
         if not specialist_subtasks:
-            # Pure direct answer — no specialist delegation needed
-            await self._answer_directly(task, task_id, context, discord_message_id)
+            # Pure direct/discord answer — no specialist delegation needed
+            if direct_subtasks or discord_subtasks:
+                await self._answer_directly(task, task_id, context, discord_message_id)
+            else:
+                await self._answer_directly(task, task_id, context, discord_message_id)
             return
 
         # Dispatch specialist subtasks
@@ -189,6 +218,40 @@ class OrchestratorAgent(BaseAgent):
             direct_tasks=direct_subtasks,
             discord_message_id=discord_message_id,
         )
+
+    # ── Discord action dispatch ───────────────────────────────────────────────
+
+    async def _execute_discord_subtask(self, task: str, task_id: str) -> None:
+        """
+        Ask the LLM to convert a natural-language Discord task into a structured
+        discord.action payload, then emit it to the bridge.
+        """
+        messages = [
+            SystemMessage(content=(
+                "You translate natural-language Discord management requests into JSON.\n"
+                "Respond with ONLY a JSON object — no markdown, no explanation.\n"
+                "Valid actions: send_message, create_channel, delete_channel, rename_channel, "
+                "set_topic, create_category, pin_message, list_channels\n"
+                "Example: {\"action\": \"create_channel\", \"name\": \"general\", \"topic\": \"Chat\"}"
+            )),
+            HumanMessage(content=f"Discord task: {task}"),
+        ]
+        response = await self.llm.ainvoke(messages)
+        raw = response.content.strip().lstrip("```json").rstrip("```").strip()
+
+        try:
+            action_payload = json.loads(raw)
+        except Exception:
+            log.warning("orchestrator.discord_action_parse_failed", raw=raw[:200])
+            return
+
+        action_payload["task_id"] = task_id
+        await self.emit(
+            EventType.DISCORD_ACTION,
+            payload=action_payload,
+            target="broadcast",
+        )
+        log.info("orchestrator.discord_action_emitted", action=action_payload.get("action"))
 
     # ── Direct answer ────────────────────────────────────────────────────────
 

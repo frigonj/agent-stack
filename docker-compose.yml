@@ -62,7 +62,8 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
-      - .:/workspace/src:ro          # read-only source visibility for self-awareness
+      - .:/workspace/src:ro                                              # read-only source visibility
+      - C:/Users/frigo/Documents/Coding Projects:/workspace/projects:ro # coding projects (read-only)
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -142,6 +143,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
 
   # ─── Tool Executor Agent ─────────────────────────────────────────────────────
@@ -170,8 +172,10 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
-      - .:/workspace/src          # read-write: executor can modify agent source files
+      - .:/workspace/src                           # read-write: executor can modify agent source files
       - /var/run/docker.sock:/var/run/docker.sock  # docker restart for self-modification
+      - C:/Users/frigo:/workspace/user             # user home directory
+      - C:/Users/frigo/Documents/Coding Projects:/workspace/projects  # coding projects
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

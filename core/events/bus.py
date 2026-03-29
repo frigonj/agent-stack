@@ -56,6 +56,10 @@ class EventType(str, Enum):
     SELF_MODIFY_PROPOSED = "self.modify.proposed"  # agent proposes a code change
     SELF_MODIFY_APPLIED  = "self.modify.applied"   # code change applied + restart requested
 
+    # Discord management (agent → bridge)
+    DISCORD_ACTION       = "discord.action"        # request a Discord API action
+    DISCORD_ACTION_DONE  = "discord.action.done"   # bridge confirms action completed
+
     # System
     HEARTBEAT         = "system.heartbeat"
     ERROR             = "system.error"

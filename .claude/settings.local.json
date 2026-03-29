@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose:*)",
+      "Bash(docker exec:*)",
+      "Bash(where docker:*)",
+      "Bash(docker --version)",
+      "Bash(wsl -- which docker)",
+      "Bash(wsl -- docker --version)",
+      "Bash(wsl -- docker ps)"
+    ]
+  }
+}
