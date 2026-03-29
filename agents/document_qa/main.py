@@ -44,7 +44,17 @@ class DocumentQAAgent(BaseAgent):
     async def _handle_task(self, event: Event) -> None:
         task = event.payload.get("task", "")
         task_id = event.task_id
+        subtask_id = event.payload.get("subtask_id")
+        parent_task_id = event.payload.get("parent_task_id")
         log.info("document_qa.task", task=task[:80])
+
+        def _reply(result: str) -> dict:
+            return {
+                "result": result,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "parent_task_id": parent_task_id,
+            }
 
         # Check long-term memory first
         prior = await self.recall(task)
@@ -53,11 +63,7 @@ class DocumentQAAgent(BaseAgent):
             best = prior[0]
             await self.emit(
                 EventType.TASK_COMPLETED,
-                payload={
-                    "result": best["content"],
-                    "source": "long_term_memory",
-                    "task_id": task_id,
-                },
+                payload=_reply(best["content"]),
                 target="orchestrator",
             )
             return
@@ -67,7 +73,7 @@ class DocumentQAAgent(BaseAgent):
         if not doc_content:
             await self.emit(
                 EventType.TASK_COMPLETED,
-                payload={"result": "No documents found in workspace.", "task_id": task_id},
+                payload=_reply("No documents found in /workspace/docs."),
                 target="orchestrator",
             )
             return
@@ -89,7 +95,7 @@ class DocumentQAAgent(BaseAgent):
 
         await self.emit(
             EventType.TASK_COMPLETED,
-            payload={"result": answer, "task_id": task_id},
+            payload=_reply(answer),
             target="orchestrator",
         )
 

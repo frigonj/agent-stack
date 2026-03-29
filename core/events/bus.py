@@ -46,6 +46,16 @@ class EventType(str, Enum):
     APPROVAL_GRANTED  = "approval.granted"
     APPROVAL_DENIED   = "approval.denied"
 
+    # Parallel tasks
+    TASK_SPAWNED         = "task.spawned"         # sub-task dispatched by orchestrator
+
+    # Proactive reasoning
+    THINK_CYCLE          = "think.cycle"           # orchestrator autonomous think cycle
+
+    # Self-modification
+    SELF_MODIFY_PROPOSED = "self.modify.proposed"  # agent proposes a code change
+    SELF_MODIFY_APPLIED  = "self.modify.applied"   # code change applied + restart requested
+
     # System
     HEARTBEAT         = "system.heartbeat"
     ERROR             = "system.error"

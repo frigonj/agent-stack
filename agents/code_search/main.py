@@ -57,7 +57,17 @@ class CodeSearchAgent(BaseAgent):
     async def _handle_task(self, event: Event) -> None:
         task = event.payload.get("task", "")
         task_id = event.task_id
+        subtask_id = event.payload.get("subtask_id")
+        parent_task_id = event.payload.get("parent_task_id")
         log.info("code_search.task", task=task[:80])
+
+        def _reply(result: str) -> dict:
+            return {
+                "result": result,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "parent_task_id": parent_task_id,
+            }
 
         # Check long-term memory first
         prior = await self.recall(task)
@@ -68,7 +78,7 @@ class CodeSearchAgent(BaseAgent):
             )
             await self.emit(
                 EventType.TASK_COMPLETED,
-                payload={"result": result_text, "source": "long_term_memory", "task_id": task_id},
+                payload=_reply(result_text),
                 target="orchestrator",
             )
             return
@@ -78,7 +88,7 @@ class CodeSearchAgent(BaseAgent):
         if not snippets:
             await self.emit(
                 EventType.TASK_COMPLETED,
-                payload={"result": "No relevant code found.", "task_id": task_id},
+                payload=_reply("No relevant code found in /workspace/repos."),
                 target="orchestrator",
             )
             return
@@ -100,7 +110,7 @@ class CodeSearchAgent(BaseAgent):
 
         await self.emit(
             EventType.TASK_COMPLETED,
-            payload={"result": analysis, "task_id": task_id},
+            payload=_reply(analysis),
             target="orchestrator",
         )
 

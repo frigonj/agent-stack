@@ -120,6 +120,8 @@ class DiscordBridgeClient(discord.Client):
         self.redis_url = redis_url
         self.task_channel_id = task_channel_id
         self.redis: aioredis.Redis | None = None
+        # task_id → (channel_id, message_id) for ⏳→✅ reaction update
+        self._pending_messages: dict[str, tuple[int, int]] = {}
 
     async def setup_hook(self) -> None:
         self.redis = await aioredis.from_url(
@@ -169,6 +171,8 @@ class DiscordBridgeClient(discord.Client):
             return
 
         task_id = str(uuid.uuid4())
+        message_id = str(message.id)
+
         event = {
             "event_id":  str(uuid.uuid4()),
             "type":      "task.created",
@@ -178,13 +182,15 @@ class DiscordBridgeClient(discord.Client):
             "payload":   json.dumps({
                 "task":               message.content,
                 "discord_user":       message.author.display_name,
-                "discord_message_id": str(message.id),
+                "discord_message_id": message_id,
                 "discord_channel_id": str(message.channel.id),
             }),
         }
         await self.redis.xadd("agents:orchestrator", event)
+        # Track pending message for reaction update when reply arrives
+        self._pending_messages[task_id] = (message.channel.id, message.id)
         await message.add_reaction("⏳")
-        log.info("discord_bridge.task_queued", task=message.content[:80])
+        log.info("discord_bridge.task_queued", task=message.content[:80], task_id=task_id)
 
     # ── Broadcast stream consumer ─────────────────────────────────────────────
 
@@ -249,12 +255,30 @@ class DiscordBridgeClient(discord.Client):
 
         if event_type == "task.completed":
             result = payload.get("result", "(no output)")
+            task_id = payload.get("task_id")
             embed = discord.Embed(
-                title=f"{icon} {source.replace('_', ' ').title()} — Done",
+                title=f"{icon} {source.replace('_', ' ').title()}",
                 description=result[:4000],
                 color=color,
             )
+
+            # Try to reply to the original user message so it threads nicely
+            origin = self._pending_messages.pop(task_id, None) if task_id else None
+            if origin:
+                ch_id, msg_id = origin
+                try:
+                    ch = await self.fetch_channel(ch_id)
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.remove_reaction("⏳", self.user)
+                    await msg.add_reaction("✅")
+                    await msg.reply(embed=embed, mention_author=False)
+                    log.info("discord_bridge.reply_sent", task_id=task_id)
+                    return
+                except Exception as exc:
+                    log.warning("discord_bridge.reply_failed", error=str(exc))
+
             await channel.send(embed=embed)
+            log.info("discord_bridge.message_sent", event_type=event_type, source=source)
 
         elif event_type == "approval.required":
             await self._post_approval(payload, channel, source, icon)

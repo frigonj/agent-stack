@@ -35,7 +35,11 @@ class BaseAgent(ABC):
       - handle_event(event) → the agent's core logic per event
       - on_startup()        → optional async init
       - on_shutdown()       → optional async cleanup + memory promotion
+      - think()             → optional proactive reasoning (called every think_interval seconds)
     """
+
+    # Seconds between proactive think() calls. Override in subclasses.
+    think_interval: int = 300
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -58,11 +62,14 @@ class BaseAgent(ABC):
 
         self._running = False
         self._findings: list[dict] = []    # Staged for promotion on shutdown
+        self._stop_event: Optional[asyncio.Event] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         log.info("agent.starting", role=self.role)
+
+        self._stop_event = asyncio.Event()
 
         await self.bus.connect()
         await self.memory.open_session()
@@ -82,10 +89,15 @@ class BaseAgent(ABC):
         )
 
         log.info("agent.ready", role=self.role)
-        await self._event_loop()
+        await asyncio.gather(
+            self._event_loop(),
+            self._think_loop(),
+        )
 
     async def stop(self, summary: Optional[str] = None) -> None:
         self._running = False
+        if self._stop_event:
+            self._stop_event.set()
         log.info("agent.stopping", role=self.role)
 
         await self.on_shutdown()
@@ -103,6 +115,28 @@ class BaseAgent(ABC):
         log.info("agent.stopped", role=self.role)
 
     # ── Event loop ───────────────────────────────────────────────────────────
+
+    async def _think_loop(self) -> None:
+        """
+        Background loop that calls think() every think_interval seconds.
+        Exits immediately when stop() is called (via _stop_event).
+        """
+        while self._running:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self.think_interval,
+                )
+                break  # stop was requested
+            except asyncio.TimeoutError:
+                pass   # normal — interval elapsed, time to think
+
+            if not self._running:
+                break
+            try:
+                await self.think()
+            except Exception as exc:
+                log.error("agent.think_error", role=self.role, error=str(exc))
 
     async def _event_loop(self) -> None:
         async for stream, entry_id, event in self.bus.consume(
@@ -180,6 +214,13 @@ class BaseAgent(ABC):
 
     async def on_shutdown(self) -> None:
         """Optional: run before session close and memory promotion."""
+        pass
+
+    async def think(self) -> None:
+        """
+        Proactive reasoning cycle called every think_interval seconds.
+        Override in subclasses to add autonomous background behaviour.
+        """
         pass
 
 

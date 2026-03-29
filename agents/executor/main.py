@@ -1,12 +1,13 @@
 """
 agents/executor/main.py
 ────────────────────────
-Tool executor agent — runs shell commands, reads/writes files,
-calls external APIs. The hands of the pipeline.
+Tool executor agent — runs shell commands, reads/writes files, restarts services.
+The hands of the pipeline, including self-modification of the agent stack.
 
-Approval gates: commands in REQUIRES_APPROVAL are held until the user
-approves or denies via Discord. Read-only commands in SAFE_COMMANDS run
-without approval. All other commands are blocked entirely.
+Approval gates:
+  SAFE_COMMANDS     — read-only, run immediately.
+  REQUIRES_APPROVAL — state-changing; held for Discord approval before running.
+  Anything else     — blocked entirely.
 """
 
 from __future__ import annotations
@@ -24,22 +25,64 @@ from core.events.bus import Event, EventType
 
 log = structlog.get_logger()
 
-SYSTEM_PROMPT = """You are a tool execution specialist.
-You receive tasks that require running commands, reading files, or calling APIs.
-Before executing anything, confirm what you are about to do.
-Report results clearly, including stdout, stderr, and exit codes.
-Flag any errors or unexpected outputs for the orchestrator.
+SYSTEM_PROMPT = """You are a tool execution specialist with full access to the agent stack \
+source code and runtime environment.
+
+## Shell commands
+If a task requires a shell command, respond with exactly:
+CMD: <the command>
+
+Report results clearly: stdout, stderr, exit codes. Flag unexpected outputs for the orchestrator.
+
+## Self-modification
+The agent stack source is mounted at /workspace/src/. You can read any agent file and propose
+improvements by writing new versions. All writes, patches, and restarts require human approval.
+
+Read a file:
+  CMD: cat /workspace/src/agents/executor/main.py
+
+List all agents:
+  CMD: ls /workspace/src/agents/
+
+Write a new version of a file (requires approval):
+  CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
+  <full file content>
+  EOF
+
+Restart a service after a code change (requires approval):
+  CMD: docker restart agent_executor
+
+Container names: agent_orchestrator, agent_executor, agent_document_qa,
+                 agent_code_search, agent_discord_bridge
+
+## Self-improvement workflow
+1. cat the file you want to improve.
+2. Propose the change in your response.
+3. Use tee to write the updated file (will trigger approval gate).
+4. Use docker restart <name> to reload (will trigger approval gate).
+
+When writing a self-modification, include a brief explanation of what changed and why.
 """
 
 # Read-only commands — run without approval
 SAFE_COMMANDS = {
     "ls", "cat", "find", "grep", "echo", "pwd", "wc",
-    "head", "tail", "diff", "sort", "uniq",
+    "head", "tail", "diff", "sort", "uniq", "stat",
+    "env", "printenv", "which", "type", "id",
 }
 
 # Commands that can modify state — require explicit user approval via Discord
 REQUIRES_APPROVAL = {
-    "curl", "python", "python3", "pip", "git",
+    # Network / package managers
+    "curl", "wget", "pip", "pip3", "apt", "apt-get", "npm", "yarn",
+    # Code execution
+    "python", "python3",
+    # Version control
+    "git",
+    # File write / patching (self-modification)
+    "tee", "patch", "cp", "mv", "rm", "chmod", "chown", "mkdir", "touch",
+    # Container management (self-restart)
+    "docker", "docker-compose",
 }
 
 
@@ -56,7 +99,10 @@ class ExecutorAgent(BaseAgent):
     async def _handle_task(self, event: Event) -> None:
         task = event.payload.get("task", "")
         task_id = event.task_id
-        log.info("executor.task", task=task[:80])
+        subtask_id = event.payload.get("subtask_id")
+        parent_task_id = event.payload.get("parent_task_id")
+
+        log.info("executor.task", task=task[:80], subtask_id=subtask_id)
 
         await self.emit(
             EventType.AGENT_THINKING,
@@ -65,40 +111,54 @@ class ExecutorAgent(BaseAgent):
 
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=(
-                f"Task: {task}\n\n"
-                "If this requires a shell command, respond with exactly:\n"
-                "CMD: <the command>\n\n"
-                "Otherwise, respond with your analysis directly."
-            )),
+            HumanMessage(content=f"Task: {task}"),
         ]
         response = await self.llm.ainvoke(messages)
         content = response.content
 
         result = content
-        if content.strip().startswith("CMD:"):
-            cmd = content.split("CMD:", 1)[1].strip().splitlines()[0]
-            result = await self._run_command(cmd, task, task_id)
+        if "CMD:" in content:
+            # Extract the first CMD: line
+            cmd_line = next(
+                (ln.split("CMD:", 1)[1].strip() for ln in content.splitlines() if "CMD:" in ln),
+                None,
+            )
+            if cmd_line:
+                result = await self._run_command(cmd_line, task, task_id)
 
         await self.emit(
             EventType.AGENT_TOOL_RESULT,
             payload={"result": result[:2000], "task_id": task_id},
         )
 
-        if any(kw in task.lower() for kw in ["bug", "error", "pattern", "found", "discovered"]):
+        # Stage findings for long-term memory
+        if any(kw in task.lower() for kw in ["bug", "error", "pattern", "found", "discovered", "improve"]):
             self.stage_finding(
                 content=f"Executor task: {task}\nResult: {result[:500]}",
                 topic="execution_findings",
                 tags=["executor", "tool"],
             )
 
+        # Mark self-modifications in memory immediately
+        if any(kw in task.lower() for kw in ["modify", "update", "patch", "rewrite", "fix code"]):
+            await self.promote_now(
+                content=f"Self-modification applied.\nTask: {task}\nOutcome: {result[:400]}",
+                topic="self_modification",
+                tags=["executor", "self_modify"],
+            )
+
         await self.emit(
             EventType.TASK_COMPLETED,
-            payload={"result": result, "task_id": task_id},
+            payload={
+                "result": result,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "parent_task_id": parent_task_id,
+            },
             target="orchestrator",
         )
 
-    async def _run_command(self, cmd: str, task: str, task_id: str, timeout: int = 30) -> str:
+    async def _run_command(self, cmd: str, task: str, task_id: str, timeout: int = 60) -> str:
         """Run a shell command after allowlist and approval checks."""
         try:
             parts = shlex.split(cmd)
@@ -111,10 +171,10 @@ class ExecutorAgent(BaseAgent):
             approved = await self._request_approval(cmd, task, task_id)
             if not approved:
                 log.info("executor.command_denied", cmd=cmd)
-                return f"Command denied: `{cmd}`"
+                return f"Command denied by user: `{cmd}`"
         elif base_cmd not in SAFE_COMMANDS:
             log.warning("executor.blocked_command", cmd=base_cmd)
-            return f"Command '{base_cmd}' is not permitted."
+            return f"Command '{base_cmd}' is not on the allowlist and cannot be run."
 
         log.info("executor.running", cmd=cmd)
         await self.emit(EventType.AGENT_TOOL_CALL, payload={"command": cmd})
@@ -132,7 +192,7 @@ class ExecutorAgent(BaseAgent):
 
             result = f"Exit code: {code}\n"
             if out:
-                result += f"STDOUT:\n{out[:1500]}\n"
+                result += f"STDOUT:\n{out[:2000]}\n"
             if err:
                 result += f"STDERR:\n{err[:500]}\n"
             return result
@@ -144,8 +204,7 @@ class ExecutorAgent(BaseAgent):
 
     async def _request_approval(self, cmd: str, task: str, task_id: str) -> bool:
         """
-        Emit an approval.required event and wait for the user's decision
-        via Discord (set as a Redis key by the discord_bridge).
+        Emit an approval.required event and wait for the user's decision via Discord.
         Returns True if approved, False if denied or timed out.
         """
         approval_id = str(uuid.uuid4())

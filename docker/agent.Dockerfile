@@ -3,9 +3,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps
+# System deps (docker.io provides docker CLI for executor's self-modification capability)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl build-essential libpq-dev \
+    git curl build-essential libpq-dev docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Dependency layer ──────────────────────────────────────────────────────────

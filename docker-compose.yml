@@ -62,6 +62,7 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
+      - .:/workspace/src:ro          # read-only source visibility for self-awareness
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -92,6 +93,7 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
+      - .:/workspace/src:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -122,6 +124,7 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
+      - .:/workspace/src:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -167,6 +170,8 @@ services:
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
+      - .:/workspace/src          # read-write: executor can modify agent source files
+      - /var/run/docker.sock:/var/run/docker.sock  # docker restart for self-modification
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
