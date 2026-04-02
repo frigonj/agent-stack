@@ -572,7 +572,20 @@ Rules for plans:
             session.last_activity = time.time()
             await self._respond_clarify(task, task_id, discord_message_id, session_id=session.session_id)
         else:
-            await self._run_task(task, task_id, discord_message_id=discord_message_id)
+            # Detach planning so the event-handler returns immediately and acks
+            # the task.created event.  The orchestrator can then receive and begin
+            # handling new incoming tasks concurrently while this plan is being
+            # built and dispatched.  Error handling is local to the background task.
+            async def _plan_and_run() -> None:
+                try:
+                    await self._run_task(task, task_id, discord_message_id=discord_message_id)
+                except Exception as exc:
+                    log.error("orchestrator.plan_error", task=task[:80], error=str(exc))
+                    await self._publish_reply(
+                        f"⚠️ Planning error: {exc}",
+                        task_id, discord_message_id, original_task=task,
+                    )
+            asyncio.create_task(_plan_and_run())
 
     # ── Intent classification ─────────────────────────────────────────────────
 
@@ -1340,7 +1353,7 @@ Rules for plans:
             )
             step = next((s for s in plan.steps if s.step_id == subtask_id), None)
             if step:
-                passed, reason = self._validate_result(step.expected, result)
+                passed, reason = self._validate_result(step.expected, result, source=event.source)
                 step.result = result
                 step.status = "done" if passed else "failed"
                 if not passed:
@@ -1353,7 +1366,7 @@ Rules for plans:
                 # Fallback: mark first running step for this agent
                 for s in plan.steps:
                     if s.status == "running" and s.agent == event.source:
-                        passed, _ = self._validate_result(s.expected, result)
+                        passed, _ = self._validate_result(s.expected, result, source=event.source)
                         s.result = result
                         s.status = "done" if passed else "failed"
                         break
@@ -1431,10 +1444,28 @@ Rules for plans:
 
     # ── Validation ───────────────────────────────────────────────────────────
 
-    def _validate_result(self, expected: str, result: str) -> tuple[bool, str]:
+    # Tags injected by specialist agents to prove execution actually happened.
+    # A result that is pure LLM prose without one of these is treated as a
+    # planning reply, not completed work.
+    _EXECUTION_PROOF_MARKERS = (
+        "Exit code:",          # executor ran a shell command
+        "[EXECUTOR_NO_CMD]",   # executor flagged no command — will fail below
+        "STDOUT:",             # executor ran a command with output
+        "STDERR:",             # executor ran a command (even if it errored)
+        "✅",                  # discord action confirmed
+        "❌",                  # discord action failed (still ran)
+        "[research]",          # research agent citation block
+        "[doc]",               # document_qa citation block
+        "code_search:",        # code search result header
+    )
+
+    def _validate_result(self, expected: str, result: str, source: str = "") -> tuple[bool, str]:
         """
         Rule-based result validation. Returns (passed, reason).
-        Conservative: only hard-fail on definitive error signals.
+
+        Core rule: a successful result must prove work was actually done.
+        For executor steps: an exit code must be present.
+        For all agents: [EXECUTOR_NO_CMD] and hard error markers are failures.
         """
         if not result:
             return False, "Empty result"
@@ -1456,6 +1487,10 @@ Rules for plans:
         # Discord action failures
         if "'ok': False" in result or '"ok": false' in result.lower():
             return False, "Discord action reported failure"
+
+        # Executor-specific: no evidence of command execution = chatted instead of worked
+        if source == "executor" and "Exit code:" not in result:
+            return False, "Executor result has no 'Exit code:' — command was not run"
 
         # Expected outcome check: if the expected description names a concrete
         # success signal, verify it appears somewhere in the result.

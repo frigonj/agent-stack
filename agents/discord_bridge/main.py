@@ -126,7 +126,9 @@ _CONTROL_HELP = (
     "`restart <service>` — restart a Docker container\n"
     "`restart all` — restart all agent containers\n"
     "`status` — show running containers\n"
-    "`build docs` — force a full architecture document rebuild now\n\n"
+    "`build docs` — force a full architecture document rebuild now\n"
+    "`verbose on` — forward all Redis events to #agent-logs\n"
+    "`verbose off` — return to normal (only high-level events)\n\n"
     f"Services: {', '.join(sorted(_KNOWN_SERVICES))}"
 )
 
@@ -143,6 +145,25 @@ VISIBLE_EVENTS = {
     "discord.action",
     "memory.pruned",
     "plan.status",
+}
+
+# Extra events forwarded only when verbose mode is active
+# (Redis key  config:verbose_events = "1"  or Discord command "verbose on")
+VERBOSE_EVENTS = {
+    "task.created",
+    "task.assigned",
+    "task.failed",
+    "agent.started",
+    "agent.thinking",
+    "agent.tool_call",
+    "agent.tool_result",
+    "memory.promoted",
+    "context.created",
+    "think.cycle",
+    "task.spawned",
+    "task.fix_spawned",
+    "self.modify.proposed",
+    "self.modify.applied",
 }
 
 
@@ -610,6 +631,19 @@ class DiscordBridgeClient(discord.Client):
                 await message.reply(f"❌ Failed to queue rebuild: {exc}")
             return
 
+        # verbose on/off
+        if lower in ("verbose on", "verbose 1", "verbose true"):
+            await self.redis.set("config:verbose_events", "1")
+            await message.reply("🔊 Verbose mode **on** — all Redis events will be forwarded to #agent-logs.")
+            log.info("discord_bridge.verbose_enabled")
+            return
+
+        if lower in ("verbose off", "verbose 0", "verbose false"):
+            await self.redis.delete("config:verbose_events")
+            await message.reply("🔇 Verbose mode **off** — returning to normal event filtering.")
+            log.info("discord_bridge.verbose_disabled")
+            return
+
         # unrecognised
         await message.reply(f"❓ Unknown command. {_CONTROL_HELP}")
 
@@ -691,10 +725,24 @@ class DiscordBridgeClient(discord.Client):
             self._log_channel = None
         return self._log_channel
 
+    async def _is_verbose(self) -> bool:
+        """Return True when verbose mode is enabled (config:verbose_events = '1')."""
+        try:
+            val = await self.redis.get("config:verbose_events")
+            return val in ("1", "true", "on")
+        except Exception:
+            return False
+
     async def _dispatch(self, data: dict, channel_id: int) -> None:
         event_type = data.get("type", "")
+
+        verbose = event_type in VERBOSE_EVENTS
         if event_type not in VISIBLE_EVENTS:
-            return
+            if not verbose:
+                return
+            # Verbose-only event: only forward when verbose mode is active
+            if not await self._is_verbose():
+                return
 
         try:
             channel = await self.fetch_channel(channel_id)
@@ -706,6 +754,36 @@ class DiscordBridgeClient(discord.Client):
         payload = json.loads(data.get("payload", "{}"))
         icon    = AGENT_ICON.get(source, "🤖")
         color   = AGENT_COLOR.get(source, discord.Color.blurple())
+
+        # Verbose-only events: compact one-liner to #agent-logs, never to the main channel
+        if verbose and event_type not in VISIBLE_EVENTS:
+            log_ch = await self._get_log_channel()
+            dest = log_ch or channel
+            task_id   = data.get("task_id", "")[:8]
+            ts        = float(data.get("timestamp", time.time()))
+            ts_str    = time.strftime("%H:%M:%S", time.localtime(ts))
+            # Summarise payload concisely
+            summary = ""
+            if event_type == "agent.tool_call":
+                summary = f"`{payload.get('command', payload.get('tool', ''))[:120]}`"
+            elif event_type == "agent.tool_result":
+                summary = payload.get("result", "")[:200]
+            elif event_type in ("task.created", "task.assigned"):
+                summary = payload.get("task", "")[:120]
+            elif event_type == "memory.promoted":
+                summary = f"[{payload.get('topic', '')}] {payload.get('preview', '')[:100]}"
+            elif event_type == "agent.thinking":
+                summary = payload.get("task", "")[:120]
+            elif event_type in ("self.modify.proposed", "self.modify.applied"):
+                summary = payload.get("file", payload.get("description", ""))[:120]
+            else:
+                summary = str(payload)[:200]
+            embed = discord.Embed(
+                description=f"**{ts_str}** `{event_type}` · {icon} **{source}** · task `{task_id}`\n{summary}",
+                color=discord.Color.greyple(),
+            )
+            await dest.send(embed=embed)
+            return
 
         if event_type == "task.completed":
             result = payload.get("result", "(no output)")

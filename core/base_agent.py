@@ -96,6 +96,9 @@ class BaseAgent(ABC):
         self._context_tasks: dict[str, asyncio.Task] = {}
         self._model_context_limit: Optional[int] = None   # cached from LM Studio
         self._last_event_time: float = time.monotonic()
+        # Counts concurrently running event-handler tasks.
+        # Status is only set to "idle" when this reaches zero.
+        self._active_tasks: int = 0
 
         # IDLE_TIMEOUT env var overrides the class-level default
         env_idle = os.environ.get("IDLE_TIMEOUT", "")
@@ -380,6 +383,7 @@ class BaseAgent(ABC):
             asyncio.create_task(self._handle_and_ack(stream, entry_id, event))
 
     async def _handle_and_ack(self, stream: str, entry_id: str, event: Event) -> None:
+        self._active_tasks += 1
         await self._set_status("busy", task=event.payload.get("task", event.type.value)[:80])
         try:
             await self.handle_event(event)
@@ -388,7 +392,10 @@ class BaseAgent(ABC):
             log.error("agent.event_error", role=self.role, error=str(exc), event_id=event.event_id)
             await self._emit_error(event, exc)
         finally:
-            await self._set_status("idle")
+            self._active_tasks -= 1
+            if self._active_tasks <= 0:
+                self._active_tasks = 0
+                await self._set_status("idle")
 
     _STATUS_KEY_PREFIX = "agent:status"
     _STATUS_TTL = 3600  # 1 hour — auto-expires so stale entries don't linger
