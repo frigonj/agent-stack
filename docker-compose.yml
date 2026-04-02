@@ -46,8 +46,8 @@ services:
     restart: unless-stopped
     healthcheck:
       # Verify the agent process is alive and its Redis connection is healthy.
-      # pgrep finds the main.py process; the redis-cli ping confirms the bus is reachable.
-      test: ["CMD-SHELL", "pgrep -f 'python.*main.py' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
+      # All agents run as "python -m agent.main" so match on agent.main, not main.py.
+      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -87,7 +87,7 @@ services:
     container_name: agent_discord_bridge
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python.*main.py' > /dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3

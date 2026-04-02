@@ -343,6 +343,8 @@ class ResearchAgent(BaseAgent):
 
     async def _extract_fact(self, query: str, snippet: str) -> Optional[str]:
         try:
+            # Use llm.ainvoke directly — no SystemMessage, content is tiny (< 300 tokens),
+            # and this fires once per search snippet so lock contention would stall the pipeline.
             resp = await self.llm.ainvoke([
                 HumanMessage(content=_extract_fact_prompt(query, snippet)),
             ])
@@ -360,6 +362,8 @@ class ResearchAgent(BaseAgent):
         iteration: int,
     ) -> list[str]:
         try:
+            # Use llm.ainvoke directly — no SystemMessage and called once per iteration,
+            # so not worth holding the distributed lock.
             resp = await self.llm.ainvoke([
                 HumanMessage(content=_gap_prompt(question, facts, iteration)),
             ])
