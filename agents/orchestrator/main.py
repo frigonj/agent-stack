@@ -502,11 +502,23 @@ Return ONLY valid JSON, no markdown fences. Two possible responses:
 
 Rules for plans:
 - expected = one short phrase describing success (e.g. "exit code 0", "file written", "list returned")
-- 1–3 phases, 1–4 steps total
+- 1–4 phases, 1–8 steps total
 - discord agent for ANYTHING involving Discord channels/categories/messages/topics
 - When unsure which agent, use executor
 - Steps that depend on results of earlier steps MUST use a later phase number
-- Prefer checking /workspace/tools/ for existing scripts before creating new executor steps"""
+- Prefer checking /workspace/tools/ for existing scripts before creating new executor steps
+
+Step quality rules (CRITICAL — failure to follow causes task failures):
+- PREFER two focused steps over one ambiguous step. "Read file X then update Y" → two steps.
+- Each executor step must describe ONE concrete operation: a single command, a single file read,
+  or a single file write. Never combine "read AND write" or "find AND update" in one step.
+- Include the exact file path, command flags, or search query in the task string whenever known.
+  BAD:  "update the config file"
+  GOOD: "read /workspace/src/config/.env.example with cat"
+  GOOD: "write updated REDIS_URL to /workspace/src/.env using tee"
+- For multi-file or multi-command tasks, assign each file/command its own step (same phase if independent).
+- code_search steps must name the specific function, class, or pattern to find.
+- research steps must state the exact question to research."""
 
     def __init__(self, settings: Settings):
         super().__init__(settings)
@@ -1469,18 +1481,33 @@ Rules for plans:
         # Hard fallback
         return [PlanStep(step_id=str(uuid.uuid4()), phase=1, task=task, agent="executor", expected="")]
 
+    _MAX_PLAN_STEPS = 8   # hard cap — prevents runaway plans from the LLM
+
     def _parse_plan_steps(self, data: dict) -> list[PlanStep]:
         raw = data.get("steps", [])
         if not raw or not isinstance(raw, list):
             raise ValueError("no steps in plan")
+
+        # Clamp to hard cap — take the first N steps rather than failing
+        if len(raw) > self._MAX_PLAN_STEPS:
+            log.warning(
+                "orchestrator.plan_steps_clamped",
+                original=len(raw),
+                clamped=self._MAX_PLAN_STEPS,
+            )
+            raw = raw[: self._MAX_PLAN_STEPS]
+
         steps = []
         for s in raw:
+            task = str(s.get("task", "")).strip()
+            if not task:
+                continue
             steps.append(PlanStep(
                 step_id=str(uuid.uuid4()),
                 phase=max(1, int(s.get("phase", 1))),
-                task=str(s.get("task", "")).strip(),
+                task=task[:600],          # hard cap on step task length
                 agent=str(s.get("agent", "executor")).strip(),
-                expected=str(s.get("expected", "")).strip(),
+                expected=str(s.get("expected", "")).strip()[:200],
             ))
         return steps
 
