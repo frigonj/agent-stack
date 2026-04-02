@@ -5,12 +5,33 @@ Redis Streams event bus for short-term agent memory and inter-agent messaging.
 
 Every agent action, tool call, and result is an event. Events are ephemeral
 by design — meaningful findings get promoted to Emrys long-term memory.
+
+Context streams
+───────────────
+In addition to per-role streams (agents:{role}), the bus manages named
+context streams that represent a single task, chat session, or other unit
+of work.  These are the source of truth for correlation — no more
+parent_task_id threading through payloads.
+
+  ctx:task:{id}:{slug}   — all events for one task
+  ctx:chat:{id}:{slug}   — all events for one chat session
+  ctx:plan:{id}:{slug}   — all events for one execution plan
+
+A lightweight registry (Redis Hash  ctx:registry) maps context_id → metadata
+so the orchestrator and agents can enumerate and resume contexts.
+
+Configuration
+─────────────
+Runtime-adjustable values live in Redis under the key prefix  config: .
+Any agent or the orchestrator may call get_config / set_config to read or
+update them.  Changes take effect on the next read — no restart needed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -21,6 +42,28 @@ import redis.asyncio as aioredis
 import structlog
 
 log = structlog.get_logger()
+
+
+# ── Defaults for runtime-configurable values ──────────────────────────────────
+
+CONFIG_DEFAULTS: dict[str, Any] = {
+    "vote_timeout_ms":        3_000,   # ms agents have to vote on a plan
+    "vote_max_extension_ms": 10_000,   # max extra ms one agent can request
+    "chat_idle_gap_secs":    1_800,    # 30 min idle → new chat session
+    "chat_keyword_overlap":    0.4,    # Jaccard threshold for same session
+    "max_concurrent_contexts":   5,    # per-agent context stream pool size
+    "topic_confidence_ask":    0.8,    # below this → ask user for category
+    "topic_min_sessions":       50,    # sessions before asking user at all
+    "max_fix_depth":            10,    # max strategy-rotating fix attempts
+}
+
+
+def _slugify(name: str) -> str:
+    name = name.strip().lower()
+    name = re.sub(r"[^a-z0-9\-_ ]", "", name)
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    return name[:40] or "context"
 
 
 class EventType(str, Enum):
@@ -49,6 +92,9 @@ class EventType(str, Enum):
     # Parallel tasks
     TASK_SPAWNED         = "task.spawned"         # sub-task dispatched by orchestrator
 
+    # Fix subtask (strategy-rotating retry on failure)
+    TASK_FIX_SPAWNED     = "task.fix_spawned"     # failed step spawned a fix subtask
+
     # Proactive reasoning
     THINK_CYCLE          = "think.cycle"           # orchestrator autonomous think cycle
 
@@ -59,6 +105,30 @@ class EventType(str, Enum):
     # Discord management (agent → bridge)
     DISCORD_ACTION       = "discord.action"        # request a Discord API action
     DISCORD_ACTION_DONE  = "discord.action.done"   # bridge confirms action completed
+
+    # Memory lifecycle
+    MEMORY_PRUNED        = "memory.pruned"          # long-term memory pruned; user warned
+
+    # Plan execution lifecycle
+    PLAN_STATUS          = "plan.status"            # step/phase progress update → Discord
+    PLAN_PROPOSED        = "plan.proposed"          # orchestrator broadcasts plan before executing
+    AGENT_VOTE           = "agent.vote"             # agent approves/rejects a proposed plan
+    VOTE_EXTENSION_REQUESTED = "vote.extension_requested"  # agent needs more deliberation time
+
+    # Context stream lifecycle
+    CONTEXT_CREATED      = "context.created"        # orchestrator announces new named context stream
+    CONTEXT_CLOSED       = "context.closed"         # context stream closed + snapshot saved
+    CONTEXT_SNAPSHOT     = "context.snapshot"       # rolling mid-execution snapshot
+
+    # Chat session lifecycle
+    CHAT_SESSION_STARTED = "chat.session_started"
+    CHAT_SESSION_CLOSED  = "chat.session_closed"
+
+    # Topic classification (agent-learned categories)
+    TOPIC_CLASSIFIED     = "topic.classified"       # agent assigned a topic category to a context
+
+    # Runtime configuration
+    CONFIG_UPDATED       = "config.updated"         # agent/orchestrator updated a config value
 
     # System
     HEARTBEAT         = "system.heartbeat"
@@ -102,19 +172,30 @@ class EventBus:
     """
     Thin async wrapper around Redis Streams.
 
-    Streams are per-agent-role:
+    Role streams (per-agent dispatch):
         agents:orchestrator
         agents:document_qa
         agents:code_search
         agents:executor
 
-    Plus a global broadcast stream:
+    Broadcast stream:
         agents:broadcast
+
+    Context streams (per-task/session source of truth):
+        ctx:task:{id}:{slug}
+        ctx:chat:{id}:{slug}
+        ctx:plan:{id}:{slug}
+
+    Context registry (Redis Hash):
+        ctx:registry  →  context_id → JSON metadata
     """
 
-    STREAM_PREFIX = "agents"
-    BROADCAST_STREAM = "agents:broadcast"
-    MAX_STREAM_LEN = 10_000          # Per stream — keeps Redis footprint bounded
+    STREAM_PREFIX     = "agents"
+    BROADCAST_STREAM  = "agents:broadcast"
+    CONTEXT_PREFIX    = "ctx"
+    CONTEXT_REGISTRY  = "ctx:registry"
+    MAX_STREAM_LEN    = 10_000          # Per stream — keeps Redis footprint bounded
+    CONFIG_PREFIX     = "config"
 
     def __init__(self, redis_url: str):
         self._url = redis_url
@@ -135,12 +216,14 @@ class EventBus:
     def _stream_key(self, target: str) -> str:
         return f"{self.STREAM_PREFIX}:{target}"
 
+    # ── Role stream publish / consume ─────────────────────────────────────────
+
     async def publish(
         self,
         event: Event,
         target: str = "broadcast",
     ) -> str:
-        """Publish an event to a stream. Returns the Redis stream entry ID."""
+        """Publish an event to a role/broadcast stream. Returns the Redis entry ID."""
         key = self._stream_key(target)
         entry_id = await self._client.xadd(
             key,
@@ -165,10 +248,17 @@ class EventBus:
         streams: Optional[list[str]] = None,
         block_ms: int = 1000,
         count: int = 10,
-    ) -> AsyncIterator[tuple[str, str, Event]]:
+    ) -> AsyncIterator[tuple[str | None, str | None, "Event | None"]]:
         """
         Yield (stream, entry_id, Event) tuples from a consumer group.
         Creates the group and stream if they don't exist.
+
+        When no messages arrive within *block_ms* a ``(None, None, None)``
+        sentinel is yielded so callers can check a stop-flag without being
+        permanently blocked in the ``async for`` loop.  Callers must guard:
+
+            if stream is None:   # idle sentinel
+                continue
         """
         target_streams = streams or [role, "broadcast"]
         keys = [self._stream_key(s) for s in target_streams]
@@ -192,6 +282,9 @@ class EventBus:
                 block=block_ms,
             )
             if not results:
+                # Yield a heartbeat sentinel so the caller can react to stop
+                # signals without waiting for a real event to unblock the loop.
+                yield None, None, None
                 continue
             for stream_key, messages in results:
                 for entry_id, data in messages:
@@ -217,20 +310,222 @@ class EventBus:
             await pipe.xack(ack_stream, ack_group, ack_entry_id)
             await pipe.execute()
 
+    # ── Context stream management ─────────────────────────────────────────────
+
+    def _context_stream_key(self, context_type: str, context_id: str, name: str) -> str:
+        return f"{self.CONTEXT_PREFIX}:{context_type}:{context_id}:{_slugify(name)}"
+
+    async def create_context_stream(
+        self,
+        context_type: str,
+        context_id: str,
+        name: str,
+        metadata: dict | None = None,
+    ) -> str:
+        """
+        Register a new named context stream and return its stream key.
+        Idempotent — safe to call multiple times with the same context_id.
+
+        context_type: 'task' | 'chat' | 'plan'
+        context_id:   stable UUID for this context
+        name:         human-readable slug (will be sanitised)
+        metadata:     arbitrary extra fields stored in the registry
+        """
+        stream_key = self._context_stream_key(context_type, context_id, name)
+        existing = await self._client.hget(self.CONTEXT_REGISTRY, context_id)
+        if existing:
+            return json.loads(existing)["stream"]
+
+        entry = {
+            "type":       context_type,
+            "id":         context_id,
+            "name":       name,
+            "stream":     stream_key,
+            "status":     "active",
+            "created_at": time.time(),
+            **(metadata or {}),
+        }
+        await self._client.hset(self.CONTEXT_REGISTRY, context_id, json.dumps(entry))
+        # Touch the stream so it exists even before the first event
+        try:
+            await self._client.xgroup_create(stream_key, "readers", id="0", mkstream=True)
+        except aioredis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+        log.debug("event_bus.context_created", type=context_type, id=context_id, name=name)
+        return stream_key
+
+    async def publish_to_context(self, context_id: str, event: Event) -> str:
+        """
+        Append an event to the context stream identified by context_id.
+        Returns the Redis entry ID, or empty string if context not found.
+        """
+        meta = await self.get_context_metadata(context_id)
+        if not meta:
+            log.warning("event_bus.context_not_found", context_id=context_id)
+            return ""
+        stream_key = meta["stream"]
+        entry_id = await self._client.xadd(
+            stream_key,
+            event.to_redis(),
+            maxlen=self.MAX_STREAM_LEN,
+            approximate=True,
+        )
+        return entry_id
+
+    async def get_context_metadata(self, context_id: str) -> dict | None:
+        """Return registry metadata for a context, or None if not found."""
+        data = await self._client.hget(self.CONTEXT_REGISTRY, context_id)
+        return json.loads(data) if data else None
+
+    async def update_context_metadata(self, context_id: str, **fields) -> None:
+        """Merge fields into an existing context registry entry."""
+        data = await self._client.hget(self.CONTEXT_REGISTRY, context_id)
+        if not data:
+            return
+        entry = json.loads(data)
+        entry.update(fields)
+        await self._client.hset(self.CONTEXT_REGISTRY, context_id, json.dumps(entry))
+
+    async def close_context(self, context_id: str) -> None:
+        """Mark a context as closed in the registry."""
+        await self.update_context_metadata(context_id, status="closed", closed_at=time.time())
+        log.debug("event_bus.context_closed", context_id=context_id)
+
+    async def list_active_contexts(
+        self, context_type: str | None = None
+    ) -> list[dict]:
+        """
+        Return all registered contexts sorted newest-first.
+        Optionally filter by context_type ('task', 'chat', 'plan').
+        """
+        all_data = await self._client.hgetall(self.CONTEXT_REGISTRY)
+        contexts = [json.loads(v) for v in all_data.values()]
+        if context_type:
+            contexts = [c for c in contexts if c.get("type") == context_type]
+        return sorted(contexts, key=lambda c: c.get("created_at", 0), reverse=True)
+
+    async def read_context_stream(
+        self,
+        context_id: str,
+        count: int = 50,
+        last_id: str = "0",
+    ) -> list[tuple[str, Event]]:
+        """
+        Read up to *count* messages from a context stream.
+        Returns list of (entry_id, Event) tuples.
+
+        Used by agents to check history before asking the user for clarification.
+        """
+        meta = await self.get_context_metadata(context_id)
+        if not meta:
+            return []
+        stream_key = meta["stream"]
+        try:
+            results = await self._client.xrange(stream_key, min=last_id, count=count)
+            return [
+                (entry_id, Event.from_redis(data))
+                for entry_id, data in results
+            ]
+        except Exception as exc:
+            log.warning("event_bus.context_read_failed", context_id=context_id, error=str(exc))
+            return []
+
+    async def consume_context_stream(
+        self,
+        context_id: str,
+        group: str,
+        consumer: str,
+        block_ms: int = 1000,
+        count: int = 10,
+    ) -> AsyncIterator[tuple[str, str, Event]]:
+        """
+        Consume new messages from a context stream via a consumer group.
+        Yields (stream_key, entry_id, Event).  Used by agents subscribing to
+        a specific context as part of the multi-context pool.
+        """
+        meta = await self.get_context_metadata(context_id)
+        if not meta:
+            return
+        stream_key = meta["stream"]
+        try:
+            await self._client.xgroup_create(stream_key, group, id="$", mkstream=False)
+        except aioredis.ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+        stream_ids = {stream_key: ">"}
+        while True:
+            results = await self._client.xreadgroup(
+                groupname=group,
+                consumername=consumer,
+                streams=stream_ids,
+                count=count,
+                block=block_ms,
+            )
+            if not results:
+                yield  # signal idle; caller can break if context is closed
+                continue
+            for sk, messages in results:
+                for entry_id, data in messages:
+                    event = Event.from_redis(data)
+                    yield sk, entry_id, event
+
+    # ── Runtime configuration ─────────────────────────────────────────────────
+
+    async def get_config(self, key: str, default: Any = None) -> Any:
+        """
+        Read a runtime-configurable value from Redis.
+        Falls back to CONFIG_DEFAULTS, then to *default*.
+        """
+        val = await self._client.get(f"{self.CONFIG_PREFIX}:{key}")
+        if val is not None:
+            try:
+                return json.loads(val)
+            except json.JSONDecodeError:
+                return val
+        return CONFIG_DEFAULTS.get(key, default)
+
+    async def set_config(self, key: str, value: Any) -> None:
+        """
+        Write a runtime-configurable value to Redis.
+        Persists until explicitly cleared.  Publish CONFIG_UPDATED so listeners
+        can react immediately without polling.
+        """
+        await self._client.set(f"{self.CONFIG_PREFIX}:{key}", json.dumps(value))
+        log.info("event_bus.config_updated", key=key, value=value)
+
+    # ── Approval helpers ──────────────────────────────────────────────────────
+
     async def wait_for_approval(self, approval_id: str, timeout: float = 300.0) -> str:
         """
-        Poll for an approval decision set by the Discord bridge.
+        Block until an approval decision is pushed by the Discord bridge.
+
+        The bridge calls set_approval() which writes the decision to a Redis
+        list (`approval:notify:{id}`). This method uses BLPOP to wake up
+        immediately instead of polling every 2 s — reduces Redis round-trips
+        from ~150 to 1 per approval, and cuts median latency to near zero.
+
         Returns 'approved' or 'denied'. Defaults to 'denied' on timeout.
         """
-        key = f"approval:{approval_id}"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            val = await self._client.get(key)
-            if val is not None:
-                await self._client.delete(key)
-                return val
-            await asyncio.sleep(2)
+        notify_key = f"approval:notify:{approval_id}"
+        result = await self._client.blpop(notify_key, timeout=int(timeout))
+        if result is not None:
+            _key, decision = result
+            return decision
         return "denied"
+
+    async def set_approval(self, approval_id: str, decision: str, ex: int = 600) -> None:
+        """
+        Record an approval decision and unblock any waiter.
+        """
+        key        = f"approval:{approval_id}"
+        notify_key = f"approval:notify:{approval_id}"
+        await self._client.set(key, decision, ex=ex)
+        await self._client.lpush(notify_key, decision)
+        await self._client.expire(notify_key, ex)
+
+    # ── Misc helpers ──────────────────────────────────────────────────────────
 
     async def get_stream_info(self, role: str) -> dict:
         key = self._stream_key(role)

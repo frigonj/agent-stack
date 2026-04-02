@@ -11,6 +11,7 @@ on first connection — no migration tooling required for initial deployment.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Optional
 
@@ -26,6 +27,12 @@ log = structlog.get_logger()
 
 _encoder = None
 
+# In-process LRU cache keyed on SHA-256(text).
+# Prevents re-encoding identical queries across the lifetime of one agent process.
+# 500 entries ≈ 750 KB of float32 vectors — negligible memory cost.
+_EMBED_CACHE_MAX  = 500
+_embed_cache: dict[str, list[float]] = {}
+
 
 def _get_encoder():
     global _encoder
@@ -36,14 +43,50 @@ def _get_encoder():
 
 
 def _embed_texts(texts: list[str]) -> list[list[float] | None]:
-    """Batch-encode texts to 384-dim vectors. Returns None entries on failure."""
+    """
+    Batch-encode texts to 384-dim vectors with in-process caching.
+
+    Cached texts skip the model entirely — only novel texts are encoded.
+    Returns None entries for any text that fails to encode.
+    """
+    results: list[list[float] | None] = [None] * len(texts)
+    to_encode_indices: list[int] = []
+    to_encode_texts:   list[str] = []
+
+    for i, text in enumerate(texts):
+        key = hashlib.sha256(text.encode()).hexdigest()
+        if key in _embed_cache:
+            results[i] = _embed_cache[key]
+        else:
+            to_encode_indices.append(i)
+            to_encode_texts.append(text)
+
+    if not to_encode_texts:
+        return results  # all cache hits
+
     try:
-        model = _get_encoder()
-        vectors = model.encode(texts)
-        return [v.tolist() for v in vectors]
+        model   = _get_encoder()
+        vectors = model.encode(to_encode_texts)
+        for idx, (orig_i, text, vec) in enumerate(
+            zip(to_encode_indices, to_encode_texts, vectors)
+        ):
+            v   = vec.tolist()
+            key = hashlib.sha256(text.encode()).hexdigest()
+            # Simple FIFO eviction when cache is full
+            if len(_embed_cache) >= _EMBED_CACHE_MAX:
+                oldest = next(iter(_embed_cache))
+                del _embed_cache[oldest]
+            _embed_cache[key] = v
+            results[orig_i]   = v
     except Exception as exc:
         log.warning("memory.embed_failed", error=str(exc))
-        return [None] * len(texts)
+        # results already has None for un-encoded indices
+
+    cache_hits = len(texts) - len(to_encode_texts)
+    if cache_hits:
+        log.debug("memory.embed_cache_hits", hits=cache_hits, total=len(texts))
+
+    return results
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -82,6 +125,135 @@ _SCHEMA = [
     """
     CREATE INDEX IF NOT EXISTS idx_knowledge_fts ON knowledge
         USING GIN(to_tsvector('english', title || ' ' || content))
+    """,
+    # ── Open task queue ───────────────────────────────────────────────────
+    # Used by the orchestrator think loop as a persistent, ordered work queue.
+    # Tasks stored here are picked up on the next think cycle without any LLM call.
+    """
+    CREATE TABLE IF NOT EXISTS open_tasks (
+        id         SERIAL PRIMARY KEY,
+        agent      TEXT NOT NULL DEFAULT 'orchestrator',
+        task       TEXT NOT NULL,
+        priority   INT  NOT NULL DEFAULT 5,   -- lower = higher priority
+        status     TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_open_tasks_queue ON open_tasks(status, priority, created_at)",
+    # ── Active plan ledger ────────────────────────────────────────────────
+    # One row per in-flight or recently-completed orchestrator plan.
+    # Enables crash recovery and post-mortem inspection.
+    # Rows expire automatically via expire_plans(): 7 days after last update.
+    """
+    CREATE TABLE IF NOT EXISTS active_plans (
+        task_id       TEXT PRIMARY KEY,
+        plan_id       TEXT NOT NULL,
+        original_task TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'planning',
+        plan_json     JSONB NOT NULL DEFAULT '{}',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_active_plans_status ON active_plans(status, updated_at)",
+    # ── Shared tool registry ──────────────────────────────────────────────
+    # All agents register capabilities here; all agents search before calling the LLM.
+    # Executor is the primary owner/runner but any agent may contribute.
+    """
+    CREATE TABLE IF NOT EXISTS tools (
+        id          SERIAL PRIMARY KEY,
+        name        TEXT UNIQUE NOT NULL,
+        description TEXT NOT NULL,
+        owner_agent TEXT NOT NULL DEFAULT 'executor',
+        invocation  TEXT NOT NULL,
+        tags        JSONB NOT NULL DEFAULT '[]',
+        usage_count INT  NOT NULL DEFAULT 0,
+        created_by  TEXT NOT NULL DEFAULT 'system',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        embedding   vector(384)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tools_owner ON tools(owner_agent)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_tools_fts ON tools
+        USING GIN(to_tsvector('english', name || ' ' || description))
+    """,
+    # ── Context snapshots ─────────────────────────────────────────────────
+    # Unified store for task, chat session, and plan summaries.
+    # Serves both long-term recall ("what happened in session X?") and
+    # user-facing context lookup ("/recall <id>").
+    # Rolling mid-execution snapshots allow rollback to any checkpoint.
+    """
+    CREATE TABLE IF NOT EXISTS context_snapshots (
+        context_id     TEXT NOT NULL,
+        snapshot_seq   INT  NOT NULL DEFAULT 0,  -- 0 = latest, >0 = rolling checkpoints
+        context_type   TEXT NOT NULL,            -- 'task' | 'chat' | 'plan'
+        name           TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'active',
+        topic_category TEXT DEFAULT NULL,
+        keywords       JSONB NOT NULL DEFAULT '[]',
+        summary        TEXT DEFAULT NULL,
+        snapshot_json  JSONB NOT NULL DEFAULT '{}',
+        value_score    FLOAT NOT NULL DEFAULT 0.0,
+        message_count  INT   NOT NULL DEFAULT 0,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        closed_at      TIMESTAMPTZ DEFAULT NULL,
+        embedding      vector(384),
+        PRIMARY KEY (context_id, snapshot_seq)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ctx_snapshots_type ON context_snapshots(context_type, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ctx_snapshots_updated ON context_snapshots(updated_at DESC)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_ctx_snapshots_fts ON context_snapshots
+        USING GIN(to_tsvector('english', name || ' ' || COALESCE(summary, '') || ' ' || COALESCE(topic_category, '')))
+    """,
+    # ── Topic patterns ────────────────────────────────────────────────────
+    # Agent-learned keyword→category mappings that grow over sessions.
+    # Confidence rises as more sessions confirm the pattern.
+    # When confidence < threshold the orchestrator may ask the user.
+    """
+    CREATE TABLE IF NOT EXISTS topic_patterns (
+        id           SERIAL PRIMARY KEY,
+        category     TEXT NOT NULL,
+        keywords     JSONB NOT NULL DEFAULT '[]',
+        match_count  INT  NOT NULL DEFAULT 1,
+        confidence   FLOAT NOT NULL DEFAULT 0.5,
+        created_by   TEXT NOT NULL DEFAULT 'orchestrator',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_topic_patterns_category ON topic_patterns(category)",
+    "CREATE INDEX IF NOT EXISTS idx_topic_patterns_confidence ON topic_patterns(confidence DESC)",
+    # ── Research sources ──────────────────────────────────────────────────
+    # Committed facts gathered by the research agent after cross-source consensus.
+    # Each row is one source URL + extracted snippet pair for a given research query.
+    # Rows with confidence >= 0.75 are considered reliable and used in replies.
+    """
+    CREATE TABLE IF NOT EXISTS research_sources (
+        id           SERIAL PRIMARY KEY,
+        query_id     TEXT NOT NULL,           -- matches the ctx:research:{id} stream key
+        query_text   TEXT NOT NULL,           -- original user research question
+        url          TEXT NOT NULL,
+        domain       TEXT NOT NULL DEFAULT '',
+        title        TEXT NOT NULL DEFAULT '',
+        snippet      TEXT NOT NULL,
+        fact         TEXT NOT NULL DEFAULT '', -- extracted single-sentence fact
+        confidence   FLOAT NOT NULL DEFAULT 0.0,
+        source_rank  INT   NOT NULL DEFAULT 0, -- position in search results (0-indexed)
+        committed    BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        embedding    vector(384)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_research_sources_query ON research_sources(query_id)",
+    "CREATE INDEX IF NOT EXISTS idx_research_sources_committed ON research_sources(committed, confidence DESC)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_research_sources_fts ON research_sources
+        USING GIN(to_tsvector('english', query_text || ' ' || fact || ' ' || snippet))
     """,
 ]
 
@@ -286,7 +458,670 @@ class LongTermMemory:
                 log.warning("memory.vector_search_failed", fallback="fts")
         return await self.recall(query, limit)
 
+    async def count(self) -> int:
+        """Return total number of knowledge entries across all agents."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT COUNT(*) AS n FROM knowledge")
+            row = await cur.fetchone()
+        return row["n"] if row else 0
+
+    async def prune(self, target: int) -> int:
+        """
+        Delete the oldest knowledge entries until count <= target.
+        Returns the number of entries deleted.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT COUNT(*) AS n FROM knowledge")
+            row = await cur.fetchone()
+            total = row["n"] if row else 0
+
+            to_delete = max(0, total - target)
+            if to_delete == 0:
+                return 0
+
+            await conn.execute("""
+                DELETE FROM knowledge
+                WHERE id IN (
+                    SELECT id FROM knowledge
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                )
+            """, (to_delete,))
+
+        log.info("memory.pruned", deleted=to_delete, remaining=total - to_delete)
+        return to_delete
+
+    # ── Active plan ledger ───────────────────────────────────────────────────
+
+    async def upsert_plan(self, task_id: str, plan_id: str, original_task: str,
+                          status: str, plan_json: dict) -> None:
+        """Create or update a plan row. Called on plan creation and every status change."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute("""
+                INSERT INTO active_plans (task_id, plan_id, original_task, status, plan_json)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (task_id) DO UPDATE SET
+                    status     = EXCLUDED.status,
+                    plan_json  = EXCLUDED.plan_json,
+                    updated_at = NOW()
+            """, (task_id, plan_id, original_task[:500], status, json.dumps(plan_json)))
+        log.debug("memory.plan_upserted", task_id=task_id, status=status)
+
+    async def load_active_plans(self) -> list[dict]:
+        """Return all plans that were still running when the process last exited."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute("""
+                SELECT task_id, plan_id, original_task, status, plan_json, created_at, updated_at
+                FROM active_plans
+                WHERE status IN ('planning', 'running')
+                ORDER BY created_at ASC
+            """)
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def expire_plans(self) -> int:
+        """Delete plan rows older than 7 days. Returns number deleted."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute("""
+                DELETE FROM active_plans
+                WHERE updated_at < NOW() - INTERVAL '7 days'
+                RETURNING task_id
+            """)
+            rows = await cur.fetchall()
+        deleted = len(rows)
+        if deleted:
+            log.info("memory.plans_expired", deleted=deleted)
+        return deleted
+
+    async def cleanup_stale(self, max_age_hours: int = 24) -> dict:
+        """
+        Delete completed/failed tasks, resolved plans, and old handoffs that are
+        older than *max_age_hours*. Called by the orchestrator think loop.
+
+        Returns a dict with counts of each type deleted so the caller can log
+        or emit a status event if anything was pruned.
+        """
+        interval = f"{max_age_hours} hours"
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            # Completed / failed tasks older than max_age
+            cur = await conn.execute(
+                """
+                DELETE FROM open_tasks
+                WHERE status IN ('done', 'failed')
+                  AND updated_at < NOW() - INTERVAL %s
+                RETURNING id
+                """,
+                (interval,),
+            )
+            tasks = len(await cur.fetchall())
+
+            # Terminal plans older than max_age
+            cur = await conn.execute(
+                """
+                DELETE FROM active_plans
+                WHERE status IN ('completed', 'expired', 'failed')
+                  AND updated_at < NOW() - INTERVAL %s
+                RETURNING task_id
+                """,
+                (interval,),
+            )
+            plans = len(await cur.fetchall())
+
+            # Handoffs (session summaries) older than max_age
+            cur = await conn.execute(
+                """
+                DELETE FROM handoffs
+                WHERE ts < NOW() - INTERVAL %s
+                RETURNING id
+                """,
+                (interval,),
+            )
+            handoffs = len(await cur.fetchall())
+
+        total = tasks + plans + handoffs
+        if total:
+            log.info(
+                "memory.stale_cleanup",
+                tasks=tasks,
+                plans=plans,
+                handoffs=handoffs,
+                max_age_hours=max_age_hours,
+            )
+        return {"tasks": tasks, "plans": plans, "handoffs": handoffs}
+
     async def close(self) -> None:
         if self._pool:
             await self._pool.close()
             self._pool = None
+
+    # ── Open task queue ──────────────────────────────────────────────────────
+
+    async def enqueue_task(self, task: str, priority: int = 5, agent: str = "orchestrator") -> int:
+        """Add a task to the persistent work queue. Returns the new task id."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO open_tasks (agent, task, priority)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (agent, task, priority),
+            )
+            row = await cur.fetchone()
+        task_id = row["id"]
+        log.info("memory.task_enqueued", task_id=task_id, priority=priority)
+        return task_id
+
+    async def get_pending_tasks(self, limit: int = 5, agent: str = "orchestrator") -> list[dict]:
+        """
+        Return pending tasks ordered by priority then age.
+        These are consumed by the think loop without any LLM call.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, agent, task, priority, created_at
+                FROM open_tasks
+                WHERE status = 'pending' AND agent = %s
+                ORDER BY priority ASC, created_at ASC
+                LIMIT %s
+                """,
+                (agent, limit),
+            )
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def claim_task(self, task_id: int) -> bool:
+        """Mark a task as running. Returns False if already claimed (concurrent safety)."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                UPDATE open_tasks
+                SET status = 'running', updated_at = NOW()
+                WHERE id = %s AND status = 'pending'
+                RETURNING id
+                """,
+                (task_id,),
+            )
+            row = await cur.fetchone()
+        return row is not None
+
+    async def complete_task(self, task_id: int) -> None:
+        """Mark a task as done."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "UPDATE open_tasks SET status = 'done', updated_at = NOW() WHERE id = %s",
+                (task_id,),
+            )
+
+    async def fail_task(self, task_id: int) -> None:
+        """Return a claimed task to pending so it can be retried."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "UPDATE open_tasks SET status = 'pending', updated_at = NOW() WHERE id = %s",
+                (task_id,),
+            )
+
+    # ── Shared tool registry ─────────────────────────────────────────────────
+    # All agents register capabilities here and search before calling the LLM.
+    # Executor is the primary runner but any agent may contribute tools.
+
+    async def register_tool(
+        self,
+        name: str,
+        description: str,
+        owner_agent: str,
+        invocation: str,
+        tags: Optional[list[str]] = None,
+        created_by: str = "system",
+    ) -> None:
+        """
+        Add or update a tool in the shared registry.
+        Upserts on name so re-registering on startup refreshes the embedding.
+        """
+        [embedding] = await asyncio.to_thread(_embed_texts, [description])
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO tools (name, description, owner_agent, invocation, tags, created_by, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    owner_agent = EXCLUDED.owner_agent,
+                    invocation  = EXCLUDED.invocation,
+                    tags        = EXCLUDED.tags,
+                    embedding   = EXCLUDED.embedding
+                """,
+                (name, description, owner_agent, invocation,
+                 json.dumps(tags or []), created_by, embedding),
+            )
+        log.debug("memory.tool_registered", name=name, owner=owner_agent)
+
+    async def search_tools(self, query: str, limit: int = 5) -> list[dict]:
+        """
+        Search the shared tool registry using semantic (pgvector) similarity.
+        Falls back to FTS when no embeddings are available.
+        Returns rows ordered by relevance (most similar first).
+        """
+        [embedding] = await asyncio.to_thread(_embed_texts, [query])
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            if embedding is not None:
+                cur = await conn.execute(
+                    """
+                    SELECT name, description, owner_agent, invocation, tags, usage_count,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM tools
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (embedding, embedding, limit),
+                )
+            else:
+                cur = await conn.execute(
+                    """
+                    SELECT name, description, owner_agent, invocation, tags, usage_count,
+                           ts_rank(
+                               to_tsvector('english', name || ' ' || description),
+                               plainto_tsquery('english', %s)
+                           ) AS similarity
+                    FROM tools
+                    WHERE to_tsvector('english', name || ' ' || description)
+                          @@ plainto_tsquery('english', %s)
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                    """,
+                    (query, query, limit),
+                )
+            rows = await cur.fetchall()
+        log.debug("memory.tools_searched", query=query[:60], results=len(rows))
+        return list(rows)
+
+    async def get_tool(self, name: str) -> Optional[dict]:
+        """Exact lookup by tool name."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT name, description, owner_agent, invocation, tags, usage_count "
+                "FROM tools WHERE name = %s",
+                (name,),
+            )
+            return await cur.fetchone()
+
+    async def increment_tool_usage(self, name: str) -> None:
+        """Bump usage_count so frequently-used tools sort higher over time."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "UPDATE tools SET usage_count = usage_count + 1 WHERE name = %s",
+                (name,),
+            )
+
+    # ── Executor capability registry ─────────────────────────────────────────
+    # Successful task→command mappings are stored here so the executor can
+    # re-run known operations without an LLM call.
+
+    async def store_capability(self, task: str, command: str, tags: Optional[list[str]] = None) -> None:
+        """
+        Persist a task→command mapping so the executor can reuse it.
+        Uses an upsert on title so re-running the same task refreshes the entry.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO knowledge (agent, topic, title, content, tags)
+                VALUES ('executor', 'capability', %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (task.lower().strip(), command, json.dumps(tags or ["executor", "capability"])),
+            )
+        log.debug("memory.capability_stored", task=task[:80], command=command[:80])
+
+    async def lookup_capability(self, task: str) -> Optional[str]:
+        """
+        Look up a previously stored command for a task using full-text search.
+        Returns the shell command string, or None if no confident match found.
+        """
+        pool = await self._get_pool()
+        normalized = task.lower().strip()
+        async with pool.connection() as conn:
+            # Exact title match first (fastest, highest confidence)
+            cur = await conn.execute(
+                "SELECT content FROM knowledge WHERE topic = 'capability' AND title = %s LIMIT 1",
+                (normalized,),
+            )
+            row = await cur.fetchone()
+            if row:
+                log.debug("memory.capability_hit_exact", task=task[:80])
+                return row["content"]
+
+            # FTS match — require all query terms to be present
+            cur = await conn.execute(
+                """
+                SELECT content,
+                       ts_rank(to_tsvector('english', title), plainto_tsquery('english', %s)) AS rank
+                FROM knowledge
+                WHERE topic = 'capability'
+                  AND to_tsvector('english', title) @@ plainto_tsquery('english', %s)
+                ORDER BY rank DESC
+                LIMIT 1
+                """,
+                (normalized, normalized),
+            )
+            row = await cur.fetchone()
+            if row and row["rank"] > 0.05:
+                log.debug("memory.capability_hit_fts", task=task[:80], rank=row["rank"])
+                return row["content"]
+
+        return None
+
+    # ── Context snapshots ────────────────────────────────────────────────────
+    # Unified recall + long-term memory for task, chat, and plan contexts.
+    # snapshot_seq=0 is always the canonical "current" row; rolling checkpoints
+    # use increasing seq numbers so users can roll back to any point.
+
+    async def save_context_snapshot(
+        self,
+        context_id: str,
+        context_type: str,
+        name: str,
+        *,
+        summary: Optional[str] = None,
+        snapshot_json: Optional[dict] = None,
+        keywords: Optional[list[str]] = None,
+        value_score: float = 0.0,
+        topic_category: Optional[str] = None,
+        message_count: int = 0,
+        status: str = "active",
+        snapshot_seq: int = 0,
+    ) -> None:
+        """
+        Create or update a context snapshot.  snapshot_seq=0 is the live row;
+        call with a higher seq to save a rolling checkpoint.
+        """
+        embed_text = f"{name} {summary or ''} {topic_category or ''}"
+        [embedding] = await asyncio.to_thread(_embed_texts, [embed_text])
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO context_snapshots
+                    (context_id, snapshot_seq, context_type, name, status,
+                     topic_category, keywords, summary, snapshot_json,
+                     value_score, message_count, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (context_id, snapshot_seq) DO UPDATE SET
+                    name           = EXCLUDED.name,
+                    status         = EXCLUDED.status,
+                    topic_category = EXCLUDED.topic_category,
+                    keywords       = EXCLUDED.keywords,
+                    summary        = EXCLUDED.summary,
+                    snapshot_json  = EXCLUDED.snapshot_json,
+                    value_score    = EXCLUDED.value_score,
+                    message_count  = EXCLUDED.message_count,
+                    embedding      = EXCLUDED.embedding,
+                    updated_at     = NOW()
+                """,
+                (
+                    context_id, snapshot_seq, context_type, name, status,
+                    topic_category, json.dumps(keywords or []),
+                    summary, json.dumps(snapshot_json or {}),
+                    value_score, message_count, embedding,
+                ),
+            )
+        log.debug("memory.context_snapshot_saved", context_id=context_id, seq=snapshot_seq)
+
+    async def close_context_snapshot(
+        self,
+        context_id: str,
+        summary: str,
+        snapshot_json: dict,
+        value_score: float,
+        *,
+        checkpoint: bool = True,
+    ) -> None:
+        """
+        Mark the live snapshot (seq=0) as closed and optionally save a final
+        checkpoint with the full state for rollback.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE context_snapshots
+                SET status    = 'closed',
+                    summary   = COALESCE(%s, summary),
+                    value_score = %s,
+                    closed_at = NOW(),
+                    updated_at = NOW()
+                WHERE context_id = %s AND snapshot_seq = 0
+                """,
+                (summary, value_score, context_id),
+            )
+            if checkpoint:
+                # Determine next seq
+                cur = await conn.execute(
+                    "SELECT MAX(snapshot_seq) AS mx FROM context_snapshots WHERE context_id = %s",
+                    (context_id,),
+                )
+                row = await cur.fetchone()
+                next_seq = (row["mx"] or 0) + 1
+                # Read current live row to copy metadata
+                cur = await conn.execute(
+                    "SELECT context_type, name, topic_category, keywords, message_count "
+                    "FROM context_snapshots WHERE context_id = %s AND snapshot_seq = 0",
+                    (context_id,),
+                )
+                live = await cur.fetchone()
+                if live:
+                    await conn.execute(
+                        """
+                        INSERT INTO context_snapshots
+                            (context_id, snapshot_seq, context_type, name, status,
+                             topic_category, keywords, summary, snapshot_json,
+                             value_score, message_count, closed_at)
+                        VALUES (%s, %s, %s, %s, 'closed', %s, %s, %s, %s, %s, %s, NOW())
+                        """,
+                        (
+                            context_id, next_seq,
+                            live["context_type"], live["name"],
+                            live["topic_category"], live["keywords"],
+                            summary, json.dumps(snapshot_json),
+                            value_score, live["message_count"],
+                        ),
+                    )
+        log.info("memory.context_closed", context_id=context_id, value_score=value_score)
+
+    async def get_context_snapshot(
+        self, context_id: str, snapshot_seq: int = 0
+    ) -> Optional[dict]:
+        """Return a specific snapshot row, or None if not found."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT * FROM context_snapshots WHERE context_id = %s AND snapshot_seq = %s",
+                (context_id, snapshot_seq),
+            )
+            return await cur.fetchone()
+
+    async def list_context_checkpoints(self, context_id: str) -> list[dict]:
+        """Return all rolling snapshots for a context ordered oldest→newest."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT context_id, snapshot_seq, status, summary, value_score, "
+                "message_count, created_at, closed_at "
+                "FROM context_snapshots WHERE context_id = %s ORDER BY snapshot_seq ASC",
+                (context_id,),
+            )
+            return list(await cur.fetchall())
+
+    async def search_context_snapshots(
+        self,
+        query: str,
+        context_type: Optional[str] = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """
+        Semantic + FTS search over closed and active context snapshots.
+        Returns snapshot_seq=0 rows only (latest state per context).
+        """
+        [embedding] = await asyncio.to_thread(_embed_texts, [query])
+        pool = await self._get_pool()
+        type_filter = "AND context_type = %s" if context_type else ""
+        async with pool.connection() as conn:
+            if embedding is not None:
+                params = [embedding, embedding]
+                if context_type:
+                    params.append(context_type)
+                params.append(limit)
+                cur = await conn.execute(
+                    f"""
+                    SELECT context_id, context_type, name, status, topic_category,
+                           keywords, summary, value_score, message_count,
+                           created_at, closed_at,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM context_snapshots
+                    WHERE snapshot_seq = 0 {type_filter}
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    params,
+                )
+            else:
+                params = [query, query]
+                if context_type:
+                    params.append(context_type)
+                params.append(limit)
+                cur = await conn.execute(
+                    f"""
+                    SELECT context_id, context_type, name, status, topic_category,
+                           keywords, summary, value_score, message_count,
+                           created_at, closed_at
+                    FROM context_snapshots
+                    WHERE snapshot_seq = 0
+                      AND to_tsvector('english', name || ' ' || COALESCE(summary,'') || ' ' || COALESCE(topic_category,''))
+                          @@ plainto_tsquery('english', %s)
+                      {type_filter}
+                    ORDER BY ts_rank(
+                        to_tsvector('english', name || ' ' || COALESCE(summary,'') || ' ' || COALESCE(topic_category,'')),
+                        plainto_tsquery('english', %s)
+                    ) DESC
+                    LIMIT %s
+                    """,
+                    params,
+                )
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def get_closed_session_count(self) -> int:
+        """Total number of closed contexts — used to decide when to start asking users for topic labels."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM context_snapshots WHERE snapshot_seq = 0 AND status = 'closed'"
+            )
+            row = await cur.fetchone()
+        return row["n"] if row else 0
+
+    # ── Topic patterns ───────────────────────────────────────────────────────
+    # Agents observe keyword→category correlations over sessions.
+    # Confidence grows as patterns repeat.  Low-confidence patterns prompt
+    # the user for a label (after enough sessions have accumulated).
+
+    async def save_topic_pattern(
+        self,
+        category: str,
+        keywords: list[str],
+        confidence: float = 0.5,
+        created_by: str = "orchestrator",
+    ) -> None:
+        """Insert a new topic pattern or update match_count + confidence if it already exists."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            # Check for an existing pattern with overlapping keywords
+            cur = await conn.execute(
+                "SELECT id, match_count FROM topic_patterns WHERE category = %s AND keywords = %s::jsonb",
+                (category, json.dumps(sorted(keywords))),
+            )
+            row = await cur.fetchone()
+            if row:
+                new_count = row["match_count"] + 1
+                # Confidence converges toward 1.0 as match_count grows (log scale)
+                import math
+                new_conf = min(0.99, 0.5 + 0.5 * math.log1p(new_count) / math.log1p(50))
+                await conn.execute(
+                    "UPDATE topic_patterns SET match_count = %s, confidence = %s, updated_at = NOW() WHERE id = %s",
+                    (new_count, new_conf, row["id"]),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO topic_patterns (category, keywords, confidence, created_by) VALUES (%s, %s::jsonb, %s, %s)",
+                    (category, json.dumps(sorted(keywords)), confidence, created_by),
+                )
+        log.debug("memory.topic_pattern_saved", category=category, keywords=keywords[:5])
+
+    async def search_topic_patterns(
+        self, keywords: list[str], limit: int = 5
+    ) -> list[dict]:
+        """
+        Find stored patterns whose keyword sets overlap most with *keywords*.
+        Returns rows ordered by Jaccard-style overlap (approximated via array intersection).
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            # Retrieve all patterns and compute overlap in Python (table stays small)
+            cur = await conn.execute(
+                "SELECT id, category, keywords, match_count, confidence FROM topic_patterns ORDER BY confidence DESC"
+            )
+            rows = await cur.fetchall()
+
+        if not rows:
+            return []
+
+        query_set = set(kw.lower() for kw in keywords)
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            pat_set = set(kw.lower() for kw in json.loads(row["keywords"]))
+            union = query_set | pat_set
+            if not union:
+                continue
+            jaccard = len(query_set & pat_set) / len(union)
+            scored.append((jaccard * row["confidence"], dict(row)))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored[:limit]]
+
+    async def confirm_topic_pattern(
+        self, category: str, keywords: list[str], confirmed_by: str = "user"
+    ) -> None:
+        """
+        Boost confidence of a pattern to 0.99 after user confirmation.
+        Also resets match_count to 50 so future variations inherit high base confidence.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE topic_patterns
+                SET confidence = 0.99, match_count = 50, updated_at = NOW()
+                WHERE category = %s AND keywords = %s::jsonb
+                """,
+                (category, json.dumps(sorted(keywords))),
+            )
+        log.info("memory.topic_pattern_confirmed", category=category, confirmed_by=confirmed_by)

@@ -35,7 +35,7 @@ services:
       retries: 10
       start_period: 10s
 
-  # ─── Orchestrator Agent ──────────────────────────────────────────────────────
+  # ─── Orchestrator Agent (always-on) ─────────────────────────────────────────
   orchestrator:
     build:
       context: .
@@ -44,6 +44,14 @@ services:
         AGENT_MODULE: orchestrator
     container_name: agent_orchestrator
     restart: unless-stopped
+    healthcheck:
+      # Verify the agent process is alive and its Redis connection is healthy.
+      # pgrep finds the main.py process; the redis-cli ping confirms the bus is reachable.
+      test: ["CMD-SHELL", "pgrep -f 'python.*main.py' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       redis:
         condition: service_healthy
@@ -57,25 +65,57 @@ services:
       - AGENT_ROLE=orchestrator
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agent-stack}
     volumes:
       - ./agents/orchestrator:/app/agent
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro                                              # read-only source visibility
-      - C:/Users/frigo/Documents/Coding Projects:/workspace/projects:ro # coding projects (read-only)
+      - ./emrys-src:/workspace/emrys:ro                                 # Emrys library source
+      - //c/Users/frigo/Documents/Coding Projects:/workspace/projects:ro # coding projects (read-only)
+      - /var/run/docker.sock:/var/run/docker.sock                       # spawn ephemeral agent containers
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ─── Document Q&A Agent ──────────────────────────────────────────────────────
+  # ─── Discord Bridge (always-on) ─────────────────────────────────────────────
+  discord_bridge:
+    build:
+      context: .
+      dockerfile: docker/bridge.Dockerfile
+    container_name: agent_discord_bridge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python.*main.py' > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
+      - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}   # Optional — #claude channel
+      - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-} # Optional — #control channel
+      - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}         # Optional — #agent-logs channel
+      - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./agents/discord_bridge:/app/agent   # live-reload: restart picks up code changes
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Document Q&A Agent (ephemeral — spun up by orchestrator on demand) ─────
   document_qa:
     build:
       context: .
-      dockerfile: docker/agent.Dockerfile
-      args:
-        AGENT_MODULE: document_qa
+      dockerfile: docker/document_qa.Dockerfile
     container_name: agent_document_qa
-    restart: unless-stopped
+    restart: "no"
     depends_on:
       redis:
         condition: service_healthy
@@ -89,16 +129,25 @@ services:
       - AGENT_ROLE=document_qa
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DOCS_PATH=/workspace/docs
+      - REPO_PATH=/workspace/src            # agent-stack source (read-only)
+      - GENERATED_PATH=/workspace/docs/generated
+      # Google Drive sync (optional) — leave blank to disable
+      - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/google_sa.json
     volumes:
       - ./agents/document_qa:/app/agent
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
-      - .:/workspace/src:ro
+      - .:/workspace/src:ro                 # full agent-stack source for architecture review
+      - ./emrys-src:/workspace/emrys:ro
+      # Google service account key — place your JSON at config/google_sa.json
+      # If the file doesn't exist the Drive sync is silently skipped.
+      - ./config/google_sa.json:/run/secrets/google_sa.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ─── Code Search Agent ───────────────────────────────────────────────────────
+  # ─── Code Search Agent (ephemeral — spun up by orchestrator on demand) ──────
   code_search:
     build:
       context: .
@@ -106,7 +155,7 @@ services:
       args:
         AGENT_MODULE: code_search
     container_name: agent_code_search
-    restart: unless-stopped
+    restart: "no"
     depends_on:
       redis:
         condition: service_healthy
@@ -120,33 +169,100 @@ services:
       - AGENT_ROLE=code_search
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - REPO_PATH=/workspace/repos
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
       - ./agents/code_search:/app/agent
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro
+      - ./emrys-src:/workspace/emrys:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ─── Discord Bridge ──────────────────────────────────────────────────────────
-  discord_bridge:
+  # ─── Claude Code Agent (ephemeral — spun up by orchestrator on demand) ──────
+  claude_code_agent:
     build:
       context: .
-      dockerfile: docker/bridge.Dockerfile
-    container_name: agent_discord_bridge
-    restart: unless-stopped
+      dockerfile: docker/claude_code.Dockerfile
+    container_name: agent_claude_code
+    restart: "no"
     depends_on:
       redis:
         condition: service_healthy
     environment:
       - REDIS_URL=redis://redis:6379
-      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
-      - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
-      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-6}
+      - CLAUDE_MAX_TOKENS=${CLAUDE_MAX_TOKENS:-8192}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
+    volumes:
+      - ./agents/claude_code_agent:/app/agent
+      - agent_workspace:/workspace
+      - .:/workspace/src                           # read-write: can modify agent source
+      - ./emrys-src:/workspace/emrys:ro
+      - /var/run/docker.sock:/var/run/docker.sock  # docker commands via run_shell
+      - //c/Users/frigo:/workspace/user             # user home directory
+      - //c/Users/frigo/Documents/Coding Projects:/workspace/projects
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
-  # ─── Tool Executor Agent ─────────────────────────────────────────────────────
+  # ─── SearXNG (self-hosted meta-search, used by research agent) ──────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: agent_searxng
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./docker/searxng:/etc/searxng:ro   # pre-baked settings.yml — no runtime setup needed
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY:-changeme-replace-in-prod}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Research Agent (ephemeral — spun up by orchestrator on demand) ──────────
+  research:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: research
+    container_name: agent_research
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=research
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SEARXNG_URL=http://searxng:8080
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
+    volumes:
+      - ./agents/research:/app/agent
+      - ./core:/app/core
+      - agent_workspace:/workspace
+      - model_cache:/root/.cache/torch
+      - .:/workspace/src:ro
+      - ./emrys-src:/workspace/emrys:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Tool Executor Agent (ephemeral — spun up by orchestrator on demand) ────
   executor:
     build:
       context: .
@@ -154,7 +270,7 @@ services:
       args:
         AGENT_MODULE: executor
     container_name: agent_executor
-    restart: unless-stopped
+    restart: "no"
     depends_on:
       redis:
         condition: service_healthy
@@ -167,15 +283,17 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=executor
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
       - ./agents/executor:/app/agent
       - ./core:/app/core
       - agent_workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src                           # read-write: executor can modify agent source files
+      - ./emrys-src:/workspace/emrys:ro
       - /var/run/docker.sock:/var/run/docker.sock  # docker restart for self-modification
-      - C:/Users/frigo:/workspace/user             # user home directory
-      - C:/Users/frigo/Documents/Coding Projects:/workspace/projects  # coding projects
+      - //c/Users/frigo:/workspace/user             # user home directory
+      - //c/Users/frigo/Documents/Coding Projects:/workspace/projects  # coding projects
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
+from core.context import truncate_task, truncate_code
 
 log = structlog.get_logger()
 
@@ -23,6 +24,26 @@ SYSTEM_PROMPT = """You are a code analysis specialist.
 You search codebases for patterns, bugs, and architectural decisions.
 Be precise about file paths and line references when possible.
 When you find a bug or important pattern, flag it clearly so it can be stored in long-term memory.
+
+## Tool-building
+After performing a search that produces a reusable grep/find pattern, save it to
+/workspace/tools/ (e.g. find-all-event-handlers.sh) so future tasks skip the LLM.
+Request executor to write the script if you cannot write files directly.
+
+## document_qa capabilities (delegate via orchestrator)
+The document_qa agent can now:
+- Answer questions from /workspace/docs (PDF, markdown, text) via pypdf + LLM
+- Review the agent-stack source at /workspace/src and generate architecture documents
+- Produce LaTeX documents and compile them to PDF using texlive/latexmk
+- Output files land in /workspace/docs/generated/
+Route tasks involving architecture documentation or report generation to document_qa.
+
+## research agent (delegate via orchestrator)
+The research agent searches the internet via SearXNG (Google + Bing + DDG):
+- Decomposes questions → searches → extracts facts → cross-source consensus check
+- Commits confident, sourced facts to Postgres (table: research_sources)
+- Zero Claude API calls — uses local LLM (Qwen) throughout
+Route "what is X", "latest version of Y", "current status of Z" to research.
 """
 
 # File extensions to index
@@ -45,9 +66,30 @@ class CodeSearchAgent(BaseAgent):
         super().__init__(settings)
         self.repo_path = Path(os.getenv("REPO_PATH", "/workspace/repos"))
 
+    _OWN_TOOLS = [
+        ("search-codebase-pattern",
+         "Search codebase source files for a keyword, function name, or pattern using grep",
+         "event:task.assigned:code_search",
+         ["code", "search", "grep", "pattern"]),
+        ("find-python-files",
+         "Find all Python source files in the workspace repositories",
+         "shell:find /workspace/repos -name '*.py' -not -path '*/__pycache__/*'",
+         ["code", "python", "files"]),
+        ("list-repo-directories",
+         "List top-level directories in the code repository workspace",
+         "shell:ls /workspace/repos/",
+         ["repos", "directories"]),
+        ("analyze-code-structure",
+         "Analyze code architecture, patterns, and explain how a module works",
+         "event:task.assigned:code_search",
+         ["code", "analysis", "architecture"]),
+    ]
+
     async def on_startup(self) -> None:
         self.repo_path.mkdir(parents=True, exist_ok=True)
-        log.info("code_search.startup", repo_path=str(self.repo_path))
+        for name, desc, inv, tags in self._OWN_TOOLS:
+            await self.memory.register_tool(name, desc, "code_search", inv, tags, "code_search")
+        log.info("code_search.startup", repo_path=str(self.repo_path), tools_seeded=len(self._OWN_TOOLS))
 
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:
@@ -55,7 +97,7 @@ class CodeSearchAgent(BaseAgent):
                 await self._handle_task(event)
 
     async def _handle_task(self, event: Event) -> None:
-        task = event.payload.get("task", "")
+        task = truncate_task(event.payload.get("task", ""))
         task_id = event.task_id
         subtask_id = event.payload.get("subtask_id")
         parent_task_id = event.payload.get("parent_task_id")
@@ -93,12 +135,16 @@ class CodeSearchAgent(BaseAgent):
             )
             return
 
+        # Search tool registry for relevant tools to include as context
+        tool_hits = await self.search_tools(task)
+        tools_ctx = self.format_tools_context(tool_hits)
+
         # Analyze via LLM
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context()),
-            HumanMessage(content=f"Code snippets:\n{snippets[:8000]}\n\nTask: {task}"),
+            SystemMessage(content=SYSTEM_PROMPT + tools_ctx + self.self_modify_context() + self.task_queue_context()),
+            HumanMessage(content=f"Code snippets:\n{truncate_code(snippets)}\n\nTask: {task}"),
         ]
-        response = await self.llm.ainvoke(messages)
+        response = await self.llm_invoke(messages)
         analysis = response.content
 
         # Stage findings for long-term promotion
