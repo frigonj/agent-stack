@@ -478,7 +478,7 @@ class DiscordBridgeClient(discord.Client):
                     continue
                 if meta.get("type") != "chat" or meta.get("status") != "active":
                     continue
-                last_active = meta.get("created_at", 0)
+                last_active = meta.get("last_active") or meta.get("updated_at") or meta.get("created_at", 0)
                 if now - last_active > idle_gap:
                     continue
                 pat_set = set(meta.get("keywords") or [])
@@ -874,9 +874,8 @@ class DiscordBridgeClient(discord.Client):
 
         try:
             if action == "send_message":
-                ch_id  = payload.get("channel_id") or self.task_channel_id
-                ch_name = payload.get("channel_name", "")
-                text    = payload.get("content", "")
+                ch_id = payload.get("channel_id")
+                text  = payload.get("content", "")
                 if not text:
                     await _ack("send_message requires non-empty content", ok=False)
                     return
@@ -884,6 +883,8 @@ class DiscordBridgeClient(discord.Client):
                     ch = await self.fetch_channel(int(ch_id))
                 else:
                     ch = await _resolve_channel(payload)
+                    if ch is None:
+                        ch = await self.fetch_channel(int(self.task_channel_id))
                 if not ch:
                     await _ack("Channel not found for send_message", ok=False)
                     return
