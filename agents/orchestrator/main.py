@@ -1439,6 +1439,10 @@ Rules for plans:
         if not result:
             return False, "Empty result"
 
+        # Executor couldn't extract or run a command — it only chatted
+        if result.startswith("[EXECUTOR_NO_CMD]"):
+            return False, "Executor produced no command — LLM described the task instead of running it"
+
         # Hard failure markers
         fail_markers = [
             "Exit code: 1\n", "Exit code: 2\n", "Exit code: 127\n",
@@ -1452,6 +1456,20 @@ Rules for plans:
         # Discord action failures
         if "'ok': False" in result or '"ok": false' in result.lower():
             return False, "Discord action reported failure"
+
+        # Expected outcome check: if the expected description names a concrete
+        # success signal, verify it appears somewhere in the result.
+        if expected:
+            exp_lower = expected.lower()
+            result_lower = result.lower()
+            # "exit code 0" → the result must contain "exit code: 0"
+            if "exit code 0" in exp_lower and "exit code: 0" not in result_lower:
+                return False, f"Expected '{expected}' but result has no 'Exit code: 0'"
+            # "file written" → result should mention a path or "written"
+            if "file written" in exp_lower and not any(
+                kw in result_lower for kw in ("written", "created", "saved", "/workspace")
+            ):
+                return False, f"Expected '{expected}' but result shows no file write confirmation"
 
         return True, ""
 

@@ -128,6 +128,7 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=document_qa
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
       - DOCS_PATH=/workspace/docs
       - REPO_PATH=/workspace/src            # agent-stack source (read-only)
       - GENERATED_PATH=/workspace/docs/generated

@@ -15,6 +15,7 @@ Every agent:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import time
@@ -149,6 +150,7 @@ class BaseAgent(ABC):
         )
 
         log.info("agent.ready", role=self.role)
+        await self._set_status("idle")
         await asyncio.gather(
             self._event_loop(),
             self._think_loop(),
@@ -378,12 +380,45 @@ class BaseAgent(ABC):
             asyncio.create_task(self._handle_and_ack(stream, entry_id, event))
 
     async def _handle_and_ack(self, stream: str, entry_id: str, event: Event) -> None:
+        await self._set_status("busy", task=event.payload.get("task", event.type.value)[:80])
         try:
             await self.handle_event(event)
             await self.bus.ack(stream, self.group_name, entry_id)
         except Exception as exc:
             log.error("agent.event_error", role=self.role, error=str(exc), event_id=event.event_id)
             await self._emit_error(event, exc)
+        finally:
+            await self._set_status("idle")
+
+    _STATUS_KEY_PREFIX = "agent:status"
+    _STATUS_TTL = 3600  # 1 hour — auto-expires so stale entries don't linger
+
+    async def _set_status(self, status: str, task: str = "") -> None:
+        """Publish agent status to Redis for the control script to query."""
+        try:
+            payload = json.dumps({
+                "status":  status,
+                "task":    task,
+                "since":   time.time(),
+                "queue":   await self._queue_depth(),
+            })
+            await self.bus._client.setex(
+                f"{self._STATUS_KEY_PREFIX}:{self.role}", self._STATUS_TTL, payload
+            )
+        except Exception:
+            pass  # status publishing is best-effort; never block the event loop
+
+    async def _queue_depth(self) -> int:
+        """Return the number of pending (unprocessed) messages in this agent's stream."""
+        try:
+            key = f"agents:{self.role}"
+            groups = await self.bus._client.xinfo_groups(key)
+            for g in groups:
+                lag = g.get("lag") or g.get("pel-count") or 0
+                return int(lag)
+        except Exception:
+            pass
+        return 0
 
     # ── LLM call management ─────────────────────────────────────────────────
 

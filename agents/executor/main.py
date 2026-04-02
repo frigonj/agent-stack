@@ -86,6 +86,17 @@ _INLINE_PATTERN = re.compile(
 )
 
 
+def _extract_cmd(content: str) -> str | None:
+    """
+    Extract the first CMD: line from an LLM response.
+    Returns the command string, or None if not present.
+    """
+    for line in content.splitlines():
+        if "CMD:" in line:
+            return line.split("CMD:", 1)[1].strip()
+    return None
+
+
 def _extract_inline_command(task: str) -> str | None:
     """
     If the task is a bare shell command or a thin wrapper around one
@@ -303,13 +314,31 @@ class ExecutorAgent(BaseAgent):
                         response = await self.llm_invoke(messages)
                         content = response.content
 
-                        result = content
-                        cmd_line = None
-                        if "CMD:" in content:
-                            cmd_line = next(
-                                (ln.split("CMD:", 1)[1].strip() for ln in content.splitlines() if "CMD:" in ln),
-                                None,
+                        cmd_line = self._extract_cmd(content)
+
+                        # ── 5a. Retry with a strict format prompt if no CMD: found ──
+                        if not cmd_line:
+                            log.warning(
+                                "executor.no_cmd_in_response",
+                                task=task[:80],
+                                preview=content[:120].replace("\n", " "),
                             )
+                            retry_messages = [
+                                SystemMessage(content=(
+                                    "You are a shell command executor. "
+                                    "Respond with EXACTLY one line in this format:\n"
+                                    "CMD: <shell command>\n\n"
+                                    "No explanation. No markdown. Just CMD: followed by the command."
+                                )),
+                                HumanMessage(content=f"Task: {task}"),
+                            ]
+                            try:
+                                retry_resp = await self.llm_invoke(retry_messages)
+                                cmd_line = self._extract_cmd(retry_resp.content)
+                            except Exception as exc:
+                                log.warning("executor.cmd_retry_failed", error=str(exc))
+
+                        result = content if not cmd_line else ""
                         if cmd_line:
                             result = await self._run_command(cmd_line, task, task_id, timeout=timeout)
                             # Store successful command for future reuse
@@ -326,6 +355,10 @@ class ExecutorAgent(BaseAgent):
                                     )
                                 # Promote complex commands to named tool scripts
                                 self._maybe_save_tool(task, cmd_line)
+                        else:
+                            # No command could be extracted — mark the result so the
+                            # orchestrator's validator can detect it as incomplete.
+                            result = f"[EXECUTOR_NO_CMD] {content}"
 
         await self.emit(
             EventType.AGENT_TOOL_RESULT,
