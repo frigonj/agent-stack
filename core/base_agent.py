@@ -562,27 +562,50 @@ class BaseAgent(ABC):
                 limit=limit,
             )
 
-        # ── Distributed lock via Redis SET NX + pub/sub wake-up ─────────────
-        lock_value  = f"{self.role}:{id(messages)}"
-        notify_chan  = f"{self._LLM_LOCK_KEY}:released"
-        acquired    = False
+        # ── Distributed lock with priority queue ────────────────────────────
+        #
+        # Priority: orchestrator (score 0) always cuts the queue ahead of
+        # specialist agents (score 1). This keeps user-facing response latency
+        # low even when specialists are busy with multi-call pipelines.
+        #
+        # Mechanism:
+        #   llm:queue  — Redis sorted set; members are "role:nonce", score is
+        #                priority (0 = high, 1 = normal).  ZADD NX adds our
+        #                entry; we hold the lock when we are rank-0 AND the
+        #                SET NX lock key is ours.
+        #   llm:lock   — Redis string SET NX; actual mutual-exclusion token.
+        #   llm:lock:released — pub/sub channel; PUBLISH wakes up waiters.
+        #
+        lock_priority = 0 if self.role == "orchestrator" else 1
+        nonce         = str(id(messages))
+        member        = f"{self.role}:{nonce}"
+        lock_value    = member
+        queue_key     = f"{self._LLM_LOCK_KEY}:queue"
+        notify_chan    = f"{self._LLM_LOCK_KEY}:released"
+        acquired      = False
 
-        while not acquired:
-            ok = await self.bus._client.set(
-                self._LLM_LOCK_KEY, lock_value,
-                nx=True, ex=self._LLM_LOCK_TTL,
-            )
-            if ok:
-                acquired = True
-            else:
-                log.debug("agent.llm_lock_waiting", role=self.role)
-                # Subscribe and block until the current holder releases the lock.
-                # This replaces the 1.5 s busy-poll loop — agents wake up instantly.
+        # Register in the priority queue
+        await self.bus._client.zadd(queue_key, {member: lock_priority}, nx=True)
+        # Set a TTL on the queue key itself so crashed agents don't litter it
+        await self.bus._client.expire(queue_key, self._LLM_LOCK_TTL * 10)
+
+        try:
+            while not acquired:
+                # We can attempt the lock only when we are at the front of the queue
+                front = await self.bus._client.zrange(queue_key, 0, 0)
+                if front and front[0] == member:
+                    ok = await self.bus._client.set(
+                        self._LLM_LOCK_KEY, lock_value,
+                        nx=True, ex=self._LLM_LOCK_TTL,
+                    )
+                    if ok:
+                        acquired = True
+                        continue
+
+                log.debug("agent.llm_lock_waiting", role=self.role, priority=lock_priority)
                 pubsub = self.bus._client.pubsub()
                 await pubsub.subscribe(notify_chan)
                 try:
-                    # Wait up to _LLM_LOCK_TTL seconds so we never stall longer
-                    # than the lock's own TTL even if the PUBLISH is missed.
                     await pubsub.get_message(
                         ignore_subscribe_messages=True,
                         timeout=float(self._LLM_LOCK_TTL),
@@ -590,6 +613,10 @@ class BaseAgent(ABC):
                 finally:
                     await pubsub.unsubscribe(notify_chan)
                     await pubsub.aclose()
+        except Exception:
+            # Clean up queue entry if we never acquired the lock
+            await self.bus._client.zrem(queue_key, member)
+            raise
 
         try:
             result = await self.llm.ainvoke(messages)
@@ -611,11 +638,11 @@ class BaseAgent(ABC):
                 )
             raise
         finally:
-            # Release lock only if we still own it (guard against TTL expiry)
+            # Remove from queue and release lock, then wake up waiters
+            await self.bus._client.zrem(queue_key, member)
             current = await self.bus._client.get(self._LLM_LOCK_KEY)
             if current == lock_value:
                 await self.bus._client.delete(self._LLM_LOCK_KEY)
-                # Wake up all waiters immediately
                 await self.bus._client.publish(notify_chan, "released")
 
     # ── Memory helpers ───────────────────────────────────────────────────────

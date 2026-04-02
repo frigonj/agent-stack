@@ -2213,13 +2213,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 await self._publish_reply(result, task_id, discord_message_id, original_task=original_task)
                 return
 
-        combined = truncate_result("\n\n".join(f"[{src}]: {res}" for src, res in raw_results))
+        summary_system = (
+            "You are a concise assistant. Summarise the gathered information into a clear reply. "
+            "Interpret command output plainly. If nothing useful was found, say so honestly."
+        )
+        fixed = f"Task: {original_task}\n\nInformation gathered:\n"
+        budget = await self._budget_content_chars(summary_system, fixed)
+        raw_combined = "\n\n".join(f"[{src}]: {res}" for src, res in raw_results)
+        combined = raw_combined[:budget]
         messages = [
-            SystemMessage(content=(
-                "You are a concise assistant. Summarise the gathered information into a clear reply. "
-                "Interpret command output plainly. If nothing useful was found, say so honestly."
-            )),
-            HumanMessage(content=f"Task: {original_task}\n\nInformation gathered:\n{combined}"),
+            SystemMessage(content=summary_system),
+            HumanMessage(content=fixed + combined),
         ]
         response = await self.llm_invoke(messages)
         await self._publish_reply(response.content, task_id, discord_message_id, original_task=original_task)
