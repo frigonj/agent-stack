@@ -50,7 +50,7 @@ _SRC_SKIP_DIRS  = {"__pycache__", ".git", "node_modules", ".venv", "venv", "dist
 
 # Hard cap on source-tree chars loaded for a single review.
 # The real cap is calculated dynamically from the model's context limit in
-# _doc_budget_chars(); this is the fallback for very small context windows.
+# _budget_content_chars(); this is the fallback for very small context windows.
 _SRC_MAX_CHARS = 12_000
 
 SYSTEM_PROMPT = """You are a documentation and architecture specialist with LaTeX typesetting skills.
@@ -165,29 +165,6 @@ class DocumentQAAgent(BaseAgent):
             tools_seeded=len(self._OWN_TOOLS),
         )
 
-    async def _doc_budget_chars(self, system_msg: str, task: str = "") -> int:
-        """
-        Return the character budget available for document/source content.
-
-        Formula:
-            budget = (context_limit * 0.70) - tokens(system_msg) - tokens(task) - reply_reserve
-        Reply reserve = 25% of context_limit.
-        Minimum returned is 1000 chars so we always send something useful.
-        """
-        ctx_limit  = await self._get_model_context_limit()
-        # Keep 30% headroom (25% reply + 5% overhead padding)
-        input_cap  = int(ctx_limit * 0.70)
-        sys_tokens = self._estimate_tokens([SystemMessage(content=system_msg)])
-        task_toks  = len(task) // 4  # fast approximation for short strings
-        available  = max(1_000, (input_cap - sys_tokens - task_toks) * 4)  # back to chars
-        log.debug(
-            "document_qa.doc_budget",
-            ctx_limit=ctx_limit,
-            sys_tokens=sys_tokens,
-            available_chars=available,
-        )
-        return available
-
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:
             if event.payload.get("assigned_to") == "document_qa":
@@ -242,7 +219,7 @@ class DocumentQAAgent(BaseAgent):
         tools_ctx = self.format_tools_context(tool_hits)
         # Use lean system prompt — self_modify/task_queue context is irrelevant for doc QA
         system_msg = SYSTEM_PROMPT + tools_ctx
-        budget = await self._doc_budget_chars(system_msg, task)
+        budget = await self._budget_content_chars(system_msg, task)
         # Respect both the dynamic budget and the static truncate_file ceiling
         capped_content = doc_content[:budget]
 
@@ -270,7 +247,7 @@ class DocumentQAAgent(BaseAgent):
         tool_hits = await self.search_tools(task)
         tools_ctx = self.format_tools_context(tool_hits)
         system_msg = SYSTEM_PROMPT + tools_ctx
-        budget = await self._doc_budget_chars(system_msg, task)
+        budget = await self._budget_content_chars(system_msg, task)
         capped_content = pdf_content[:budget]
 
         messages = [
@@ -299,7 +276,7 @@ class DocumentQAAgent(BaseAgent):
             "Then produce a complete LaTeX document source for this architecture.\n"
             "I will compile and save it."
         )
-        budget = await self._doc_budget_chars(system_msg, task + instructions)
+        budget = await self._budget_content_chars(system_msg, task + instructions)
         source_tree = self._load_source_tree(max_chars=min(budget, _SRC_MAX_CHARS))
         if not source_tree:
             return (
@@ -349,7 +326,7 @@ class DocumentQAAgent(BaseAgent):
                 "Wrap the LaTeX source in \\begin{document}...\\end{document}. "
                 "I will extract and compile it."
             )
-            budget = await self._doc_budget_chars(system_msg, task + latex_instructions)
+            budget = await self._budget_content_chars(system_msg, task + latex_instructions)
             ctx = self._load_source_tree(max_chars=min(budget, _SRC_MAX_CHARS))
 
         messages = [

@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
-from core.context import truncate_task, truncate_code
+from core.context import truncate_task
 
 log = structlog.get_logger()
 
@@ -138,11 +138,16 @@ class CodeSearchAgent(BaseAgent):
         # Search tool registry for relevant tools to include as context
         tool_hits = await self.search_tools(task)
         tools_ctx = self.format_tools_context(tool_hits)
+        system_msg = SYSTEM_PROMPT + tools_ctx
+
+        # Cap snippet size to what actually fits in the model's context window
+        budget = await self._budget_content_chars(system_msg, f"Code snippets:\n\n\nTask: {task}")
+        fitted_snippets = snippets[:budget]
 
         # Analyze via LLM
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT + tools_ctx + self.self_modify_context() + self.task_queue_context()),
-            HumanMessage(content=f"Code snippets:\n{truncate_code(snippets)}\n\nTask: {task}"),
+            SystemMessage(content=system_msg),
+            HumanMessage(content=f"Code snippets:\n{fitted_snippets}\n\nTask: {task}"),
         ]
         response = await self.llm_invoke(messages)
         analysis = response.content

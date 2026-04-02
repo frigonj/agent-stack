@@ -308,7 +308,7 @@ class ExecutorAgent(BaseAgent):
                         # ── 5. Fall back to LLM ───────────────────────────────
                         tools_ctx = self.format_tools_context(tool_hits)
                         messages = [
-                            SystemMessage(content=SYSTEM_PROMPT + tools_ctx + self.self_modify_context() + self.task_queue_context()),
+                            SystemMessage(content=SYSTEM_PROMPT + tools_ctx),
                             HumanMessage(content=f"Task: {task}"),
                         ]
                         response = await self.llm_invoke(messages)

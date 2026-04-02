@@ -476,6 +476,34 @@ class BaseAgent(ABC):
             total += _count_tokens(content)
         return total
 
+    async def _budget_content_chars(self, system_msg: str, fixed_content: str = "") -> int:
+        """
+        Return the character budget available for variable document/code content.
+
+        Subtracts the system message and any fixed content (task description,
+        static instructions) from the model's input budget, leaving room for
+        the reply (25% of context window).
+
+        Use this before loading large content (files, source trees, code snippets)
+        to avoid sending more tokens than the model can accept.
+
+        Returns at least 1 000 chars so there's always something useful to send.
+        """
+        ctx_limit   = await self._get_model_context_limit()
+        input_cap   = int(ctx_limit * 0.70)          # 25% reply + 5% overhead
+        sys_tokens  = self._estimate_tokens([SystemMessage(content=system_msg)])
+        fixed_toks  = _count_tokens(fixed_content) if fixed_content else 0
+        available   = max(1_000, (input_cap - sys_tokens - fixed_toks) * 4)
+        log.debug(
+            "agent.content_budget",
+            role=self.role,
+            ctx_limit=ctx_limit,
+            sys_tokens=sys_tokens,
+            fixed_tokens=fixed_toks,
+            available_chars=available,
+        )
+        return available
+
     def _circuit_check(self) -> bool:
         """
         Return True if the circuit is currently open (LM Studio considered down).

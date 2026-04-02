@@ -329,7 +329,7 @@ class ResearchAgent(BaseAgent):
 
     async def _decompose(self, question: str) -> list[str]:
         try:
-            resp = await self.llm.ainvoke([
+            resp = await self.llm_invoke([
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(content=_decompose_prompt(question)),
             ])
@@ -378,7 +378,7 @@ class ResearchAgent(BaseAgent):
                 "multiple independent sources. Please try a more specific query."
             )
         try:
-            resp = await self.llm.ainvoke([
+            resp = await self.llm_invoke([
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(content=_synthesise_prompt(question, facts)),
             ])
