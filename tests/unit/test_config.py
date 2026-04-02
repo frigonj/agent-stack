@@ -13,7 +13,6 @@ def test_default_values():
     """Settings have sensible defaults."""
     s = Settings()
     assert s.redis_url == "redis://localhost:6379"
-    assert s.emrys_url == "http://localhost:8000"
     assert s.lm_studio_url == "http://host.docker.internal:1234"
     assert s.lm_studio_model == "qwen2.5-14b"
     assert s.log_level == "INFO"

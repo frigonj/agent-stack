@@ -72,6 +72,20 @@ jobs:
           --health-timeout 3s
           --health-retries 5
 
+      postgres:
+        image: pgvector/pgvector:pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: agent
+          POSTGRES_DB: agentmem
+        options: >-
+          --health-cmd "pg_isready -U agent -d agentmem"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -84,20 +98,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Emrys
-        run: pip install "emrys[vectors] @ git+https://github.com/NuAvalon/emrys.git"
-
-      - name: Start Emrys MCP server
-        run: |
-          mkdir -p /tmp/emrys-persist
-          emrys serve --persist-dir /tmp/emrys-persist &
-          sleep 3
-          echo "Emrys started"
-
       - name: Run integration tests
         env:
           REDIS_URL: redis://localhost:6379
-          EMRYS_URL: http://localhost:8000
+          DATABASE_URL: postgresql://agent:agent@localhost:5432/agentmem
           LM_STUDIO_URL: http://localhost:1234   # Will be mocked in tests
           AGENT_ROLE: test_agent
         run: pytest tests/integration/ -v --timeout=60
@@ -109,22 +113,33 @@ jobs:
     needs: lint
     strategy:
       matrix:
-        agent: [orchestrator, document_qa, code_search, executor]
+        include:
+          - agent: orchestrator
+            dockerfile: docker/agent.Dockerfile
+            args: "--build-arg AGENT_MODULE=orchestrator"
+          - agent: code_search
+            dockerfile: docker/agent.Dockerfile
+            args: "--build-arg AGENT_MODULE=code_search"
+          - agent: executor
+            dockerfile: docker/agent.Dockerfile
+            args: "--build-arg AGENT_MODULE=executor"
+          - agent: document_qa
+            dockerfile: docker/document_qa.Dockerfile
+            args: ""
+          - agent: discord_bridge
+            dockerfile: docker/bridge.Dockerfile
+            args: ""
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build agent image (${{ matrix.agent }})
+      - name: Build ${{ matrix.agent }} image
         run: |
           docker build \
-            --file docker/agent.Dockerfile \
-            --build-arg AGENT_MODULE=${{ matrix.agent }} \
+            --file ${{ matrix.dockerfile }} \
+            ${{ matrix.args }} \
             --tag agent-${{ matrix.agent }}:ci \
             .
-
-      - name: Build Emrys image
-        if: matrix.agent == 'orchestrator'
-        run: docker build --file docker/emrys.Dockerfile --tag agent-emrys:ci .
 
   # ─── Stack Smoke Test ─────────────────────────────────────────────────────
   stack-smoke:
@@ -141,19 +156,20 @@ jobs:
           LM_STUDIO_URL=http://localhost:1234
           LM_STUDIO_MODEL=mock-model
           LOG_LEVEL=DEBUG
+          DISCORD_BOT_TOKEN=placeholder
+          DISCORD_TASK_CHANNEL_ID=000000000000000000
           EOF
 
-      - name: Start infrastructure only (Redis + Emrys)
+      - name: Start infrastructure (Redis + Postgres)
         run: |
-          docker compose up -d redis emrys
-          sleep 5
+          docker compose up -d redis postgres
+          sleep 10
 
       - name: Verify Redis health
         run: docker compose exec -T redis redis-cli ping | grep -q PONG
 
-      - name: Verify Emrys health
-        run: |
-          docker compose exec -T emrys python -c "import emrys; print('emrys ok')"
+      - name: Verify Postgres health
+        run: docker compose exec -T postgres pg_isready -U agent -d agentmem
 
       - name: Tear down
         if: always()
