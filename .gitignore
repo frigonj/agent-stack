@@ -23,7 +23,11 @@ coverage.xml
 emrys-src/
 
 # Workspace data (mounted volumes — not versioned)
-workspace/
+# Ignore everything inside workspace/ except the seed tool scripts
+workspace/*
+!workspace/tools/
+workspace/tools/*
+!workspace/tools/*.sh
 
 # Docker
 *.log

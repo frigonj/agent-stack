@@ -32,36 +32,252 @@ log = structlog.get_logger()
 
 # ── Built-in tool definitions seeded into the shared registry on startup ─────
 # All agents can find and reference these. Executor owns + executes shell: tools.
+# Format: (name, description-with-example, shell_invocation, tags)
+# The description is embedded for semantic search — include usage examples so the
+# planner can generate correct CMD: lines without guessing syntax.
 _BUILTIN_TOOLS: list[tuple[str, str, str, list[str]]] = [
-    # (name, description, shell_invocation, tags)
+
+    # ── Docker ────────────────────────────────────────────────────────────────
     ("list-docker-containers",
-     "List all running Docker containers with status",
+     "List all running Docker containers with name, status, ports. "
+     "Example: CMD: docker ps",
      "shell:docker ps",
-     ["docker", "containers", "status"]),
-    ("list-docker-all-containers",
-     "List all Docker containers including stopped ones",
+     ["docker", "containers", "status", "list"]),
+
+    ("list-all-docker-containers",
+     "List all Docker containers including stopped ones. "
+     "Example: CMD: docker ps -a",
      "shell:docker ps -a",
-     ["docker", "containers"]),
+     ["docker", "containers", "stopped"]),
+
+    ("docker-logs",
+     "Tail logs of a Docker container. "
+     "Example: CMD: docker logs --tail 100 agent_orchestrator",
+     "shell:docker logs --tail 100 <container_name>",
+     ["docker", "logs", "debug"]),
+
+    ("docker-restart",
+     "Restart a Docker container by name. Requires AUTO_APPROVED tier. "
+     "Example: CMD: docker restart agent_executor",
+     "shell:docker restart <container_name>",
+     ["docker", "restart", "container"]),
+
+    ("docker-exec",
+     "Run a command inside a running container. "
+     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+     "shell:docker exec <container> <command>",
+     ["docker", "exec", "container"]),
+
+    ("docker-inspect",
+     "Show detailed container metadata (env vars, mounts, network). "
+     "Example: CMD: docker inspect agent_orchestrator",
+     "shell:docker inspect <container_name>",
+     ["docker", "inspect", "metadata"]),
+
+    ("docker-compose-ps",
+     "Show status of all compose services. "
+     "Example: CMD: docker compose ps",
+     "shell:docker compose ps",
+     ["docker", "compose", "services", "status"]),
+
+    # ── File operations ───────────────────────────────────────────────────────
+    ("read-file",
+     "Print file contents to stdout. "
+     "Example: CMD: cat /workspace/src/core/config.py",
+     "shell:cat <file_path>",
+     ["file", "read", "cat"]),
+
+    ("list-directory",
+     "List files and directories. Use -la for details, -R for recursive. "
+     "Example: CMD: ls -la /workspace/src/agents/",
+     "shell:ls -la <directory>",
+     ["file", "list", "directory", "ls"]),
+
+    ("find-files",
+     "Find files by name pattern recursively. "
+     "Example: CMD: find /workspace -name '*.py' -not -path '*/__pycache__/*'",
+     "shell:find <dir> -name '<pattern>'",
+     ["file", "find", "search", "pattern"]),
+
+    ("grep-in-files",
+     "Search file contents for a pattern. -r recursive, -n line numbers, -l files only. "
+     "Example: CMD: grep -rn 'EventType' /workspace/src/core/",
+     "shell:grep -rn '<pattern>' <directory>",
+     ["grep", "search", "text", "pattern", "code"]),
+
+    ("head-file",
+     "Print first N lines of a file. "
+     "Example: CMD: head -50 /workspace/src/agents/orchestrator/main.py",
+     "shell:head -<N> <file_path>",
+     ["file", "read", "head"]),
+
+    ("tail-file",
+     "Print last N lines of a file (useful for logs). "
+     "Example: CMD: tail -100 /workspace/logs/orchestrator.log",
+     "shell:tail -<N> <file_path>",
+     ["file", "read", "tail", "logs"]),
+
+    ("write-file",
+     "Write content to a file using tee. Requires AUTO_APPROVED tier. "
+     "Example: CMD: tee /workspace/tools/my-script.sh << 'EOF'\\n#!/bin/bash\\n...\\nEOF",
+     "shell:tee <file_path> << 'EOF'\\n<content>\\nEOF",
+     ["file", "write", "create", "tee"]),
+
+    ("make-executable",
+     "Make a script executable with chmod. "
+     "Example: CMD: chmod +x /workspace/tools/my-script.sh",
+     "shell:chmod +x <file_path>",
+     ["file", "chmod", "executable", "script"]),
+
+    ("disk-usage",
+     "Show disk space usage of a directory or volume. "
+     "Example: CMD: df -h /workspace",
+     "shell:df -h <path>",
+     ["disk", "storage", "usage", "workspace"]),
+
+    ("directory-size",
+     "Show the size of each subdirectory. "
+     "Example: CMD: du -sh /workspace/*/",
+     "shell:du -sh <path>/*/",
+     ["disk", "size", "directory"]),
+
+    # ── Git ───────────────────────────────────────────────────────────────────
+    ("git-log",
+     "Show recent git commit history with author and message. "
+     "Example: CMD: git -C /workspace/src log --oneline -20",
+     "shell:git -C <repo_path> log --oneline -<N>",
+     ["git", "log", "history", "commits"]),
+
+    ("git-status",
+     "Show working tree status — modified, staged, untracked files. "
+     "Example: CMD: git -C /workspace/src status",
+     "shell:git -C <repo_path> status",
+     ["git", "status", "changes"]),
+
+    ("git-diff",
+     "Show unstaged changes in the working tree. "
+     "Example: CMD: git -C /workspace/src diff",
+     "shell:git -C <repo_path> diff",
+     ["git", "diff", "changes"]),
+
+    ("git-pull",
+     "Pull latest changes from remote. "
+     "Example: CMD: git -C /workspace/src pull",
+     "shell:git -C <repo_path> pull",
+     ["git", "pull", "update", "sync"]),
+
+    # ── Python / pip ──────────────────────────────────────────────────────────
+    ("run-python-script",
+     "Execute a Python script. "
+     "Example: CMD: python3 /workspace/tools/check_health.py",
+     "shell:python3 <script_path>",
+     ["python", "script", "run", "execute"]),
+
+    ("pip-install",
+     "Install a Python package. Requires REQUIRES_APPROVAL tier. "
+     "Example: CMD: pip install requests",
+     "shell:pip install <package_name>",
+     ["pip", "install", "python", "package"]),
+
+    ("pip-list",
+     "List installed Python packages and versions. "
+     "Example: CMD: pip list",
+     "shell:pip list",
+     ["pip", "python", "packages", "installed"]),
+
+    ("run-pytest",
+     "Run the test suite with pytest. "
+     "Example: CMD: pytest /workspace/src/tests/unit/ -v",
+     "shell:pytest <test_path> -v",
+     ["pytest", "test", "unit", "testing"]),
+
+    # ── Redis ─────────────────────────────────────────────────────────────────
+    ("redis-list-keys",
+     "List all Redis keys matching a pattern. "
+     "Example: CMD: docker exec agent_redis redis-cli keys 'agents:*'",
+     "shell:docker exec agent_redis redis-cli keys '<pattern>'",
+     ["redis", "keys", "list"]),
+
+    ("redis-get-key",
+     "Get the value of a Redis key. "
+     "Example: CMD: docker exec agent_redis redis-cli get 'agent:status:orchestrator'",
+     "shell:docker exec agent_redis redis-cli get '<key>'",
+     ["redis", "get", "value"]),
+
+    ("redis-stream-length",
+     "Get the number of entries in a Redis stream. "
+     "Example: CMD: docker exec agent_redis redis-cli xlen agents:orchestrator",
+     "shell:docker exec agent_redis redis-cli xlen <stream_name>",
+     ["redis", "stream", "length", "queue"]),
+
+    ("redis-stream-read",
+     "Read recent entries from a Redis stream. "
+     "Example: CMD: docker exec agent_redis redis-cli xrevrange agents:broadcast + - COUNT 10",
+     "shell:docker exec agent_redis redis-cli xrevrange <stream> + - COUNT <N>",
+     ["redis", "stream", "read", "events"]),
+
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    ("postgres-query",
+     "Run an SQL query against the agent memory database. "
+     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT topic, COUNT(*) FROM knowledge GROUP BY topic;'",
+     "shell:docker exec agent_postgres psql -U agent -d agentmem -c '<SQL>'",
+     ["postgres", "sql", "database", "query"]),
+
+    ("postgres-count-knowledge",
+     "Count knowledge entries in the agent long-term memory database. "
+     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+     "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+     ["postgres", "memory", "knowledge", "count"]),
+
+    ("postgres-list-tools",
+     "List all registered tools in the shared tool registry. "
+     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
+     "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
+     ["postgres", "tools", "registry", "list"]),
+
+    # ── Process / system ──────────────────────────────────────────────────────
+    ("list-processes",
+     "List running processes. Use grep to filter. "
+     "Example: CMD: ps aux | grep python",
+     "shell:ps aux | grep <process_name>",
+     ["processes", "system", "ps"]),
+
+    ("check-port",
+     "Check if a port is listening. "
+     "Example: CMD: ss -tlnp | grep 6379",
+     "shell:ss -tlnp | grep <port>",
+     ["network", "port", "listening"]),
+
+    ("curl-endpoint",
+     "Make an HTTP request to an endpoint. Requires REQUIRES_APPROVAL. "
+     "Example: CMD: curl -s http://localhost:1234/api/v0/models | python3 -m json.tool",
+     "shell:curl -s <url>",
+     ["curl", "http", "network", "api"]),
+
+    # ── Workspace / agent stack ───────────────────────────────────────────────
     ("list-workspace-tools",
-     "List all saved reusable scripts in /workspace/tools/",
+     "List all saved reusable scripts in /workspace/tools/. "
+     "Example: CMD: ls -la /workspace/tools/",
      "shell:ls -la /workspace/tools/",
-     ["tools", "scripts", "workspace"]),
-    ("list-agent-source",
-     "List all agent source directories in the stack",
+     ["tools", "scripts", "workspace", "list"]),
+
+    ("list-agent-sources",
+     "List all agent source directories in the stack. "
+     "Example: CMD: ls /workspace/src/agents/",
      "shell:ls /workspace/src/agents/",
-     ["agents", "source"]),
-    ("show-disk-usage",
-     "Show disk usage of workspace volumes",
-     "shell:df -h /workspace",
-     ["disk", "workspace"]),
-    ("list-python-processes",
-     "Show running Python processes inside containers",
-     "shell:ps aux | grep python",
-     ["processes", "python"]),
+     ["agents", "source", "list"]),
+
     ("show-redis-streams",
-     "List all Redis streams and their lengths",
+     "List all Redis event streams and their lengths. "
+     "Example: CMD: docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
      "shell:docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
-     ["redis", "streams", "events"]),
+     ["redis", "streams", "events", "agents"]),
+
+    ("show-agent-status",
+     "Show the current status (idle/busy) of all agents from Redis. "
+     "Example: CMD: docker exec agent_redis redis-cli keys 'agent:status:*'",
+     "shell:docker exec agent_redis redis-cli keys 'agent:status:*'",
+     ["agents", "status", "redis", "monitoring"]),
 ]
 
 
@@ -247,6 +463,95 @@ class ExecutorAgent(BaseAgent):
         for name, desc, inv, tags in _BUILTIN_TOOLS:
             await self.memory.register_tool(name, desc, "executor", inv, tags, "executor")
         log.info("executor.tools_seeded", count=len(_BUILTIN_TOOLS))
+        await self._seed_workspace_scripts()
+        discovered = await self._scan_workspace_tools()
+        log.info("executor.workspace_tools_scanned", discovered=discovered)
+
+    async def _seed_workspace_scripts(self) -> None:
+        """
+        Copy seed tool scripts from /workspace/src/workspace/tools/ into
+        /workspace/tools/ if they do not already exist there.
+
+        This makes repo-committed scripts available on the named Docker volume
+        on first start without needing a separate bind mount.
+        """
+        import shutil
+        src_tools = Path("/workspace/src/workspace/tools")
+        if not src_tools.exists():
+            return
+        TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for script in src_tools.glob("*.sh"):
+            dest = TOOLS_DIR / script.name
+            if not dest.exists():
+                try:
+                    shutil.copy2(script, dest)
+                    dest.chmod(0o755)
+                    copied += 1
+                    log.info("executor.seed_script_copied", script=script.name)
+                except Exception as exc:
+                    log.warning("executor.seed_script_copy_failed", script=script.name, error=str(exc))
+        if copied:
+            log.info("executor.seed_scripts_installed", count=copied)
+
+    async def _scan_workspace_tools(self) -> int:
+        """
+        Scan /workspace/tools/ for shell scripts and register each one in the
+        shared tool registry.  Scripts are expected to carry a header like:
+
+            #!/bin/bash
+            # Description: What this script does (used as the registry description)
+            # Usage: ./script-name.sh [arg1] [arg2]      (optional, appended to desc)
+            # Tags: tag1, tag2, tag3                       (optional)
+
+        Idempotent — register_tool() upserts on name, so re-scanning on restart
+        refreshes descriptions without creating duplicates.
+
+        Returns the number of scripts discovered and registered.
+        """
+        if not TOOLS_DIR.exists():
+            return 0
+
+        count = 0
+        for script in sorted(TOOLS_DIR.glob("*.sh")):
+            try:
+                lines = script.read_text(errors="ignore").splitlines()
+            except Exception as exc:
+                log.warning("executor.scan_tool_read_error", path=str(script), error=str(exc))
+                continue
+
+            description = ""
+            usage       = ""
+            tags: list[str] = ["workspace-tool", "script"]
+
+            for line in lines[:20]:   # only parse the header block
+                stripped = line.strip()
+                if stripped.startswith("# Description:"):
+                    description = stripped[len("# Description:"):].strip()
+                elif stripped.startswith("# Usage:"):
+                    usage = stripped[len("# Usage:"):].strip()
+                elif stripped.startswith("# Tags:"):
+                    extra = [t.strip() for t in stripped[len("# Tags:"):].split(",") if t.strip()]
+                    tags.extend(extra)
+
+            if not description:
+                # Fall back to the script filename as a human-readable description
+                description = script.stem.replace("-", " ").replace("_", " ")
+
+            if usage:
+                description = f"{description}. Usage: {usage}"
+
+            # Tool name = script stem (e.g. check-agent-logs → check-agent-logs)
+            tool_name = script.stem[:60]
+            invocation = f"shell:{script}"
+
+            await self.memory.register_tool(
+                tool_name, description, "executor", invocation, tags, "workspace-scan"
+            )
+            log.debug("executor.workspace_tool_registered", name=tool_name, script=script.name)
+            count += 1
+
+        return count
 
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:

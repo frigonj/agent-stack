@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 import httpx
 import structlog
+from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 
 from core.events.bus import Event, EventBus, EventType
