@@ -947,7 +947,7 @@ class DiscordBridgeClient(discord.Client):
             log.info("discord_bridge.action_done", action=action, ok=ok, result=result[:100])
 
         guild = self.get_guild(self.guild_id) if self.guild_id else None
-        if not guild and action not in ("send_message",):
+        if not guild and action not in ("send_message", "send_file"):
             await _ack("Guild not found — set DISCORD_GUILD_ID in .env", ok=False)
             return
 
@@ -986,6 +986,42 @@ class DiscordBridgeClient(discord.Client):
                     return
                 await ch.send(text[:2000])
                 await _ack(f"Message sent to #{ch.name}")
+
+            elif action == "send_file":
+                # Send a file from /workspace to a Discord channel.
+                # payload fields:
+                #   file_path    — absolute path inside the container (required)
+                #   channel_id / channel_name — destination (defaults to task channel)
+                #   content      — optional caption text
+                import os as _os
+                from pathlib import Path as _Path
+                file_path = payload.get("file_path", "")
+                if not file_path:
+                    await _ack("send_file requires a file_path", ok=False)
+                    return
+                p = _Path(file_path)
+                if not p.exists():
+                    await _ack(f"File not found: {file_path}", ok=False)
+                    return
+                if p.stat().st_size > 8 * 1024 * 1024:   # 8 MB Discord limit
+                    await _ack(f"File too large for Discord (>8 MB): {file_path}", ok=False)
+                    return
+                ch_id = payload.get("channel_id")
+                if ch_id:
+                    ch = await self.fetch_channel(int(ch_id))
+                else:
+                    ch = await _resolve_channel(payload)
+                    if ch is None:
+                        ch = await self.fetch_channel(int(self.task_channel_id))
+                if not ch:
+                    await _ack("Channel not found for send_file", ok=False)
+                    return
+                caption = payload.get("content", "")
+                await ch.send(
+                    content=caption[:2000] if caption else discord.utils.MISSING,
+                    file=discord.File(str(p), filename=p.name),
+                )
+                await _ack(f"File '{p.name}' sent to #{ch.name}")
 
             elif action == "create_channel":
                 name          = payload.get("name", "new-channel")

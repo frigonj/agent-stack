@@ -490,7 +490,7 @@ Agents:
                  generate LaTeX documents compiled to PDF (output: /workspace/docs/generated/)
 - code_search  : search /workspace/repos for functions/classes/patterns
 - research     : internet research via SearXNG — "what is X", "latest Y", "current status of Z"
-- discord      : Discord server management (channels, categories, messages, topics)
+- discord      : Discord server management (channels, categories, messages, topics, file uploads from /workspace)
 
 Return ONLY valid JSON, no markdown fences. Two possible responses:
 
@@ -2121,10 +2121,26 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode != 0:
-                err = stderr.decode().strip()[:200]
-                log.error("orchestrator.agent_start_failed", agent=agent, container=container, error=err)
+                err = stderr.decode().strip()
+                # Container doesn't exist yet (never been run) — fall back to compose up
+                if "No such container" in err:
+                    log.info("orchestrator.agent_compose_up", agent=agent, container=container)
+                    compose_proc = await asyncio.create_subprocess_exec(
+                        "docker", "compose", "up", "-d", "--no-deps", agent,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=self.settings.compose_project_dir,
+                    )
+                    _, compose_err = await asyncio.wait_for(compose_proc.communicate(), timeout=120)
+                    if compose_proc.returncode == 0:
+                        log.info("orchestrator.agent_created_and_started", agent=agent, container=container)
+                        if plan:
+                            await self._emit_plan_status(plan, f"✅ `{container}` created and started")
+                        return True
+                    err = compose_err.decode().strip()[:200]
+                log.error("orchestrator.agent_start_failed", agent=agent, container=container, error=err[:200])
                 if plan:
-                    await self._emit_plan_status(plan, f"❌ Failed to start `{container}`: {err}")
+                    await self._emit_plan_status(plan, f"❌ Failed to start `{container}`: {err[:200]}")
                 return False
             log.info("orchestrator.agent_started", agent=agent, container=container)
             if plan:
@@ -2155,14 +2171,15 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             messages = [
                 SystemMessage(content=(
                     "Translate a Discord management request into a JSON array of action objects. No markdown. Output ONLY valid JSON.\n"
-                    "Valid actions: send_message, create_channel, delete_channel, rename_channel, "
+                    "Valid actions: send_message, send_file, create_channel, delete_channel, rename_channel, "
                     "set_topic, create_category, pin_message, list_channels, find_and_delete_duplicates\n"
                     "Rules:\n"
                     "- send_message MUST have a non-empty 'content' field with the literal text to send. NEVER emit send_message without concrete content.\n"
+                    "- send_file sends a file from /workspace to Discord. Required field: file_path (absolute path). Optional: channel_name or channel_id, content (caption).\n"
                     "- To read/list channels use list_channels only.\n"
                     "- To set a channel description use set_topic with a 'topic' field.\n"
                     "- Do NOT combine list_channels with send_message in the same action array.\n"
-                    'Example: [{"action":"create_channel","name":"logs"},{"action":"set_topic","channel_name":"logs","topic":"Agent logs"}]'
+                    'Example: [{"action":"send_file","file_path":"/workspace/docs/report.pdf","channel_name":"agent-tasks","content":"Here is the report"}]'
                 )),
                 HumanMessage(content=f"Discord task: {task}"),
             ]

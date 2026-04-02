@@ -31,5 +31,8 @@ class Settings(BaseSettings):
     # Version stamp — set in docker-compose.yml; triggers intent flush on change
     agent_version: str = Field("", validation_alias="AGENT_VERSION")
 
+    # Working directory containing docker-compose.yml (used for compose up fallback)
+    compose_project_dir: str = Field("/workspace/src", validation_alias="COMPOSE_PROJECT_DIR")
+
     # Logging
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")

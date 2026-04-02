@@ -64,6 +64,7 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=orchestrator
       - AGENT_VERSION=${AGENT_VERSION:-1.0}
+      - COMPOSE_PROJECT_DIR=/workspace/src
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
       - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-agent-stack}
