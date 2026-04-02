@@ -619,7 +619,7 @@ class ExecutorAgent(BaseAgent):
                         response = await self.llm_invoke(messages)
                         content = response.content
 
-                        cmd_line = self._extract_cmd(content)
+                        cmd_line = _extract_cmd(content)
 
                         # ── 5a. Retry with a strict format prompt if no CMD: found ──
                         if not cmd_line:
@@ -639,7 +639,7 @@ class ExecutorAgent(BaseAgent):
                             ]
                             try:
                                 retry_resp = await self.llm_invoke(retry_messages)
-                                cmd_line = self._extract_cmd(retry_resp.content)
+                                cmd_line = _extract_cmd(retry_resp.content)
                             except Exception as exc:
                                 log.warning("executor.cmd_retry_failed", error=str(exc))
 
