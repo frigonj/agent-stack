@@ -1175,6 +1175,67 @@ Rules for plans:
         await self.memory.upsert_plan(task_id, plan.plan_id, task, "running", plan.to_dict())
         await self._dispatch_phase(plan, min(phases))
 
+    async def _fit_plan_context(
+        self,
+        task: str,
+        context: str,
+        conversation_context: str,
+        retry_context: str,
+    ) -> str:
+        """
+        Fit context components within the available token budget so the LLM
+        planner always receives the full task description.
+
+        Priority (highest → lowest):
+          1. task + retry_context  — always preserved
+          2. conversation_context — trimmed to oldest N entries
+          3. context (memory/tools) — dropped last
+        """
+        limit   = await self._get_model_context_limit()
+        # Reserve 25% for the reply and ~10% for the system prompt overhead
+        budget  = int(limit * 0.65)
+        base_tokens = self._estimate_tokens([
+            SystemMessage(content=self._PLAN_PROMPT),
+            HumanMessage(content=f"Task: {task}{retry_context}"),
+        ])
+        available = budget - base_tokens
+
+        if available <= 0:
+            # Task alone overflows — nothing we can add; let llm_invoke truncate
+            log.warning(
+                "orchestrator.plan_context_overflow",
+                task_len=len(task),
+                base_tokens=base_tokens,
+                budget=budget,
+            )
+            return retry_context
+
+        # Try adding full context + conversation
+        full = context + conversation_context
+        if self._estimate_tokens([HumanMessage(content=full)]) <= available:
+            return context + conversation_context + retry_context
+
+        # Trim conversation to 3 most recent turns
+        trimmed_conv = ""
+        if self._conversation:
+            recent = list(self._conversation)[-3:]
+            lines = [f"  [{i+1}] {t[:160]}" for i, (t, _r, _ts) in enumerate(recent)]
+            trimmed_conv = "\nRecent conversation (last 3):\n" + "\n".join(lines)
+        if self._estimate_tokens([HumanMessage(content=context + trimmed_conv)]) <= available:
+            log.info("orchestrator.plan_context_trimmed", kept="conv_3", task=task[:60])
+            return context + trimmed_conv + retry_context
+
+        # Drop conversation entirely, keep memory/tools context
+        if self._estimate_tokens([HumanMessage(content=context)]) <= available:
+            log.info("orchestrator.plan_context_trimmed", kept="context_only", task=task[:60])
+            return context + retry_context
+
+        # Context alone is too large — truncate it to fit
+        max_ctx_chars = available * 4   # ~4 chars/token
+        truncated_ctx = context[:max_ctx_chars] + "\n[…context truncated]" if len(context) > max_ctx_chars else context
+        log.info("orchestrator.plan_context_trimmed", kept="context_truncated", task=task[:60])
+        return truncated_ctx + retry_context
+
     async def _llm_plan(
         self,
         task: str,
@@ -1189,10 +1250,12 @@ Rules for plans:
         If the LLM returns {"clarify": "..."}, emit the question and return [].
         Falls back to a single executor step on parse failure.
         """
-        full_context = context + conversation_context + retry_context
+        fitted_context = await self._fit_plan_context(
+            task, context, conversation_context, retry_context
+        )
         messages = [
             SystemMessage(content=self._PLAN_PROMPT),
-            HumanMessage(content=f"Task: {task}{full_context}"),
+            HumanMessage(content=f"Task: {task}{fitted_context}"),
         ]
         try:
             response = await self.llm_invoke(messages)
