@@ -148,6 +148,55 @@ _CLARIFY_RE = re.compile(
 )
 
 
+# ── Seed intent examples ──────────────────────────────────────────────────────
+# Canonical labelled examples stored to PostgreSQL on first startup.
+# Cover patterns that fall through the fast-path regexes above.
+# Format: (text, intent)  — intent is "task", "chat", or "clarify"
+_SEED_INTENTS: list[tuple[str, str]] = [
+    # ── task ──────────────────────────────────────────────────────────────────
+    ("list all running docker containers",                                  "task"),
+    ("show me the contents of config/.env.example",                        "task"),
+    ("search the codebase for the EventBus class",                         "task"),
+    ("find all files that import from core.events.bus",                    "task"),
+    ("run pytest tests/unit and show me the results",                      "task"),
+    ("restart the executor container",                                     "task"),
+    ("write a bash script that monitors redis queue depth",                 "task"),
+    ("create a new discord channel called agent-logs",                     "task"),
+    ("grep for TODO comments across the codebase",                         "task"),
+    ("check git log for the last 10 commits",                              "task"),
+    ("install the redis python package",                                   "task"),
+    ("generate a PDF report of the agent architecture",                    "task"),
+    ("back up the postgres database to /workspace/backups",                "task"),
+    ("search online for the latest langchain release notes",               "task"),
+    ("what is the current version of python in the executor container",    "task"),
+    ("read the docker-compose.yml and summarise the services",             "task"),
+    ("build the orchestrator docker image",                                "task"),
+    ("show disk usage in the workspace directory",                         "task"),
+    ("tail the last 50 lines of the orchestrator logs",                    "task"),
+    ("pin the last message in the announcements channel",                  "task"),
+    # ── chat ──────────────────────────────────────────────────────────────────
+    ("what did you just do",                                               "chat"),
+    ("remind me what this project does",                                   "chat"),
+    ("how does the event bus work",                                        "chat"),
+    ("what is the difference between the executor and the orchestrator",   "chat"),
+    ("good morning",                                                       "chat"),
+    ("nice work",                                                          "chat"),
+    ("that worked perfectly thanks",                                       "chat"),
+    ("can you walk me through what just happened",                         "chat"),
+    ("what agents are currently available",                                "chat"),
+    ("which agent handles shell commands",                                 "chat"),
+    # ── clarify ───────────────────────────────────────────────────────────────
+    ("update the config",                                                  "clarify"),
+    ("make it faster",                                                     "clarify"),
+    ("run the thing",                                                      "clarify"),
+    ("clean it up",                                                        "clarify"),
+    ("do that again but better",                                           "clarify"),
+    ("fix the bug",                                                        "clarify"),
+    ("add more logging",                                                   "clarify"),
+    ("deploy it",                                                          "clarify"),
+]
+
+
 def _route_by_keyword(task: str) -> list[dict] | None:
     tl = task.lower().strip()
     for pattern, agent in _KEYWORD_ROUTES:
@@ -508,6 +557,8 @@ Rules for plans:
             await self.memory.register_tool(name, desc, "orchestrator", inv, tags, "orchestrator")
         log.info("orchestrator.tools_seeded", count=len(self._OWN_TOOLS))
         await self._load_learned_intents()
+        await self._seed_intent_examples()
+        await self._check_version_reset()
         # Warn about any plans that were in-flight when the process last exited
         interrupted = await self.memory.load_active_plans()
         if interrupted:
@@ -537,6 +588,8 @@ Rules for plans:
             await self._handle_vote_extension(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
+        elif event.type == EventType.SESSION_RESET:
+            await self._handle_session_reset()
 
     # ── Task intake ──────────────────────────────────────────────────────────
 
@@ -746,7 +799,101 @@ Rules for plans:
         await self._publish_reply(response.content, task_id, discord_message_id, original_task=task)
         log.info("orchestrator.clarify_asked", task=task[:60])
 
+    # ── Session reset ─────────────────────────────────────────────────────────
+
+    async def _handle_session_reset(self) -> None:
+        """
+        Wipe the in-memory conversation window and all active chat sessions.
+        Called when a  session.reset  event arrives on the broadcast stream
+        (typically from a  `reset session`  control channel command).
+        """
+        cleared_conv  = len(self._conversation)
+        cleared_chats = len(self._chat_sessions)
+        self._conversation.clear()
+        self._chat_sessions.clear()
+        # Reload learned intents fresh from DB (drops any runtime noise)
+        await self._load_learned_intents()
+        log.info(
+            "orchestrator.session_reset",
+            cleared_conversation=cleared_conv,
+            cleared_chat_sessions=cleared_chats,
+            intents_reloaded=len(self._learned_intents),
+        )
+
+    async def _check_version_reset(self) -> None:
+        """
+        Compare the running AGENT_VERSION env var against what was stored in Redis
+        on the previous run.  When the version changes, flush non-seed learned intents
+        so stale classification examples trained on old behaviour do not pollute
+        the new version.  DB contents (knowledge, tasks, plans) are preserved.
+        """
+        current_version = os.environ.get("AGENT_VERSION", "")
+        if not current_version:
+            return  # version pinning not configured — skip
+
+        redis_key = "config:agent_version"
+        try:
+            stored_version = await self.bus._client.get(redis_key)
+            if stored_version and stored_version != current_version:
+                # Version changed — drop non-seed intents from in-memory cache
+                before = len(self._learned_intents)
+                self._learned_intents = [
+                    e for e in self._learned_intents if "seed" in e.get("tags", [])
+                ]
+                after = len(self._learned_intents)
+                log.warning(
+                    "orchestrator.version_changed_intent_flush",
+                    old_version=stored_version,
+                    new_version=current_version,
+                    flushed=before - after,
+                    kept=after,
+                )
+            await self.bus._client.set(redis_key, current_version)
+        except Exception as exc:
+            log.warning("orchestrator.version_check_failed", error=str(exc))
+
     # ── Learned intent store ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_intent_entry(e: dict) -> dict:
+        """
+        Normalize a raw DB row (content/tags keys) into the shape expected by
+        _lookup_learned_intent (text/intent keys).
+
+        Two content formats exist:
+          - Seed entries:    plain natural-language text, intent encoded in tags list
+          - Runtime entries: "INTENT_EXAMPLE intent=X text=Y…" string
+        """
+        content = e.get("content", "")
+        tags    = e.get("tags") or []
+        if isinstance(tags, str):
+            import json as _json
+            try:
+                tags = _json.loads(tags)
+            except Exception:
+                tags = []
+
+        if content.startswith("INTENT_EXAMPLE intent="):
+            # Parse "INTENT_EXAMPLE intent=task text=list all running…"
+            try:
+                rest   = content[len("INTENT_EXAMPLE intent="):]
+                intent = rest.split()[0]
+                text   = rest[len(intent):].lstrip()
+                if text.startswith("text="):
+                    text = text[5:]
+            except Exception:
+                intent = "task"
+                text   = content
+        else:
+            # Seed / organic batch_store format: content is the plain text
+            text   = content
+            # intent is the tag that is neither "intent", "seed", nor "classification"
+            intent = next(
+                (t for t in tags if t not in ("intent", "seed", "classification")),
+                "task",
+            )
+
+        return {"text": text, "intent": intent, "tags": tags}
 
     async def _load_learned_intents(self) -> None:
         """
@@ -756,12 +903,52 @@ Rules for plans:
         try:
             entries = await self.recall("intent classification examples", limit=50)
             self._learned_intents = [
-                e for e in entries
+                self._normalize_intent_entry(e)
+                for e in entries
                 if e.get("topic") == "learned_intent"
             ]
             log.info("orchestrator.learned_intents_loaded", count=len(self._learned_intents))
         except Exception as exc:
             log.warning("orchestrator.learned_intents_load_failed", error=str(exc))
+
+    async def _seed_intent_examples(self) -> None:
+        """
+        On first startup (or after a DB wipe), seed _SEED_INTENTS into PostgreSQL
+        so Tier 3 classification is useful immediately without waiting for organic
+        LLM-classified examples to accumulate.
+
+        Idempotent: skips seeding when ≥ 20 seed-tagged entries are already loaded.
+        """
+        seed_already_present = sum(
+            1 for e in self._learned_intents if "seed" in e.get("tags", [])
+        )
+        if seed_already_present >= 20:
+            log.debug("orchestrator.intent_seed_skipped", existing=seed_already_present)
+            return
+
+        entries = [
+            {
+                "content": text,
+                "topic": "learned_intent",
+                "tags": ["intent", intent, "seed"],
+                "metadata": {"intent": intent},
+            }
+            for text, intent in _SEED_INTENTS
+        ]
+        try:
+            result = await self.memory.batch_store(entries)
+            # Also populate the in-memory cache immediately
+            for text, intent in _SEED_INTENTS:
+                self._learned_intents.append({"text": text, "intent": intent, "tags": ["seed"]})
+            if len(self._learned_intents) > 200:
+                self._learned_intents = self._learned_intents[-200:]
+            log.info(
+                "orchestrator.intent_seed_done",
+                stored=result.get("count", 0),
+                total_in_memory=len(self._learned_intents),
+            )
+        except Exception as exc:
+            log.warning("orchestrator.intent_seed_failed", error=str(exc))
 
     async def _store_learned_intent(self, text: str, intent: str) -> None:
         """

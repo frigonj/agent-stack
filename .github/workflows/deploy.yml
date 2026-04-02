@@ -1,0 +1,144 @@
+name: Deploy — Graceful Rolling Update
+
+# Triggers on version tags (e.g. v1.2, v2.0) pushed to the repo.
+# Assumes the runner has SSH access to the production host and that
+# docker compose is available there.
+#
+# What this workflow does:
+#   1. Run the full CI suite first (lint → unit → integration → docker build)
+#   2. SSH to the host and drain in-flight tasks (up to DRAIN_TIMEOUT seconds)
+#   3. Pull the new images and restart agent containers (NOT redis/postgres)
+#   4. Set AGENT_VERSION so the orchestrator flushes stale learned intents
+#
+# Required secrets:
+#   DEPLOY_HOST        — SSH host (e.g. myserver.example.com)
+#   DEPLOY_USER        — SSH username
+#   DEPLOY_SSH_KEY     — Private SSH key (PEM, no passphrase)
+#   DEPLOY_WORKDIR     — Absolute path to agent-stack on the host (e.g. /opt/agent-stack)
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+"         # v1.0, v2.3 — minor/major
+      - "v[0-9]+.[0-9]+.[0-9]+"  # v1.0.1 — patch (optional hotfix)
+
+jobs:
+  # ─── Run CI first — never deploy a broken build ───────────────────────────
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+
+  # ─── Graceful deployment ──────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: ci
+    environment: production    # optional: add required reviewers in GitHub settings
+
+    env:
+      DRAIN_TIMEOUT: 120       # seconds to wait for active tasks to finish
+      DRAIN_POLL:    5         # seconds between drain checks
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      # ── Drain: wait for active plans to complete before restarting ─────────
+      - name: Drain active tasks (up to ${{ env.DRAIN_TIMEOUT }}s)
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} bash -s << 'EOF'
+            set -euo pipefail
+            DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-120}
+            DRAIN_POLL=${DRAIN_POLL:-5}
+            elapsed=0
+
+            echo "Checking for active tasks..."
+            while true; do
+              # Count plans in 'running' state via psql
+              active=$(docker compose -f "${{ secrets.DEPLOY_WORKDIR }}/docker-compose.yml" \
+                exec -T postgres \
+                psql -U agent -d agentmem -At \
+                -c "SELECT COUNT(*) FROM plans WHERE status = 'running';" 2>/dev/null || echo "0")
+              active=$(echo "$active" | tr -d '[:space:]')
+
+              if [ "$active" = "0" ]; then
+                echo "No active tasks — safe to deploy."
+                break
+              fi
+
+              if [ "$elapsed" -ge "$DRAIN_TIMEOUT" ]; then
+                echo "Warning: $active task(s) still running after ${DRAIN_TIMEOUT}s drain timeout. Proceeding."
+                break
+              fi
+
+              echo "  $active active task(s) — waiting ${DRAIN_POLL}s (${elapsed}s elapsed)..."
+              sleep "$DRAIN_POLL"
+              elapsed=$((elapsed + DRAIN_POLL))
+            done
+          EOF
+        env:
+          DRAIN_TIMEOUT: ${{ env.DRAIN_TIMEOUT }}
+          DRAIN_POLL:    ${{ env.DRAIN_POLL }}
+
+      # ── Pull latest code and rebuild images ────────────────────────────────
+      - name: Pull & rebuild on host
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} bash -s << 'EOF'
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_WORKDIR }}"
+
+            echo "Pulling latest code..."
+            git fetch --tags origin
+            git checkout "${{ github.ref_name }}"
+
+            echo "Building images..."
+            docker compose build \
+              orchestrator code_search executor document_qa discord_bridge
+          EOF
+
+      # ── Restart agent containers (leave redis + postgres running) ──────────
+      - name: Rolling restart agents
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} bash -s << 'EOF'
+            set -euo pipefail
+            cd "${{ secrets.DEPLOY_WORKDIR }}"
+
+            # Export the new version so orchestrator detects the change on startup
+            export AGENT_VERSION="${{ steps.version.outputs.version }}"
+
+            echo "Restarting agent containers (redis + postgres untouched)..."
+            docker compose up -d --no-deps --force-recreate \
+              orchestrator code_search executor document_qa discord_bridge
+
+            echo "Waiting for orchestrator healthcheck..."
+            for i in $(seq 1 24); do
+              status=$(docker inspect --format='{{.State.Health.Status}}' agent_orchestrator 2>/dev/null || echo "starting")
+              if [ "$status" = "healthy" ]; then
+                echo "  Orchestrator healthy after $((i * 5))s."
+                break
+              fi
+              echo "  Status: $status — waiting 5s ($((i * 5))s elapsed)..."
+              sleep 5
+            done
+          EOF
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployed agent-stack ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version**: ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit**: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Databases**: redis + postgres left running (no data loss)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Drain**: waited up to ${{ env.DRAIN_TIMEOUT }}s for active tasks" >> "$GITHUB_STEP_SUMMARY"

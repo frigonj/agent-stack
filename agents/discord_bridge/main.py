@@ -128,7 +128,8 @@ _CONTROL_HELP = (
     "`status` — show running containers\n"
     "`build docs` — force a full architecture document rebuild now\n"
     "`verbose on` — forward all Redis events to #agent-logs\n"
-    "`verbose off` — return to normal (only high-level events)\n\n"
+    "`verbose off` — return to normal (only high-level events)\n"
+    "`reset session` — clear orchestrator conversation history and reload intents\n\n"
     f"Services: {', '.join(sorted(_KNOWN_SERVICES))}"
 )
 
@@ -642,6 +643,23 @@ class DiscordBridgeClient(discord.Client):
             await self.redis.delete("config:verbose_events")
             await message.reply("🔇 Verbose mode **off** — returning to normal event filtering.")
             log.info("discord_bridge.verbose_disabled")
+            return
+
+        # reset session
+        if lower in ("reset session", "reset context", "new session", "clear context"):
+            await self.redis.xadd(
+                "agents:broadcast",
+                {
+                    "type":    "session.reset",
+                    "source":  "discord_control",
+                    "payload": "{}",
+                },
+            )
+            await message.reply(
+                "🔄 Session reset sent — orchestrator will clear conversation history "
+                "and reload intent examples."
+            )
+            log.info("discord_bridge.session_reset_sent")
             return
 
         # unrecognised

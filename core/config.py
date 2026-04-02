@@ -28,5 +28,8 @@ class Settings(BaseSettings):
     # Agent identity
     agent_role: str = Field("agent", validation_alias="AGENT_ROLE")
 
+    # Version stamp — set in docker-compose.yml; triggers intent flush on change
+    agent_version: str = Field("", validation_alias="AGENT_VERSION")
+
     # Logging
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")

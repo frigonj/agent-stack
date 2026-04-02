@@ -102,6 +102,9 @@ class EventType(str, Enum):
     SELF_MODIFY_PROPOSED = "self.modify.proposed"  # agent proposes a code change
     SELF_MODIFY_APPLIED  = "self.modify.applied"   # code change applied + restart requested
 
+    # Session management
+    SESSION_RESET        = "session.reset"          # wipe conversation/chat context
+
     # Discord management (agent → bridge)
     DISCORD_ACTION       = "discord.action"        # request a Discord API action
     DISCORD_ACTION_DONE  = "discord.action.done"   # bridge confirms action completed
