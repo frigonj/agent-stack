@@ -37,6 +37,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture
 async def bus():
     b = EventBus(redis_url=REDIS_URL)
@@ -56,6 +57,7 @@ async def producer_bus():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 async def _stream_tip(bus: EventBus, stream_key: str) -> str:
     """
     Return the entry ID of the most-recent message in *stream_key*, or '0-0'
@@ -66,7 +68,7 @@ async def _stream_tip(bus: EventBus, stream_key: str) -> str:
     try:
         entries = await bus._client.xrevrange(stream_key, count=1)
         if entries:
-            return entries[0][0]   # (entry_id, data)
+            return entries[0][0]  # (entry_id, data)
     except Exception:
         pass
     return "0-0"
@@ -89,7 +91,7 @@ async def publish_and_find(
     from the live agent stack.
     """
     stream_key = f"agents:{target_stream}"
-    tip        = await _stream_tip(bus, stream_key)
+    tip = await _stream_tip(bus, stream_key)
 
     await producer_bus.publish(event, target=target_stream)
 
@@ -110,14 +112,15 @@ async def publish_and_find(
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_task_assigned_reaches_specialist_stream(bus, producer_bus):
     """
     TASK_ASSIGNED published to a specialist stream is readable from that stream.
     Validates the fundamental routing: orchestrator → specialist.
     """
-    task_id    = str(uuid.uuid4())
-    step_id    = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+    step_id = str(uuid.uuid4())
     specialist = "executor"
 
     evt = Event(
@@ -133,7 +136,8 @@ async def test_task_assigned_reaches_specialist_stream(bus, producer_bus):
     )
 
     received = await publish_and_find(
-        bus, producer_bus,
+        bus,
+        producer_bus,
         target_stream=specialist,
         event=evt,
         expect_type=EventType.TASK_ASSIGNED,
@@ -167,14 +171,17 @@ async def test_task_completed_reaches_orchestrator(bus, producer_bus):
     )
 
     received = await publish_and_find(
-        bus, producer_bus,
+        bus,
+        producer_bus,
         target_stream="orchestrator",
         event=evt,
         expect_type=EventType.TASK_COMPLETED,
         match_event_id=evt.event_id,
     )
 
-    assert received is not None, "Orchestrator never received TASK_COMPLETED from specialist"
+    assert received is not None, (
+        "Orchestrator never received TASK_COMPLETED from specialist"
+    )
     assert received.source == "executor"
     assert received.payload["parent_task_id"] == task_id
     assert received.payload["subtask_id"] == step_id
@@ -187,7 +194,7 @@ async def test_final_reply_emitted_to_broadcast(bus, producer_bus):
     The orchestrator's final reply sends TASK_COMPLETED to broadcast with
     discord_message_id so the Discord bridge can deliver it.
     """
-    task_id            = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
     discord_message_id = str(uuid.uuid4())
 
     evt = Event(
@@ -201,7 +208,8 @@ async def test_final_reply_emitted_to_broadcast(bus, producer_bus):
     )
 
     received = await publish_and_find(
-        bus, producer_bus,
+        bus,
+        producer_bus,
         target_stream="broadcast",
         event=evt,
         expect_type=EventType.TASK_COMPLETED,
@@ -235,7 +243,8 @@ async def test_orphan_result_carries_parent_id(bus, producer_bus):
     )
 
     received = await publish_and_find(
-        bus, producer_bus,
+        bus,
+        producer_bus,
         target_stream="orchestrator",
         event=evt,
         expect_type=EventType.TASK_COMPLETED,
@@ -254,7 +263,9 @@ async def test_context_stream_created_and_readable(bus):
     """
     context_id = str(uuid.uuid4())
     stream_key = await bus.create_context_stream(
-        "task", context_id, "integration-test-task",
+        "task",
+        context_id,
+        "integration-test-task",
         metadata={"discord_message_id": "msg-123"},
     )
     assert stream_key.startswith("ctx:task:")
@@ -285,8 +296,8 @@ async def test_consume_sentinel_on_idle(bus):
     When no events arrive, consume() yields (None, None, None) so callers
     can check stop-flags. This is the fix for the idle termination bug.
     """
-    idle_stream     = f"idle_test_{uuid.uuid4().hex[:8]}"
-    group           = f"idle_group_{uuid.uuid4().hex[:8]}"
+    idle_stream = f"idle_test_{uuid.uuid4().hex[:8]}"
+    group = f"idle_group_{uuid.uuid4().hex[:8]}"
     sentinel_received = False
 
     async def drain():

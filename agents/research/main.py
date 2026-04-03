@@ -39,11 +39,11 @@ log = structlog.get_logger()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SEARXNG_URL               = os.getenv("SEARXNG_URL", "http://searxng:8080")
-MAX_SEARCH_ITERATIONS     = int(os.getenv("MAX_SEARCH_ITERATIONS", "3"))
-MAX_RESULTS_PER_QUERY     = int(os.getenv("MAX_RESULTS_PER_QUERY", "8"))
-MIN_SOURCES_FOR_CONSENSUS = 2      # ≥2 independent domains → fact is reliable
-CONFIDENCE_COMMIT_THRESHOLD = 0.75 # facts above this go to Postgres
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
+MAX_SEARCH_ITERATIONS = int(os.getenv("MAX_SEARCH_ITERATIONS", "3"))
+MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "8"))
+MIN_SOURCES_FOR_CONSENSUS = 2  # ≥2 independent domains → fact is reliable
+CONFIDENCE_COMMIT_THRESHOLD = 0.75  # facts above this go to Postgres
 
 SYSTEM_PROMPT = """You are a research specialist. You receive internet search results and
 reason across multiple sources to produce accurate, well-sourced answers.
@@ -69,6 +69,7 @@ Route non-research tasks back via the orchestrator.
 """
 
 # ── SearXNG helpers ───────────────────────────────────────────────────────────
+
 
 async def _search(
     client: httpx.AsyncClient,
@@ -111,6 +112,7 @@ def _domain(url: str) -> str:
 
 # ── LLM helpers (all local — LM Studio / Qwen) ────────────────────────────────
 
+
 def _decompose_prompt(question: str) -> str:
     return (
         "Break this research question into 2-4 short, targeted web search queries.\n"
@@ -141,7 +143,7 @@ def _synthesise_prompt(question: str, facts: list[dict]) -> str:
 
 
 def _gap_prompt(question: str, facts: list[dict], iteration: int) -> str:
-    covered = "; ".join(f['fact'][:80] for f in facts if f.get('fact'))[:600]
+    covered = "; ".join(f["fact"][:80] for f in facts if f.get("fact"))[:600]
     return (
         "Given what we know so far and the original question, "
         "generate 1-2 follow-up search queries to fill remaining gaps.\n"
@@ -155,8 +157,8 @@ def _parse_json_from_llm(text: str) -> object:
     """Extract the first JSON value (array or string or null) from LLM output."""
     text = text.strip()
     # Strip markdown fences
-    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.M)
-    text = re.sub(r'\s*```$', '', text, flags=re.M)
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.M)
+    text = re.sub(r"\s*```$", "", text, flags=re.M)
     text = text.strip()
     try:
         return json.loads(text)
@@ -173,27 +175,31 @@ def _parse_json_from_llm(text: str) -> object:
 
 # ── Research Agent ────────────────────────────────────────────────────────────
 
-class ResearchAgent(BaseAgent):
 
+class ResearchAgent(BaseAgent):
     _OWN_TOOLS = [
-        ("research-question",
-         "Research a factual question across multiple internet sources and return a sourced answer",
-         "event:task.assigned:research",
-         ["research", "search", "web", "facts", "sources"]),
-        ("lookup-current-info",
-         "Find current information about a topic (news, documentation, prices, status)",
-         "event:task.assigned:research",
-         ["research", "current", "lookup", "news"]),
+        (
+            "research-question",
+            "Research a factual question across multiple internet sources and return a sourced answer",
+            "event:task.assigned:research",
+            ["research", "search", "web", "facts", "sources"],
+        ),
+        (
+            "lookup-current-info",
+            "Find current information about a topic (news, documentation, prices, status)",
+            "event:task.assigned:research",
+            ["research", "current", "lookup", "news"],
+        ),
     ]
 
     async def handle_event(self, event: Event) -> None:
         if event.type not in (EventType.TASK_ASSIGNED, EventType.TASK_CREATED):
             return
 
-        task        = event.payload.get("task", "")
-        task_id     = event.task_id or str(uuid.uuid4())
-        subtask_id  = event.payload.get("subtask_id", str(uuid.uuid4()))
-        parent_id   = event.payload.get("parent_task_id", task_id)
+        task = event.payload.get("task", "")
+        task_id = event.task_id or str(uuid.uuid4())
+        subtask_id = event.payload.get("subtask_id", str(uuid.uuid4()))
+        parent_id = event.payload.get("parent_task_id", task_id)
         discord_mid = event.payload.get("discord_message_id")
 
         log.info("research.task_received", task=task[:80])
@@ -209,10 +215,10 @@ class ResearchAgent(BaseAgent):
                 type=EventType.TASK_COMPLETED,
                 source=self.role,
                 payload={
-                    "result":             result,
-                    "task_id":            task_id,
-                    "subtask_id":         subtask_id,
-                    "parent_task_id":     parent_id,
+                    "result": result,
+                    "task_id": task_id,
+                    "subtask_id": subtask_id,
+                    "parent_task_id": parent_id,
                     "discord_message_id": discord_mid,
                 },
                 task_id=task_id,
@@ -229,32 +235,36 @@ class ResearchAgent(BaseAgent):
 
         # Create a context stream for this research session
         await self.bus.create_context_stream(
-            "research", query_id, question[:60],
+            "research",
+            query_id,
+            question[:60],
             metadata={"status": "active", "question": question},
         )
 
         staging_key = f"research:staging:{query_id}"
-        all_facts:  list[dict] = []   # {fact, domain, url, confidence}
+        all_facts: list[dict] = []  # {fact, domain, url, confidence}
 
         async with httpx.AsyncClient() as http:
-
             # ── Step 1: initial sub-query decomposition ────────────────────────
             sub_queries = await self._decompose(question)
             log.info("research.sub_queries", queries=sub_queries)
 
             for iteration in range(1, MAX_SEARCH_ITERATIONS + 1):
-                log.info("research.iteration_start", iteration=iteration,
-                         queries=len(sub_queries))
+                log.info(
+                    "research.iteration_start",
+                    iteration=iteration,
+                    queries=len(sub_queries),
+                )
 
                 new_facts: list[dict] = []
 
                 for sub_q in sub_queries:
                     results = await _search(http, sub_q)
                     for hit in results:
-                        url     = hit.get("url", "")
+                        url = hit.get("url", "")
                         snippet = hit.get("content", hit.get("snippet", ""))
-                        title   = hit.get("title", "")
-                        domain  = _domain(url)
+                        title = hit.get("title", "")
+                        domain = _domain(url)
 
                         if not snippet or not url:
                             continue
@@ -266,10 +276,10 @@ class ResearchAgent(BaseAgent):
                                 type=EventType.TASK_CREATED,
                                 source="research",
                                 payload={
-                                    "kind":   "snippet",
-                                    "sub_q":  sub_q,
-                                    "url":    url,
-                                    "title":  title,
+                                    "kind": "snippet",
+                                    "sub_q": sub_q,
+                                    "url": url,
+                                    "title": title,
                                     "domain": domain,
                                     "snippet": snippet[:400],
                                 },
@@ -281,13 +291,15 @@ class ResearchAgent(BaseAgent):
                         if not fact:
                             continue
 
-                        new_facts.append({
-                            "fact":   fact,
-                            "domain": domain,
-                            "url":    url,
-                            "title":  title,
-                            "sub_q":  sub_q,
-                        })
+                        new_facts.append(
+                            {
+                                "fact": fact,
+                                "domain": domain,
+                                "url": url,
+                                "title": title,
+                                "sub_q": sub_q,
+                            }
+                        )
 
                 # Store new facts in Redis staging hash
                 if new_facts:
@@ -299,8 +311,12 @@ class ResearchAgent(BaseAgent):
                     await pipe.execute()
 
                 all_facts.extend(new_facts)
-                log.info("research.facts_accumulated", total=len(all_facts),
-                         new=len(new_facts), iteration=iteration)
+                log.info(
+                    "research.facts_accumulated",
+                    total=len(all_facts),
+                    new=len(new_facts),
+                    iteration=iteration,
+                )
 
                 # ── Consensus check ────────────────────────────────────────────
                 confident = _compute_confidence(all_facts)
@@ -327,10 +343,12 @@ class ResearchAgent(BaseAgent):
 
     async def _decompose(self, question: str) -> list[str]:
         try:
-            resp = await self.llm_invoke([
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=_decompose_prompt(question)),
-            ])
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=_decompose_prompt(question)),
+                ]
+            )
             parsed = _parse_json_from_llm(resp.content)
             if isinstance(parsed, list) and parsed:
                 return [str(q) for q in parsed[:4]]
@@ -343,9 +361,11 @@ class ResearchAgent(BaseAgent):
         try:
             # Use llm.ainvoke directly — no SystemMessage, content is tiny (< 300 tokens),
             # and this fires once per search snippet so lock contention would stall the pipeline.
-            resp = await self.llm.ainvoke([
-                HumanMessage(content=_extract_fact_prompt(query, snippet)),
-            ])
+            resp = await self.llm.ainvoke(
+                [
+                    HumanMessage(content=_extract_fact_prompt(query, snippet)),
+                ]
+            )
             parsed = _parse_json_from_llm(resp.content)
             if isinstance(parsed, str) and parsed.strip():
                 return parsed.strip()
@@ -362,9 +382,11 @@ class ResearchAgent(BaseAgent):
         try:
             # Use llm.ainvoke directly — no SystemMessage and called once per iteration,
             # so not worth holding the distributed lock.
-            resp = await self.llm.ainvoke([
-                HumanMessage(content=_gap_prompt(question, facts, iteration)),
-            ])
+            resp = await self.llm.ainvoke(
+                [
+                    HumanMessage(content=_gap_prompt(question, facts, iteration)),
+                ]
+            )
             parsed = _parse_json_from_llm(resp.content)
             if isinstance(parsed, list):
                 return [str(q) for q in parsed[:2]]
@@ -380,10 +402,12 @@ class ResearchAgent(BaseAgent):
                 "multiple independent sources. Please try a more specific query."
             )
         try:
-            resp = await self.llm_invoke([
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=_synthesise_prompt(question, facts)),
-            ])
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=_synthesise_prompt(question, facts)),
+                ]
+            )
             return resp.content.strip()
         except Exception as exc:
             log.warning("research.synthesise_failed", error=str(exc))
@@ -433,6 +457,7 @@ class ResearchAgent(BaseAgent):
 
 # ── Consensus / confidence scoring ────────────────────────────────────────────
 
+
 def _compute_confidence(facts: list[dict]) -> list[dict]:
     """
     Group facts by semantic similarity (simple: same sub_q bucket).
@@ -455,9 +480,9 @@ def _compute_confidence(facts: list[dict]) -> list[dict]:
 
     result = []
     for f in deduped:
-        sq      = f.get("sub_q", "")
+        sq = f.get("sub_q", "")
         n_agree = len(sub_q_domains.get(sq, set()))
-        conf    = min(1.0, n_agree / MIN_SOURCES_FOR_CONSENSUS)
+        conf = min(1.0, n_agree / MIN_SOURCES_FOR_CONSENSUS)
         if conf >= CONFIDENCE_COMMIT_THRESHOLD:
             result.append({**f, "confidence": round(conf, 2)})
 

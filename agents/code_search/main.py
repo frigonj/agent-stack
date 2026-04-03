@@ -60,48 +60,85 @@ Route "what is X", "latest version of Y", "current status of Z" to research.
 
 # File extensions to index
 CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".go", ".rs", ".java", ".cs",
-    ".cpp", ".c", ".h", ".rb", ".php", ".swift", ".kt",
-    ".sh", ".yaml", ".yml", ".toml", ".json", ".md",
+    ".py",
+    ".js",
+    ".ts",
+    ".go",
+    ".rs",
+    ".java",
+    ".cs",
+    ".cpp",
+    ".c",
+    ".h",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
+    ".sh",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".md",
 }
 
 # Dirs to skip
 SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv",
-    "dist", "build", ".next", "target",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    "target",
 }
 
 
 class CodeSearchAgent(BaseAgent):
-
     def __init__(self, settings: Settings):
         super().__init__(settings)
         self.repo_path = Path(os.getenv("REPO_PATH", "/workspace/repos"))
 
     _OWN_TOOLS = [
-        ("search-codebase-pattern",
-         "Search codebase source files for a keyword, function name, or pattern using grep",
-         "event:task.assigned:code_search",
-         ["code", "search", "grep", "pattern"]),
-        ("find-python-files",
-         "Find all Python source files in the workspace repositories",
-         "shell:find /workspace/repos -name '*.py' -not -path '*/__pycache__/*'",
-         ["code", "python", "files"]),
-        ("list-repo-directories",
-         "List top-level directories in the code repository workspace",
-         "shell:ls /workspace/repos/",
-         ["repos", "directories"]),
-        ("analyze-code-structure",
-         "Analyze code architecture, patterns, and explain how a module works",
-         "event:task.assigned:code_search",
-         ["code", "analysis", "architecture"]),
+        (
+            "search-codebase-pattern",
+            "Search codebase source files for a keyword, function name, or pattern using grep",
+            "event:task.assigned:code_search",
+            ["code", "search", "grep", "pattern"],
+        ),
+        (
+            "find-python-files",
+            "Find all Python source files in the workspace repositories",
+            "shell:find /workspace/repos -name '*.py' -not -path '*/__pycache__/*'",
+            ["code", "python", "files"],
+        ),
+        (
+            "list-repo-directories",
+            "List top-level directories in the code repository workspace",
+            "shell:ls /workspace/repos/",
+            ["repos", "directories"],
+        ),
+        (
+            "analyze-code-structure",
+            "Analyze code architecture, patterns, and explain how a module works",
+            "event:task.assigned:code_search",
+            ["code", "analysis", "architecture"],
+        ),
     ]
 
     async def on_startup(self) -> None:
         self.repo_path.mkdir(parents=True, exist_ok=True)
         for name, desc, inv, tags in self._OWN_TOOLS:
-            await self.memory.register_tool(name, desc, "code_search", inv, tags, "code_search")
-        log.info("code_search.startup", repo_path=str(self.repo_path), tools_seeded=len(self._OWN_TOOLS))
+            await self.memory.register_tool(
+                name, desc, "code_search", inv, tags, "code_search"
+            )
+        log.info(
+            "code_search.startup",
+            repo_path=str(self.repo_path),
+            tools_seeded=len(self._OWN_TOOLS),
+        )
 
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:
@@ -153,17 +190,21 @@ class CodeSearchAgent(BaseAgent):
         system_msg = SYSTEM_PROMPT + tools_ctx
 
         # Cap initial snippet size to half the budget — the loop may load more
-        budget = await self._budget_content_chars(system_msg, f"Code snippets:\n\n\nTask: {task}")
-        fitted_snippets = snippets[:budget // 2]
+        budget = await self._budget_content_chars(
+            system_msg, f"Code snippets:\n\n\nTask: {task}"
+        )
+        fitted_snippets = snippets[: budget // 2]
 
         messages = [
             SystemMessage(content=system_msg),
-            HumanMessage(content=(
-                f"Task: {task}\n\n"
-                f"Initial search results:\n{fitted_snippets}\n\n"
-                f"Analyse the code. Issue SEARCH: <query> to look for more if needed. "
-                f"When done, respond with DONE: <your analysis>."
-            )),
+            HumanMessage(
+                content=(
+                    f"Task: {task}\n\n"
+                    f"Initial search results:\n{fitted_snippets}\n\n"
+                    f"Analyse the code. Issue SEARCH: <query> to look for more if needed. "
+                    f"When done, respond with DONE: <your analysis>."
+                )
+            ),
         ]
 
         async def _search_action(action_type: str, payload: str) -> str:
@@ -208,12 +249,14 @@ class CodeSearchAgent(BaseAgent):
                 # Extract relevant lines
                 lines = text.splitlines()
                 relevant = [
-                    f"  {i+1}: {line}"
+                    f"  {i + 1}: {line}"
                     for i, line in enumerate(lines)
                     if any(kw in line.lower() for kw in keywords)
                 ]
                 if relevant:
-                    snippet = f"### {path.relative_to(self.repo_path)}\n" + "\n".join(relevant[:20])
+                    snippet = f"### {path.relative_to(self.repo_path)}\n" + "\n".join(
+                        relevant[:20]
+                    )
                     results.append(snippet)
                     total += len(snippet)
                     if total >= max_chars:

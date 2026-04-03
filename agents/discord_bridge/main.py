@@ -62,15 +62,15 @@ log = structlog.get_logger()
 # Keeps the Discord bridge thin — most work stays in the orchestrator.
 
 _TASK_RE = re.compile(
-    r'\b(run|execute|create|delete|update|find|search|list|show|install|restart|'
-    r'fix|build|deploy|generate|write|edit|modify|refactor|analyse|analyze|'
-    r'move|rename|copy|check|test|debug|grep|cat|ls|docker|git|pip|npm)\b',
+    r"\b(run|execute|create|delete|update|find|search|list|show|install|restart|"
+    r"fix|build|deploy|generate|write|edit|modify|refactor|analyse|analyze|"
+    r"move|rename|copy|check|test|debug|grep|cat|ls|docker|git|pip|npm)\b",
     re.I,
 )
 _CHAT_RE = re.compile(
-    r'^(hi|hello|hey|good\s+\w+|thanks?|thank you|ok|okay|got it|'
-    r'what|how|why|when|who|is |are |can |could |would |should |'
-    r'tell me|explain|status|ping|what can you|are you)',
+    r"^(hi|hello|hey|good\s+\w+|thanks?|thank you|ok|okay|got it|"
+    r"what|how|why|when|who|is |are |can |could |would |should |"
+    r"tell me|explain|status|ping|what can you|are you)",
     re.I,
 )
 
@@ -85,7 +85,7 @@ def _classify_message_locally(text: str) -> str:
         return "chat"
     if _TASK_RE.search(t):
         return "task"
-    return "chat"   # default to chat so ambiguous messages don't create spurious plans
+    return "chat"  # default to chat so ambiguous messages don't create spurious plans
 
 
 def _extract_keywords(text: str) -> list[str]:
@@ -93,31 +93,39 @@ def _extract_keywords(text: str) -> list[str]:
     words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
     return [w for w in words if len(w) > 2]
 
+
 # ── Visual identity per agent ─────────────────────────────────────────────────
 
 AGENT_COLOR = {
-    "orchestrator":     discord.Color.blue(),
-    "document_qa":      discord.Color.green(),
-    "code_search":      discord.Color.orange(),
-    "executor":         discord.Color.gold(),
-    "discord":          discord.Color.blurple(),
+    "orchestrator": discord.Color.blue(),
+    "document_qa": discord.Color.green(),
+    "code_search": discord.Color.orange(),
+    "executor": discord.Color.gold(),
+    "discord": discord.Color.blurple(),
     "claude_code_agent": discord.Color.from_rgb(138, 43, 226),  # purple
 }
 
 AGENT_ICON = {
-    "orchestrator":     "🧠",
-    "document_qa":      "📄",
-    "code_search":      "🔍",
-    "executor":         "⚙️",
+    "orchestrator": "🧠",
+    "document_qa": "📄",
+    "code_search": "🔍",
+    "executor": "⚙️",
     "claude_code_agent": "✨",
 }
 
 # ── Control channel command config ────────────────────────────────────────────
 
 _KNOWN_SERVICES = {
-    "lm-studio", "all",
-    "orchestrator", "executor", "code-search", "document-qa",
-    "discord", "claude", "redis", "postgres",
+    "lm-studio",
+    "all",
+    "orchestrator",
+    "executor",
+    "code-search",
+    "document-qa",
+    "discord",
+    "claude",
+    "redis",
+    "postgres",
 }
 
 _CONTROL_HELP = (
@@ -170,6 +178,7 @@ VERBOSE_EVENTS = {
 
 # ── Approval gate UI ──────────────────────────────────────────────────────────
 
+
 class ApprovalView(discord.ui.View):
     """Approve / Deny buttons for executor approval gates."""
 
@@ -181,15 +190,14 @@ class ApprovalView(discord.ui.View):
 
     async def _resolve(self, interaction: discord.Interaction, decision: str) -> None:
         if self._decided:
-            await interaction.response.send_message(
-                "Already decided.", ephemeral=True
-            )
+            await interaction.response.send_message("Already decided.", ephemeral=True)
             return
         self._decided = True
 
         # Use set_approval() so the BLPOP waiter in bus.wait_for_approval() wakes
         # up immediately instead of waiting for the next poll interval.
         from core.events.bus import EventBus
+
         bus = EventBus.__new__(EventBus)
         bus._client = self.redis
         await bus.set_approval(self.approval_id, decision, ex=600)
@@ -223,12 +231,14 @@ class ApprovalView(discord.ui.View):
         # Auto-deny — executor's wait_for_approval will get "denied"
         if not self._decided:
             from core.events.bus import EventBus
+
             bus = EventBus.__new__(EventBus)
             bus._client = self.redis
             await bus.set_approval(self.approval_id, "denied", ex=60)
 
 
 # ── Claude escalation gate UI ────────────────────────────────────────────────
+
 
 class ClaudeEscalationView(discord.ui.View):
     """
@@ -248,12 +258,12 @@ class ClaudeEscalationView(discord.ui.View):
         redis_client: aioredis.Redis,
     ):
         super().__init__(timeout=300)  # 5-minute window
-        self.escalation_id  = escalation_id
+        self.escalation_id = escalation_id
         self.source_task_id = source_task_id
-        self.source         = source
-        self.task           = task
-        self.redis          = redis_client
-        self._decided       = False
+        self.source = source
+        self.task = task
+        self.redis = redis_client
+        self._decided = False
 
     async def _resolve(self, interaction: discord.Interaction, approved: bool) -> None:
         if self._decided:
@@ -278,17 +288,19 @@ class ClaudeEscalationView(discord.ui.View):
             await self.redis.xadd(
                 "agents:claude_code",
                 {
-                    "event_id":  str(uuid.uuid4()),
-                    "type":      "claude.escalation",
-                    "source":    self.source,
-                    "task_id":   task_id,
+                    "event_id": str(uuid.uuid4()),
+                    "type": "claude.escalation",
+                    "source": self.source,
+                    "task_id": task_id,
                     "timestamp": str(time.time()),
-                    "payload":   json.dumps({
-                        "task":            self.task,
-                        "escalation_id":   self.escalation_id,
-                        "source_task_id":  self.source_task_id,
-                        "approved_by":     interaction.user.display_name,
-                    }),
+                    "payload": json.dumps(
+                        {
+                            "task": self.task,
+                            "escalation_id": self.escalation_id,
+                            "source_task_id": self.source_task_id,
+                            "approved_by": interaction.user.display_name,
+                        }
+                    ),
                 },
             )
             log.info(
@@ -302,16 +314,18 @@ class ClaudeEscalationView(discord.ui.View):
             await self.redis.xadd(
                 "agents:broadcast",
                 {
-                    "event_id":  str(uuid.uuid4()),
-                    "type":      "claude.escalation.denied",
-                    "source":    "discord_bridge",
-                    "task_id":   self.source_task_id,
+                    "event_id": str(uuid.uuid4()),
+                    "type": "claude.escalation.denied",
+                    "source": "discord_bridge",
+                    "task_id": self.source_task_id,
                     "timestamp": str(time.time()),
-                    "payload":   json.dumps({
-                        "escalation_id":  self.escalation_id,
-                        "source_task_id": self.source_task_id,
-                        "denied_by":      interaction.user.display_name,
-                    }),
+                    "payload": json.dumps(
+                        {
+                            "escalation_id": self.escalation_id,
+                            "source_task_id": self.source_task_id,
+                            "denied_by": interaction.user.display_name,
+                        }
+                    ),
                 },
                 maxlen=10_000,
                 approximate=True,
@@ -323,11 +337,15 @@ class ClaudeEscalationView(discord.ui.View):
             )
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         await self._resolve(interaction, approved=True)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         await self._resolve(interaction, approved=False)
 
     async def on_timeout(self) -> None:
@@ -336,24 +354,30 @@ class ClaudeEscalationView(discord.ui.View):
             await self.redis.xadd(
                 "agents:broadcast",
                 {
-                    "event_id":  str(uuid.uuid4()),
-                    "type":      "claude.escalation.denied",
-                    "source":    "discord_bridge",
-                    "task_id":   self.source_task_id,
+                    "event_id": str(uuid.uuid4()),
+                    "type": "claude.escalation.denied",
+                    "source": "discord_bridge",
+                    "task_id": self.source_task_id,
                     "timestamp": str(time.time()),
-                    "payload":   json.dumps({
-                        "escalation_id":  self.escalation_id,
-                        "source_task_id": self.source_task_id,
-                        "denied_by":      "timeout",
-                    }),
+                    "payload": json.dumps(
+                        {
+                            "escalation_id": self.escalation_id,
+                            "source_task_id": self.source_task_id,
+                            "denied_by": "timeout",
+                        }
+                    ),
                 },
                 maxlen=10_000,
                 approximate=True,
             )
-            log.info("discord_bridge.claude_escalation_timeout", escalation_id=self.escalation_id)
+            log.info(
+                "discord_bridge.claude_escalation_timeout",
+                escalation_id=self.escalation_id,
+            )
 
 
 # ── Bridge client ─────────────────────────────────────────────────────────────
+
 
 class DiscordBridgeClient(discord.Client):
     """
@@ -375,12 +399,12 @@ class DiscordBridgeClient(discord.Client):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.redis_url          = redis_url
-        self.task_channel_id    = task_channel_id
-        self.claude_channel_id  = claude_channel_id
+        self.redis_url = redis_url
+        self.task_channel_id = task_channel_id
+        self.claude_channel_id = claude_channel_id
         self.control_channel_id = control_channel_id
-        self.log_channel_id     = log_channel_id
-        self.vote_channel_id    = vote_channel_id   # #agent-deliberation channel
+        self.log_channel_id = log_channel_id
+        self.vote_channel_id = vote_channel_id  # #agent-deliberation channel
         self.control_helper_url = control_helper_url.rstrip("/")
         self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
@@ -390,7 +414,7 @@ class DiscordBridgeClient(discord.Client):
         # Entries are evicted on task completion OR after _PENDING_TTL_SECS seconds
         # to prevent unbounded growth when tasks time out or agents crash.
         self._pending_messages: dict[str, tuple[int, int, float]] = {}
-        self._PENDING_TTL_SECS = 1800   # 30 minutes — generous for slow tasks
+        self._PENDING_TTL_SECS = 1800  # 30 minutes — generous for slow tasks
         # log channel object — cached after first fetch
         self._log_channel = None
 
@@ -402,7 +426,11 @@ class DiscordBridgeClient(discord.Client):
         self.loop.create_task(self._broadcast_consumer())
 
     async def on_ready(self) -> None:
-        log.info("discord_bridge.ready", user=str(self.user), guilds=[g.name for g in self.guilds])
+        log.info(
+            "discord_bridge.ready",
+            user=str(self.user),
+            guilds=[g.name for g in self.guilds],
+        )
         try:
             channel = await self.fetch_channel(int(self.task_channel_id))
             log.info(
@@ -414,7 +442,11 @@ class DiscordBridgeClient(discord.Client):
             # Auto-detect guild_id from the task channel if not explicitly set
             if not self.guild_id and hasattr(channel, "guild"):
                 self.guild_id = channel.guild.id
-                log.info("discord_bridge.guild_detected", guild_id=self.guild_id, guild=channel.guild.name)
+                log.info(
+                    "discord_bridge.guild_detected",
+                    guild_id=self.guild_id,
+                    guild=channel.guild.name,
+                )
         except Exception as exc:
             log.error(
                 "discord_bridge.channel_fetch_failed",
@@ -432,7 +464,9 @@ class DiscordBridgeClient(discord.Client):
             "discord_bridge.message_received",
             channel_id=channel_str,
             has_content=bool(message.content),
-            content_preview=message.content[:40] if message.content else "(empty — Message Content Intent may be disabled)",
+            content_preview=message.content[:40]
+            if message.content
+            else "(empty — Message Content Intent may be disabled)",
         )
 
         # ── #control channel ──────────────────────────────────────────────────
@@ -473,8 +507,8 @@ class DiscordBridgeClient(discord.Client):
             raw = await self.redis.hgetall("ctx:registry")
             if not raw:
                 return None
-            now     = time.time()
-            idle_gap = 1800   # 30 min default (kept in sync with config)
+            now = time.time()
+            idle_gap = 1800  # 30 min default (kept in sync with config)
             try:
                 raw_cfg = await self.redis.get("config:chat_idle_gap_secs")
                 if raw_cfg:
@@ -500,7 +534,11 @@ class DiscordBridgeClient(discord.Client):
                     continue
                 if meta.get("type") != "chat" or meta.get("status") != "active":
                     continue
-                last_active = meta.get("last_active") or meta.get("updated_at") or meta.get("created_at", 0)
+                last_active = (
+                    meta.get("last_active")
+                    or meta.get("updated_at")
+                    or meta.get("created_at", 0)
+                )
                 if now - last_active > idle_gap:
                     continue
                 pat_set = set(meta.get("keywords") or [])
@@ -510,7 +548,7 @@ class DiscordBridgeClient(discord.Client):
                 score = len(query_set & pat_set) / len(union)
                 if score >= thresh and score > best_score:
                     best_score = score
-                    best_id    = meta.get("id")
+                    best_id = meta.get("id")
 
             return best_id
         except Exception as exc:
@@ -523,31 +561,41 @@ class DiscordBridgeClient(discord.Client):
         Performs local classification and session detection so the orchestrator
         receives a session_id hint without needing an extra LLM call.
         """
-        task_id    = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
         message_id = str(message.id)
-        text       = message.content
+        text = message.content
 
         # Local classification (no LLM)
-        local_intent = _classify_message_locally(text) if stream == "agents:orchestrator" else "task"
-        keywords     = _extract_keywords(text)
+        local_intent = (
+            _classify_message_locally(text)
+            if stream == "agents:orchestrator"
+            else "task"
+        )
+        keywords = _extract_keywords(text)
 
         # Try to find an existing session this message belongs to
-        session_id = await self._detect_chat_session(keywords) if local_intent == "chat" else None
+        session_id = (
+            await self._detect_chat_session(keywords)
+            if local_intent == "chat"
+            else None
+        )
 
         event = {
-            "event_id":  str(uuid.uuid4()),
-            "type":      "task.created",
-            "source":    "discord",
-            "task_id":   task_id,
+            "event_id": str(uuid.uuid4()),
+            "type": "task.created",
+            "source": "discord",
+            "task_id": task_id,
             "timestamp": str(time.time()),
-            "payload":   json.dumps({
-                "task":               text,
-                "discord_user":       message.author.display_name,
-                "discord_message_id": message_id,
-                "discord_channel_id": str(message.channel.id),
-                "local_intent":       local_intent,
-                "session_id":         session_id or "",
-            }),
+            "payload": json.dumps(
+                {
+                    "task": text,
+                    "discord_user": message.author.display_name,
+                    "discord_message_id": message_id,
+                    "discord_channel_id": str(message.channel.id),
+                    "local_intent": local_intent,
+                    "session_id": session_id or "",
+                }
+            ),
         }
         await self.redis.xadd(stream, event)
         self._pending_messages[task_id] = (message.channel.id, message.id, time.time())
@@ -587,7 +635,7 @@ class DiscordBridgeClient(discord.Client):
             await message.add_reaction("⏳")
             result = await self._call_helper("POST", f"/restart/{service}")
             await message.remove_reaction("⏳", self.user)
-            ok  = result.get("ok", False)
+            ok = result.get("ok", False)
             msg = result.get("message", str(result))
             icon = "✅" if ok else "❌"
             # Include details for "restart all"
@@ -611,21 +659,25 @@ class DiscordBridgeClient(discord.Client):
                 # Publish directly to orchestrator — no need to wait for the next think cycle
                 task_id = str(uuid.uuid4())
                 event = {
-                    "event_id":  str(uuid.uuid4()),
-                    "type":      "task.created",
-                    "source":    "control",
-                    "task_id":   task_id,
+                    "event_id": str(uuid.uuid4()),
+                    "type": "task.created",
+                    "source": "control",
+                    "task_id": task_id,
                     "timestamp": str(__import__("time").time()),
-                    "payload":   __import__("json").dumps({
-                        "task":               "Force full architecture documentation rebuild. "
-                                              "Review the agent-stack source, generate updated "
-                                              "architecture docs, compile to PDF, and upload to Google Drive.",
-                        "discord_message_id": str(message.id),
-                    }),
+                    "payload": __import__("json").dumps(
+                        {
+                            "task": "Force full architecture documentation rebuild. "
+                            "Review the agent-stack source, generate updated "
+                            "architecture docs, compile to PDF, and upload to Google Drive.",
+                            "discord_message_id": str(message.id),
+                        }
+                    ),
                 }
                 await self.redis.xadd("agents:orchestrator", event)
                 await message.remove_reaction("⏳", self.user)
-                await message.reply("📐 Architecture rebuild queued — document_qa will be spun up shortly.")
+                await message.reply(
+                    "📐 Architecture rebuild queued — document_qa will be spun up shortly."
+                )
                 log.info("discord_bridge.force_arch_build", task_id=task_id)
             except Exception as exc:
                 await message.remove_reaction("⏳", self.user)
@@ -635,13 +687,17 @@ class DiscordBridgeClient(discord.Client):
         # verbose on/off
         if lower in ("verbose on", "verbose 1", "verbose true"):
             await self.redis.set("config:verbose_events", "1")
-            await message.reply("🔊 Verbose mode **on** — all Redis events will be forwarded to #agent-logs.")
+            await message.reply(
+                "🔊 Verbose mode **on** — all Redis events will be forwarded to #agent-logs."
+            )
             log.info("discord_bridge.verbose_enabled")
             return
 
         if lower in ("verbose off", "verbose 0", "verbose false"):
             await self.redis.delete("config:verbose_events")
-            await message.reply("🔇 Verbose mode **off** — returning to normal event filtering.")
+            await message.reply(
+                "🔇 Verbose mode **off** — returning to normal event filtering."
+            )
             log.info("discord_bridge.verbose_disabled")
             return
 
@@ -650,8 +706,8 @@ class DiscordBridgeClient(discord.Client):
             await self.redis.xadd(
                 "agents:broadcast",
                 {
-                    "type":    "session.reset",
-                    "source":  "discord_control",
+                    "type": "session.reset",
+                    "source": "discord_control",
                     "payload": "{}",
                 },
             )
@@ -678,8 +734,8 @@ class DiscordBridgeClient(discord.Client):
     # ── Broadcast stream consumer ─────────────────────────────────────────────
 
     async def _broadcast_consumer(self) -> None:
-        group    = "discord_bridge_group"
-        stream   = "agents:broadcast"
+        group = "discord_bridge_group"
+        stream = "agents:broadcast"
         consumer = "discord_bridge"
 
         try:
@@ -703,7 +759,8 @@ class DiscordBridgeClient(discord.Client):
                     # Evict stale pending messages on idle ticks
                     now = time.time()
                     expired = [
-                        k for k, v in self._pending_messages.items()
+                        k
+                        for k, v in self._pending_messages.items()
                         if now - v[2] > self._PENDING_TTL_SECS
                     ]
                     for k in expired:
@@ -718,9 +775,13 @@ class DiscordBridgeClient(discord.Client):
             except aioredis.ResponseError as exc:
                 if "NOGROUP" in str(exc):
                     # Stream was deleted and recreated — rebuild the consumer group
-                    log.warning("discord_bridge.rebuilding_consumer_group", stream=stream)
+                    log.warning(
+                        "discord_bridge.rebuilding_consumer_group", stream=stream
+                    )
                     try:
-                        await self.redis.xgroup_create(stream, group, id="$", mkstream=True)
+                        await self.redis.xgroup_create(
+                            stream, group, id="$", mkstream=True
+                        )
                     except aioredis.ResponseError:
                         pass  # BUSYGROUP is fine — another instance beat us to it
                 else:
@@ -765,21 +826,25 @@ class DiscordBridgeClient(discord.Client):
         try:
             channel = await self.fetch_channel(channel_id)
         except Exception as exc:
-            log.warning("discord_bridge.channel_not_found", channel_id=channel_id, error=str(exc))
+            log.warning(
+                "discord_bridge.channel_not_found",
+                channel_id=channel_id,
+                error=str(exc),
+            )
             return
 
-        source  = data.get("source", "system")
+        source = data.get("source", "system")
         payload = json.loads(data.get("payload", "{}"))
-        icon    = AGENT_ICON.get(source, "🤖")
-        color   = AGENT_COLOR.get(source, discord.Color.blurple())
+        icon = AGENT_ICON.get(source, "🤖")
+        color = AGENT_COLOR.get(source, discord.Color.blurple())
 
         # Verbose-only events: compact one-liner to #agent-logs, never to the main channel
         if verbose and event_type not in VISIBLE_EVENTS:
             log_ch = await self._get_log_channel()
             dest = log_ch or channel
-            task_id   = data.get("task_id", "")[:8]
-            ts        = float(data.get("timestamp", time.time()))
-            ts_str    = time.strftime("%H:%M:%S", time.localtime(ts))
+            task_id = data.get("task_id", "")[:8]
+            ts = float(data.get("timestamp", time.time()))
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
             # Summarise payload concisely
             summary = ""
             if event_type == "agent.tool_call":
@@ -789,7 +854,9 @@ class DiscordBridgeClient(discord.Client):
             elif event_type in ("task.created", "task.assigned"):
                 summary = payload.get("task", "")[:120]
             elif event_type == "memory.promoted":
-                summary = f"[{payload.get('topic', '')}] {payload.get('preview', '')[:100]}"
+                summary = (
+                    f"[{payload.get('topic', '')}] {payload.get('preview', '')[:100]}"
+                )
             elif event_type == "agent.thinking":
                 summary = payload.get("task", "")[:120]
             elif event_type in ("self.modify.proposed", "self.modify.applied"):
@@ -828,7 +895,9 @@ class DiscordBridgeClient(discord.Client):
                     log.warning("discord_bridge.reply_failed", error=str(exc))
 
             await channel.send(embed=embed)
-            log.info("discord_bridge.message_sent", event_type=event_type, source=source)
+            log.info(
+                "discord_bridge.message_sent", event_type=event_type, source=source
+            )
 
         elif event_type == "approval.required":
             await self._post_approval(payload, channel, source, icon)
@@ -840,8 +909,12 @@ class DiscordBridgeClient(discord.Client):
             text = payload.get("error") or payload.get("response") or str(payload)
             embed = discord.Embed(
                 title=f"{icon} {source.replace('_', ' ').title()}",
-                description=f"```{text[:1500]}```" if event_type == "system.error" else text[:4000],
-                color=discord.Color.dark_red() if event_type == "system.error" else color,
+                description=f"```{text[:1500]}```"
+                if event_type == "system.error"
+                else text[:4000],
+                color=discord.Color.dark_red()
+                if event_type == "system.error"
+                else color,
             )
             log_ch = await self._get_log_channel()
             dest = log_ch if log_ch and event_type == "system.error" else channel
@@ -849,7 +922,7 @@ class DiscordBridgeClient(discord.Client):
 
         elif event_type == "memory.pruned":
             message = payload.get("message", "Memory pruned.")
-            reason  = payload.get("reason", "")
+            reason = payload.get("reason", "")
             embed = discord.Embed(
                 title="⚠️ Memory Warning",
                 description=message,
@@ -858,13 +931,15 @@ class DiscordBridgeClient(discord.Client):
             embed.set_footer(text=f"Source: {source} | Reason: {reason}")
             log_ch = await self._get_log_channel()
             await (log_ch or channel).send(embed=embed)
-            log.info("discord_bridge.memory_pruned_notified", source=source, reason=reason)
+            log.info(
+                "discord_bridge.memory_pruned_notified", source=source, reason=reason
+            )
 
         elif event_type == "plan.status":
-            message     = payload.get("message", "")
-            plan_id     = payload.get("plan_id", "")[:8]
+            message = payload.get("message", "")
+            plan_id = payload.get("plan_id", "")[:8]
             retry_count = payload.get("retry_count", 0)
-            original    = payload.get("original_task", "")
+            original = payload.get("original_task", "")
 
             # Pick color by message prefix
             if message.startswith("❌"):
@@ -924,27 +999,33 @@ class DiscordBridgeClient(discord.Client):
           pin_message      — pin a message in a channel
           list_channels    — reply with a list of guild channels
         """
-        action  = payload.get("action", "")
+        action = payload.get("action", "")
         task_id = payload.get("task_id", "")
 
         async def _ack(result: str, ok: bool = True) -> None:
             await self.redis.xadd(
                 "agents:broadcast",
                 {
-                    "event_id":  str(uuid.uuid4()),
-                    "type":      "discord.action.done",
-                    "source":    "discord_bridge",
-                    "task_id":   task_id,
+                    "event_id": str(uuid.uuid4()),
+                    "type": "discord.action.done",
+                    "source": "discord_bridge",
+                    "task_id": task_id,
                     "timestamp": str(time.time()),
-                    "payload":   json.dumps({
-                        "action": action, "result": result, "ok": ok,
-                        "triggering_event_id": event_id,
-                    }),
+                    "payload": json.dumps(
+                        {
+                            "action": action,
+                            "result": result,
+                            "ok": ok,
+                            "triggering_event_id": event_id,
+                        }
+                    ),
                 },
                 maxlen=10_000,
                 approximate=True,
             )
-            log.info("discord_bridge.action_done", action=action, ok=ok, result=result[:100])
+            log.info(
+                "discord_bridge.action_done", action=action, ok=ok, result=result[:100]
+            )
 
         guild = self.get_guild(self.guild_id) if self.guild_id else None
         if not guild and action not in ("send_message", "send_file"):
@@ -953,7 +1034,7 @@ class DiscordBridgeClient(discord.Client):
 
         async def _resolve_channel(p: dict):
             """Resolve channel_id or channel_name to a channel object."""
-            ch_id   = p.get("channel_id")
+            ch_id = p.get("channel_id")
             ch_name = (p.get("channel_name") or p.get("name", "")).lstrip("#").strip()
             if ch_id:
                 return await self.fetch_channel(int(ch_id))
@@ -962,7 +1043,11 @@ class DiscordBridgeClient(discord.Client):
                 if not ch:
                     # case-insensitive fallback
                     ch = next(
-                        (c for c in guild.text_channels if c.name.lower() == ch_name.lower()),
+                        (
+                            c
+                            for c in guild.text_channels
+                            if c.name.lower() == ch_name.lower()
+                        ),
                         None,
                     )
                 return ch
@@ -971,7 +1056,7 @@ class DiscordBridgeClient(discord.Client):
         try:
             if action == "send_message":
                 ch_id = payload.get("channel_id")
-                text  = payload.get("content", "")
+                text = payload.get("content", "")
                 if not text:
                     await _ack("send_message requires non-empty content", ok=False)
                     return
@@ -994,6 +1079,7 @@ class DiscordBridgeClient(discord.Client):
                 #   channel_id / channel_name — destination (defaults to task channel)
                 #   content      — optional caption text
                 from pathlib import Path as _Path
+
                 file_path = payload.get("file_path", "")
                 if not file_path:
                     await _ack("send_file requires a file_path", ok=False)
@@ -1002,8 +1088,10 @@ class DiscordBridgeClient(discord.Client):
                 if not p.exists():
                     await _ack(f"File not found: {file_path}", ok=False)
                     return
-                if p.stat().st_size > 8 * 1024 * 1024:   # 8 MB Discord limit
-                    await _ack(f"File too large for Discord (>8 MB): {file_path}", ok=False)
+                if p.stat().st_size > 8 * 1024 * 1024:  # 8 MB Discord limit
+                    await _ack(
+                        f"File too large for Discord (>8 MB): {file_path}", ok=False
+                    )
                     return
                 ch_id = payload.get("channel_id")
                 if ch_id:
@@ -1023,18 +1111,24 @@ class DiscordBridgeClient(discord.Client):
                 await _ack(f"File '{p.name}' sent to #{ch.name}")
 
             elif action == "create_channel":
-                name          = payload.get("name", "new-channel")
-                topic         = payload.get("topic", "")
+                name = payload.get("name", "new-channel")
+                topic = payload.get("topic", "")
                 category_name = payload.get("category")
-                category      = None
+                category = None
                 if category_name:
                     category = discord.utils.get(guild.categories, name=category_name)
                     if not category:
                         category = next(
-                            (c for c in guild.categories if c.name.lower() == category_name.lower()),
+                            (
+                                c
+                                for c in guild.categories
+                                if c.name.lower() == category_name.lower()
+                            ),
                             None,
                         )
-                ch = await guild.create_text_channel(name=name, topic=topic, category=category)
+                ch = await guild.create_text_channel(
+                    name=name, topic=topic, category=category
+                )
                 await _ack(f"Created #{ch.name} (id={ch.id})")
 
             elif action == "delete_channel":
@@ -1050,13 +1144,13 @@ class DiscordBridgeClient(discord.Client):
                 if not ch:
                     await _ack("Channel not found for rename_channel", ok=False)
                     return
-                old      = ch.name
+                old = ch.name
                 new_name = payload.get("name", old)
                 await ch.edit(name=new_name)
                 await _ack(f"Renamed #{old} → #{new_name}")
 
             elif action == "set_topic":
-                ch    = await _resolve_channel(payload)
+                ch = await _resolve_channel(payload)
                 topic = payload.get("topic", "")
                 if not ch:
                     await _ack("Channel not found for set_topic", ok=False)
@@ -1066,11 +1160,11 @@ class DiscordBridgeClient(discord.Client):
 
             elif action == "create_category":
                 name = payload.get("name", "New Category")
-                cat  = await guild.create_category(name=name)
+                cat = await guild.create_category(name=name)
                 await _ack(f"Created category '{cat.name}' (id={cat.id})")
 
             elif action == "pin_message":
-                ch     = await _resolve_channel(payload)
+                ch = await _resolve_channel(payload)
                 msg_id = payload.get("message_id")
                 if not ch:
                     await _ack("Channel not found for pin_message", ok=False)
@@ -1095,7 +1189,11 @@ class DiscordBridgeClient(discord.Client):
                         try:
                             await ch.delete(reason="Duplicate channel removed by agent")
                             deleted.append(f"#{ch.name} (id={ch.id})")
-                            log.info("discord_bridge.duplicate_deleted", channel=ch.name, id=ch.id)
+                            log.info(
+                                "discord_bridge.duplicate_deleted",
+                                channel=ch.name,
+                                id=ch.id,
+                            )
                         except Exception as exc:
                             errors.append(f"#{ch.name}: {exc}")
                     else:
@@ -1135,19 +1233,24 @@ class DiscordBridgeClient(discord.Client):
         ch = await self._get_vote_channel()
         if not ch:
             return
-        plan_id  = payload.get("plan_id", "")[:8]
-        task     = payload.get("original_task", "")
-        steps    = payload.get("steps", [])
-        step_txt = "\n".join(
-            f"  Phase {s.get('phase',1)}: [{s.get('agent','?')}] {s.get('task','')[:80]}"
-            for s in steps
-        ) or "(no steps)"
+        plan_id = payload.get("plan_id", "")[:8]
+        task = payload.get("original_task", "")
+        steps = payload.get("steps", [])
+        step_txt = (
+            "\n".join(
+                f"  Phase {s.get('phase', 1)}: [{s.get('agent', '?')}] {s.get('task', '')[:80]}"
+                for s in steps
+            )
+            or "(no steps)"
+        )
         embed = discord.Embed(
             title="🗳️ Plan Proposed — Awaiting Agent Votes",
             description=f"**Task:** {task[:300]}\n\n**Steps:**\n```{step_txt[:1500]}```",
             color=discord.Color.og_blurple(),
         )
-        embed.set_footer(text=f"Plan {plan_id} | Agents may vote within the timeout window")
+        embed.set_footer(
+            text=f"Plan {plan_id} | Agents may vote within the timeout window"
+        )
         msg = await ch.send(embed=embed)
         self._vote_messages[payload.get("plan_id", "")] = msg
 
@@ -1156,13 +1259,13 @@ class DiscordBridgeClient(discord.Client):
         ch = await self._get_vote_channel()
         if not ch:
             return
-        plan_id    = payload.get("plan_id", "")
-        agent      = payload.get("agent", "?")
-        approve    = payload.get("approve", True)
-        reason     = payload.get("reason", "")
+        plan_id = payload.get("plan_id", "")
+        agent = payload.get("agent", "?")
+        approve = payload.get("approve", True)
+        reason = payload.get("reason", "")
         confidence = payload.get("confidence", 1.0)
-        icon       = "✅" if approve else "❌"
-        line       = f"{icon} **{agent}** (conf={confidence:.2f}): {reason or 'no reason'}"
+        icon = "✅" if approve else "❌"
+        line = f"{icon} **{agent}** (conf={confidence:.2f}): {reason or 'no reason'}"
 
         existing = self._vote_messages.get(plan_id)
         if existing:
@@ -1175,7 +1278,10 @@ class DiscordBridgeClient(discord.Client):
             except Exception:
                 pass
         # Fallback standalone post
-        embed = discord.Embed(description=line, color=discord.Color.green() if approve else discord.Color.red())
+        embed = discord.Embed(
+            description=line,
+            color=discord.Color.green() if approve else discord.Color.red(),
+        )
         embed.set_footer(text=f"Vote on plan {plan_id[:8]}")
         await ch.send(embed=embed)
 
@@ -1188,15 +1294,17 @@ class DiscordBridgeClient(discord.Client):
         if value_score < 0.4:
             return  # too trivial to surface
         context_id = payload.get("context_id", "")[:8]
-        summary    = payload.get("summary", "")
-        success    = payload.get("success", True)
-        color      = discord.Color.green() if success else discord.Color.orange()
+        summary = payload.get("summary", "")
+        success = payload.get("success", True)
+        color = discord.Color.green() if success else discord.Color.orange()
         embed = discord.Embed(
             title="📋 Context Closed",
             description=summary[:2000],
             color=color,
         )
-        embed.set_footer(text=f"ID: {context_id} | value={value_score:.2f} | Use /recall {context_id} to revisit")
+        embed.set_footer(
+            text=f"ID: {context_id} | value={value_score:.2f} | Use /recall {context_id} to revisit"
+        )
         log_ch = await self._get_log_channel()
         await (log_ch or fallback_channel).send(embed=embed)
 
@@ -1204,8 +1312,8 @@ class DiscordBridgeClient(discord.Client):
         self, payload: dict, channel, source: str, icon: str
     ) -> None:
         approval_id = payload.get("approval_id", "")
-        command     = payload.get("command", "")
-        task        = payload.get("task", "")
+        command = payload.get("command", "")
+        task = payload.get("task", "")
 
         embed = discord.Embed(
             title="🔐 Approval Required",
@@ -1227,16 +1335,22 @@ class DiscordBridgeClient(discord.Client):
         Post an agent → Claude escalation request in #claude (or #agent-tasks
         if #claude is not configured). The user approves or denies within 5 min.
         """
-        escalation_id  = payload.get("escalation_id", str(uuid.uuid4()))
+        escalation_id = payload.get("escalation_id", str(uuid.uuid4()))
         source_task_id = payload.get("source_task_id", "")
-        task           = payload.get("task", "(no task provided)")
-        reason         = payload.get("reason", "")
+        task = payload.get("task", "(no task provided)")
+        reason = payload.get("reason", "")
 
         # Prefer the dedicated #claude channel so escalations appear alongside
         # direct Claude conversations; fall back to #agent-tasks.
-        target_channel_id = int(self.claude_channel_id) if self.claude_channel_id else None
+        target_channel_id = (
+            int(self.claude_channel_id) if self.claude_channel_id else None
+        )
         try:
-            ch = await self.fetch_channel(target_channel_id) if target_channel_id else None
+            ch = (
+                await self.fetch_channel(target_channel_id)
+                if target_channel_id
+                else None
+            )
         except Exception:
             ch = None
         if ch is None:
@@ -1255,7 +1369,9 @@ class DiscordBridgeClient(discord.Client):
             color=discord.Color.from_rgb(138, 43, 226),
         )
         if reason:
-            embed.add_field(name="Reason for escalation", value=reason[:500], inline=False)
+            embed.add_field(
+                name="Reason for escalation", value=reason[:500], inline=False
+            )
         embed.set_footer(text="No response within 5 minutes = auto-denied")
 
         view = ClaudeEscalationView(
@@ -1276,16 +1392,19 @@ class DiscordBridgeClient(discord.Client):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    redis_url           = os.environ["REDIS_URL"]
-    bot_token           = os.environ["DISCORD_BOT_TOKEN"]
-    task_channel_id     = os.environ["DISCORD_TASK_CHANNEL_ID"]
-    claude_channel_id   = os.environ.get("DISCORD_CLAUDE_CHANNEL_ID")
-    control_channel_id  = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
-    log_channel_id      = os.environ.get("DISCORD_LOG_CHANNEL_ID")
-    vote_channel_id     = os.environ.get("DISCORD_VOTE_CHANNEL_ID")   # #agent-deliberation
-    control_helper_url  = os.environ.get("CONTROL_HELPER_URL", "http://host.docker.internal:7799")
-    guild_id            = os.environ.get("DISCORD_GUILD_ID")  # Optional — auto-detected if absent
+    redis_url = os.environ["REDIS_URL"]
+    bot_token = os.environ["DISCORD_BOT_TOKEN"]
+    task_channel_id = os.environ["DISCORD_TASK_CHANNEL_ID"]
+    claude_channel_id = os.environ.get("DISCORD_CLAUDE_CHANNEL_ID")
+    control_channel_id = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
+    log_channel_id = os.environ.get("DISCORD_LOG_CHANNEL_ID")
+    vote_channel_id = os.environ.get("DISCORD_VOTE_CHANNEL_ID")  # #agent-deliberation
+    control_helper_url = os.environ.get(
+        "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
+    )
+    guild_id = os.environ.get("DISCORD_GUILD_ID")  # Optional — auto-detected if absent
 
     intents = discord.Intents.default()
     intents.message_content = True

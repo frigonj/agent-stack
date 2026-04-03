@@ -18,25 +18,26 @@ from __future__ import annotations
 # ── Character budgets per input category ──────────────────────────────────────
 
 BUDGET: dict[str, int] = {
-    "task":          4_000,   # incoming task description from Discord / think loop
-    "file":          8_000,   # file content read by executor or document_qa
-    "code":         10_000,   # code search snippets
-    "memory_entry":    600,   # single recalled memory entry content
-    "memory_total":  3_000,   # all recall results combined
-    "result":        3_000,   # specialist result relayed back to orchestrator
-    "payload":       2_000,   # event payload stored in Redis streams
-    "command_out":   3_000,   # shell command stdout / stderr
-    "context":       4_000,   # assembled prior-knowledge context block
+    "task": 4_000,  # incoming task description from Discord / think loop
+    "file": 8_000,  # file content read by executor or document_qa
+    "code": 10_000,  # code search snippets
+    "memory_entry": 600,  # single recalled memory entry content
+    "memory_total": 3_000,  # all recall results combined
+    "result": 3_000,  # specialist result relayed back to orchestrator
+    "payload": 2_000,  # event payload stored in Redis streams
+    "command_out": 3_000,  # shell command stdout / stderr
+    "context": 4_000,  # assembled prior-knowledge context block
 }
 
 # ── Memory pruning thresholds ─────────────────────────────────────────────────
 
-MEMORY_WARN_THRESHOLD  = 500    # emit MEMORY_PRUNED warning when count exceeds this
-MEMORY_HARD_LIMIT      = 1_000  # prune when count exceeds this
-MEMORY_PRUNE_TARGET    =   800  # prune oldest entries down to this count
+MEMORY_WARN_THRESHOLD = 500  # emit MEMORY_PRUNED warning when count exceeds this
+MEMORY_HARD_LIMIT = 1_000  # prune when count exceeds this
+MEMORY_PRUNE_TARGET = 800  # prune oldest entries down to this count
 
 
 # ── Core truncation helper ────────────────────────────────────────────────────
+
 
 def truncate(text: str, max_chars: int, label: str = "content") -> str:
     """
@@ -50,6 +51,7 @@ def truncate(text: str, max_chars: int, label: str = "content") -> str:
 
 
 # ── Typed helpers (used throughout the agent codebase) ───────────────────────
+
 
 def truncate_task(task: str) -> str:
     return truncate(task, BUDGET["task"], "task")

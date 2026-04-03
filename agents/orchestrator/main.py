@@ -42,17 +42,17 @@ from core.context import truncate_task, truncate_context
 
 log = structlog.get_logger()
 
-MAX_RETRIES = 3   # max retry attempts per phase before escalating to user
+MAX_RETRIES = 3  # max retry attempts per phase before escalating to user
 
 # ── Architecture change watcher ───────────────────────────────────────────────
 # Checked every think_interval (900 s). When any file hash changes the
 # orchestrator spins up document_qa to rebuild + upload docs.
 
-_ARCH_HASH_KEY           = "doc:arch_file_hashes"
-_ARCH_LAST_FULL_BUILD    = "doc:arch_last_full_build"   # Unix timestamp (str) in Redis
-_ARCH_CHANGELOG_PATH     = Path("/workspace/docs/generated/CHANGELOG.md")
+_ARCH_HASH_KEY = "doc:arch_file_hashes"
+_ARCH_LAST_FULL_BUILD = "doc:arch_last_full_build"  # Unix timestamp (str) in Redis
+_ARCH_CHANGELOG_PATH = Path("/workspace/docs/generated/CHANGELOG.md")
 # How often a full LLM+LaTeX build is allowed (seconds). Configurable via env.
-_FULL_BUILD_INTERVAL     = int(os.getenv("ARCH_FULL_BUILD_INTERVAL", str(86400)))
+_FULL_BUILD_INTERVAL = int(os.getenv("ARCH_FULL_BUILD_INTERVAL", str(86400)))
 
 WATCHED_PATHS: list[str] = [
     "/workspace/src/docker-compose.yml",
@@ -79,41 +79,124 @@ WATCHED_PATHS: list[str] = [
 
 _KEYWORD_ROUTES: list[tuple[re.Pattern, str]] = [
     # Discord — most-specific first
-    (re.compile(r'\b(duplicate|same\s+name|identical)\b.{0,40}\bchannels?\b',        re.I), 'discord'),
-    (re.compile(r'\bchannels?\b.{0,40}\b(duplicate|same\s+name|identical)\b',        re.I), 'discord'),
-    (re.compile(r'\b(list|show|display)\b.{0,20}\bchannels?\b',                       re.I), 'discord'),
-    (re.compile(r'\bcreate\s+(?:a\s+)?(?:text\s+)?channels?\b',                       re.I), 'discord'),
-    (re.compile(r'\bcreate\s+(?:a\s+)?categor\w+',                                    re.I), 'discord'),
-    (re.compile(r'\b(delete|remove|clean\s+up)\b.{0,30}\bchannels?\b',                re.I), 'discord'),
-    (re.compile(r'\brename\b.{0,30}\bchannels?\b|\brename\s+#',                       re.I), 'discord'),
-    (re.compile(r'\bset\b.{0,15}\btopic\b',                                           re.I), 'discord'),
-    (re.compile(r'\b(send|post)\b.{0,20}\b(message|in #|to #)',                       re.I), 'discord'),
-    (re.compile(r'\bpin\s+(message|msg)\b',                                           re.I), 'discord'),
-    (re.compile(r'\b(set\s*up|organis[ez]|orchestrate|configure)\b.{0,30}\bdiscord\b',re.I), 'discord'),
-    (re.compile(r'\bdiscord\b.{0,30}\b(channel|category|message|server)\b',          re.I), 'discord'),
+    (
+        re.compile(r"\b(duplicate|same\s+name|identical)\b.{0,40}\bchannels?\b", re.I),
+        "discord",
+    ),
+    (
+        re.compile(r"\bchannels?\b.{0,40}\b(duplicate|same\s+name|identical)\b", re.I),
+        "discord",
+    ),
+    (re.compile(r"\b(list|show|display)\b.{0,20}\bchannels?\b", re.I), "discord"),
+    (re.compile(r"\bcreate\s+(?:a\s+)?(?:text\s+)?channels?\b", re.I), "discord"),
+    (re.compile(r"\bcreate\s+(?:a\s+)?categor\w+", re.I), "discord"),
+    (
+        re.compile(r"\b(delete|remove|clean\s+up)\b.{0,30}\bchannels?\b", re.I),
+        "discord",
+    ),
+    (re.compile(r"\brename\b.{0,30}\bchannels?\b|\brename\s+#", re.I), "discord"),
+    (re.compile(r"\bset\b.{0,15}\btopic\b", re.I), "discord"),
+    (re.compile(r"\b(send|post)\b.{0,20}\b(message|in #|to #)", re.I), "discord"),
+    (re.compile(r"\bpin\s+(message|msg)\b", re.I), "discord"),
+    (
+        re.compile(
+            r"\b(set\s*up|organis[ez]|orchestrate|configure)\b.{0,30}\bdiscord\b", re.I
+        ),
+        "discord",
+    ),
+    (
+        re.compile(r"\bdiscord\b.{0,30}\b(channel|category|message|server)\b", re.I),
+        "discord",
+    ),
     # Executor — shell / file / container
-    (re.compile(r'\b(cat|ls|grep|find|diff|stat|wc|head|tail)\s+[/\w]',              re.I), 'executor'),
-    (re.compile(r'\b(docker|pip|pip3|git|python3?|npm|yarn|apt)\s',                   re.I), 'executor'),
-    (re.compile(r'\b(run|execute|exec)\b.{0,15}\b(command|script|cmd)\b',             re.I), 'executor'),
-    (re.compile(r'\brestart\s+(the\s+)?(agent|container|service|orchestrator|executor)',re.I), 'executor'),
-    (re.compile(r'\b(read|write|edit|modify|update)\b.{0,20}\bfile\b',                re.I), 'executor'),
-    (re.compile(r'\b(install|uninstall|upgrade)\b.{0,20}\b(package|library|module)\b',re.I), 'executor'),
+    (
+        re.compile(r"\b(cat|ls|grep|find|diff|stat|wc|head|tail)\s+[/\w]", re.I),
+        "executor",
+    ),
+    (re.compile(r"\b(docker|pip|pip3|git|python3?|npm|yarn|apt)\s", re.I), "executor"),
+    (
+        re.compile(r"\b(run|execute|exec)\b.{0,15}\b(command|script|cmd)\b", re.I),
+        "executor",
+    ),
+    (
+        re.compile(
+            r"\brestart\s+(the\s+)?(agent|container|service|orchestrator|executor)",
+            re.I,
+        ),
+        "executor",
+    ),
+    (
+        re.compile(r"\b(read|write|edit|modify|update)\b.{0,20}\bfile\b", re.I),
+        "executor",
+    ),
+    (
+        re.compile(
+            r"\b(install|uninstall|upgrade)\b.{0,20}\b(package|library|module)\b", re.I
+        ),
+        "executor",
+    ),
     # Document QA — Q&A, PDF, architecture review, LaTeX generation
-    (re.compile(r'\b(summaris[ez]|what does|tell me about)\b.{0,30}\bdoc',            re.I), 'document_qa'),
-    (re.compile(r'\bin (the |my )?(docs?|document|pdf)\b',                            re.I), 'document_qa'),
-    (re.compile(r'\b(read|extract|parse|open)\b.{0,15}\bpdf\b',                       re.I), 'document_qa'),
-    (re.compile(r'\b(generate|create|write|produce)\b.{0,30}\b(latex|pdf\s+report|doc(?:ument)?|report)\b', re.I), 'document_qa'),
-    (re.compile(r'\b(architecture|arch\s*doc|document\s+the\s+stack|review.{0,20}(source|stack|agents?))\b', re.I), 'document_qa'),
-    (re.compile(r'\b(compile\s+latex|latexmk|tex\s+file|\.tex\b)',                    re.I), 'document_qa'),
-    (re.compile(r'\b(system\s+design|component\s+diagram|stack\s+overview)\b',        re.I), 'document_qa'),
+    (
+        re.compile(r"\b(summaris[ez]|what does|tell me about)\b.{0,30}\bdoc", re.I),
+        "document_qa",
+    ),
+    (re.compile(r"\bin (the |my )?(docs?|document|pdf)\b", re.I), "document_qa"),
+    (re.compile(r"\b(read|extract|parse|open)\b.{0,15}\bpdf\b", re.I), "document_qa"),
+    (
+        re.compile(
+            r"\b(generate|create|write|produce)\b.{0,30}\b(latex|pdf\s+report|doc(?:ument)?|report)\b",
+            re.I,
+        ),
+        "document_qa",
+    ),
+    (
+        re.compile(
+            r"\b(architecture|arch\s*doc|document\s+the\s+stack|review.{0,20}(source|stack|agents?))\b",
+            re.I,
+        ),
+        "document_qa",
+    ),
+    (
+        re.compile(r"\b(compile\s+latex|latexmk|tex\s+file|\.tex\b)", re.I),
+        "document_qa",
+    ),
+    (
+        re.compile(r"\b(system\s+design|component\s+diagram|stack\s+overview)\b", re.I),
+        "document_qa",
+    ),
     # Code search
-    (re.compile(r'\b(find|search|where is|look for)\b.{0,20}\b(function|class|method)',re.I), 'code_search'),
-    (re.compile(r'\bin (the |this )?(repo|codebase|source code)\b',                   re.I), 'code_search'),
+    (
+        re.compile(
+            r"\b(find|search|where is|look for)\b.{0,20}\b(function|class|method)", re.I
+        ),
+        "code_search",
+    ),
+    (
+        re.compile(r"\bin (the |this )?(repo|codebase|source code)\b", re.I),
+        "code_search",
+    ),
     # Research agent — internet lookups, current info, multi-source fact gathering
-    (re.compile(r'\b(research|look up|look\s+up|find\s+out|what is|who is|when did|where is)\b.{0,40}\b(current|latest|recent|now|today|price|news|update)\b', re.I), 'research'),
-    (re.compile(r'\b(search the (web|internet|net)|google|bing|look online)\b',        re.I), 'research'),
-    (re.compile(r'\b(latest|current|recent|up[\s-]to[\s-]date)\b.{0,40}\b(version|release|news|status|price|info|docs)\b', re.I), 'research'),
-    (re.compile(r'\bwhat (is|are|was|were) .{3,60}\??\s*$',                            re.I), 'research'),
+    (
+        re.compile(
+            r"\b(research|look up|look\s+up|find\s+out|what is|who is|when did|where is)\b.{0,40}\b(current|latest|recent|now|today|price|news|update)\b",
+            re.I,
+        ),
+        "research",
+    ),
+    (
+        re.compile(
+            r"\b(search the (web|internet|net)|google|bing|look online)\b", re.I
+        ),
+        "research",
+    ),
+    (
+        re.compile(
+            r"\b(latest|current|recent|up[\s-]to[\s-]date)\b.{0,40}\b(version|release|news|status|price|info|docs)\b",
+            re.I,
+        ),
+        "research",
+    ),
+    (re.compile(r"\bwhat (is|are|was|were) .{3,60}\??\s*$", re.I), "research"),
     # Direct — never reached; kept as fallback sentinel only
     # Conversational classification is handled by _classify_intent() before routing.
 ]
@@ -123,27 +206,27 @@ _KEYWORD_ROUTES: list[tuple[re.Pattern, str]] = [
 # Tier-1 fast path: no LLM needed for these.
 
 _CHAT_RE = re.compile(
-    r'^('
-    r'hi|hello|hey|good\s+(morning|evening|afternoon|night)|'
-    r'thanks?|thank you|cheers|np|no prob\w*|'
-    r'ok|okay|got it|sounds good|cool|great|perfect|nice|sure|'
-    r'what can you (do|help)|your capabilities|what are you|how are you|'
-    r'are you (there|running|up|alive|ready)|'
-    r'status|ping|'
-    r'what (agents?|tools?|services?) (are|do you have|exist)|'
-    r'how does .{3,80} work\??|'
-    r'explain .{3,80}|'
-    r'what (is|was|happened to|did you do)\b'
-    r')',
+    r"^("
+    r"hi|hello|hey|good\s+(morning|evening|afternoon|night)|"
+    r"thanks?|thank you|cheers|np|no prob\w*|"
+    r"ok|okay|got it|sounds good|cool|great|perfect|nice|sure|"
+    r"what can you (do|help)|your capabilities|what are you|how are you|"
+    r"are you (there|running|up|alive|ready)|"
+    r"status|ping|"
+    r"what (agents?|tools?|services?) (are|do you have|exist)|"
+    r"how does .{3,80} work\??|"
+    r"explain .{3,80}|"
+    r"what (is|was|happened to|did you do)\b"
+    r")",
     re.I,
 )
 
 # Vague imperatives that need clarification — only fire when there is no
 # conversation context that could resolve the reference.
 _CLARIFY_RE = re.compile(
-    r'^(fix|update|change|modify|improve|adjust|tweak|clean\s*up|refactor|'
-    r'make\s+it|make\s+that|do\s+(it|that|this)|handle\s+(it|that)|'
-    r'sort\s+(it|that)\s+out)\b.{0,50}$',
+    r"^(fix|update|change|modify|improve|adjust|tweak|clean\s*up|refactor|"
+    r"make\s+it|make\s+that|do\s+(it|that|this)|handle\s+(it|that)|"
+    r"sort\s+(it|that)\s+out)\b.{0,50}$",
     re.I,
 )
 
@@ -154,46 +237,46 @@ _CLARIFY_RE = re.compile(
 # Format: (text, intent)  — intent is "task", "chat", or "clarify"
 _SEED_INTENTS: list[tuple[str, str]] = [
     # ── task ──────────────────────────────────────────────────────────────────
-    ("list all running docker containers",                                  "task"),
-    ("show me the contents of config/.env.example",                        "task"),
-    ("search the codebase for the EventBus class",                         "task"),
-    ("find all files that import from core.events.bus",                    "task"),
-    ("run pytest tests/unit and show me the results",                      "task"),
-    ("restart the executor container",                                     "task"),
-    ("write a bash script that monitors redis queue depth",                 "task"),
-    ("create a new discord channel called agent-logs",                     "task"),
-    ("grep for TODO comments across the codebase",                         "task"),
-    ("check git log for the last 10 commits",                              "task"),
-    ("install the redis python package",                                   "task"),
-    ("generate a PDF report of the agent architecture",                    "task"),
-    ("back up the postgres database to /workspace/backups",                "task"),
-    ("search online for the latest langchain release notes",               "task"),
-    ("what is the current version of python in the executor container",    "task"),
-    ("read the docker-compose.yml and summarise the services",             "task"),
-    ("build the orchestrator docker image",                                "task"),
-    ("show disk usage in the workspace directory",                         "task"),
-    ("tail the last 50 lines of the orchestrator logs",                    "task"),
-    ("pin the last message in the announcements channel",                  "task"),
+    ("list all running docker containers", "task"),
+    ("show me the contents of config/.env.example", "task"),
+    ("search the codebase for the EventBus class", "task"),
+    ("find all files that import from core.events.bus", "task"),
+    ("run pytest tests/unit and show me the results", "task"),
+    ("restart the executor container", "task"),
+    ("write a bash script that monitors redis queue depth", "task"),
+    ("create a new discord channel called agent-logs", "task"),
+    ("grep for TODO comments across the codebase", "task"),
+    ("check git log for the last 10 commits", "task"),
+    ("install the redis python package", "task"),
+    ("generate a PDF report of the agent architecture", "task"),
+    ("back up the postgres database to /workspace/backups", "task"),
+    ("search online for the latest langchain release notes", "task"),
+    ("what is the current version of python in the executor container", "task"),
+    ("read the docker-compose.yml and summarise the services", "task"),
+    ("build the orchestrator docker image", "task"),
+    ("show disk usage in the workspace directory", "task"),
+    ("tail the last 50 lines of the orchestrator logs", "task"),
+    ("pin the last message in the announcements channel", "task"),
     # ── chat ──────────────────────────────────────────────────────────────────
-    ("what did you just do",                                               "chat"),
-    ("remind me what this project does",                                   "chat"),
-    ("how does the event bus work",                                        "chat"),
-    ("what is the difference between the executor and the orchestrator",   "chat"),
-    ("good morning",                                                       "chat"),
-    ("nice work",                                                          "chat"),
-    ("that worked perfectly thanks",                                       "chat"),
-    ("can you walk me through what just happened",                         "chat"),
-    ("what agents are currently available",                                "chat"),
-    ("which agent handles shell commands",                                 "chat"),
+    ("what did you just do", "chat"),
+    ("remind me what this project does", "chat"),
+    ("how does the event bus work", "chat"),
+    ("what is the difference between the executor and the orchestrator", "chat"),
+    ("good morning", "chat"),
+    ("nice work", "chat"),
+    ("that worked perfectly thanks", "chat"),
+    ("can you walk me through what just happened", "chat"),
+    ("what agents are currently available", "chat"),
+    ("which agent handles shell commands", "chat"),
     # ── clarify ───────────────────────────────────────────────────────────────
-    ("update the config",                                                  "clarify"),
-    ("make it faster",                                                     "clarify"),
-    ("run the thing",                                                      "clarify"),
-    ("clean it up",                                                        "clarify"),
-    ("do that again but better",                                           "clarify"),
-    ("fix the bug",                                                        "clarify"),
-    ("add more logging",                                                   "clarify"),
-    ("deploy it",                                                          "clarify"),
+    ("update the config", "clarify"),
+    ("make it faster", "clarify"),
+    ("run the thing", "clarify"),
+    ("clean it up", "clarify"),
+    ("do that again but better", "clarify"),
+    ("fix the bug", "clarify"),
+    ("add more logging", "clarify"),
+    ("deploy it", "clarify"),
 ]
 
 
@@ -201,43 +284,51 @@ def _route_by_keyword(task: str) -> list[dict] | None:
     tl = task.lower().strip()
     for pattern, agent in _KEYWORD_ROUTES:
         if pattern.search(tl):
-            log.debug("orchestrator.keyword_routed", agent=agent, pattern=pattern.pattern[:40])
+            log.debug(
+                "orchestrator.keyword_routed", agent=agent, pattern=pattern.pattern[:40]
+            )
             return [{"task": task, "agent": agent, "phase": 1, "expected": ""}]
     return None
 
 
 # ── Discord action parser ─────────────────────────────────────────────────────
 
+
 def _slugify(name: str) -> str:
     name = name.strip().lower()
-    name = re.sub(r'[^a-z0-9\-_ ]', '', name)
-    name = re.sub(r'\s+', '-', name)
-    name = re.sub(r'-{2,}', '-', name).strip('-')
+    name = re.sub(r"[^a-z0-9\-_ ]", "", name)
+    name = re.sub(r"\s+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
     return name[:100]
 
 
 def _parse_discord_actions(task: str) -> list[dict] | None:
-    t  = task.strip()
+    t = task.strip()
     tl = t.lower()
     actions: list[dict] = []
 
-    if re.search(r'\b(duplicate|same\s+name|identical)\b.{0,60}\bchannels?\b', tl) or \
-       re.search(r'\bchannels?\b.{0,60}\b(duplicate|same\s+name|identical)\b', tl):
+    if re.search(
+        r"\b(duplicate|same\s+name|identical)\b.{0,60}\bchannels?\b", tl
+    ) or re.search(r"\bchannels?\b.{0,60}\b(duplicate|same\s+name|identical)\b", tl):
         return [{"action": "find_and_delete_duplicates"}]
 
-    if re.search(r'\b(list|show|display)\b.{0,20}\bchannels?\b', tl):
+    if re.search(r"\b(list|show|display)\b.{0,20}\bchannels?\b", tl):
         return [{"action": "list_channels"}]
 
     m = re.search(
-        r'\bcreate\s+(?:a\s+)?categor\w+\s+(?:called|named)?\s*["\']?([^\'"#,\n]{2,60})["\']?', tl)
+        r'\bcreate\s+(?:a\s+)?categor\w+\s+(?:called|named)?\s*["\']?([^\'"#,\n]{2,60})["\']?',
+        tl,
+    )
     if m:
         actions.append({"action": "create_category", "name": m.group(1).strip()})
 
-    m = re.search(r'\bcreate\s+(?:a\s+)?(?:text\s+)?channels?\s+(?:called|named)?\s*(.+)', tl)
+    m = re.search(
+        r"\bcreate\s+(?:a\s+)?(?:text\s+)?channels?\s+(?:called|named)?\s*(.+)", tl
+    )
     if m:
-        names_raw = re.split(r'[,]|\band\b', m.group(1))
+        names_raw = re.split(r"[,]|\band\b", m.group(1))
         for raw in names_raw:
-            raw = re.sub(r'\bwith\s+(topic|description)\b.*', '', raw).strip()
+            raw = re.sub(r"\bwith\s+(topic|description)\b.*", "", raw).strip()
             name = _slugify(raw)
             if not name:
                 continue
@@ -245,49 +336,69 @@ def _parse_discord_actions(task: str) -> list[dict] | None:
             topic_m = re.search(r'\bwith\s+topic\s+["\']?([^"\']{2,120})["\']?', tl)
             if topic_m:
                 entry["topic"] = topic_m.group(1).strip()
-            cat_m = re.search(r'\b(?:in|under)\s+(?:category\s+)?["\']?([^"\'#,\n]{2,60})["\']?', tl)
+            cat_m = re.search(
+                r'\b(?:in|under)\s+(?:category\s+)?["\']?([^"\'#,\n]{2,60})["\']?', tl
+            )
             if cat_m:
                 entry["category"] = cat_m.group(1).strip()
             actions.append(entry)
 
-    m = re.search(r'\b(?:delete|remove)\s+(?:the\s+)?(?:channel\s+)?#?([a-z0-9_\-]{2,60})', tl)
-    if m and re.search(r'\bchannel\b', tl):
+    m = re.search(
+        r"\b(?:delete|remove)\s+(?:the\s+)?(?:channel\s+)?#?([a-z0-9_\-]{2,60})", tl
+    )
+    if m and re.search(r"\bchannel\b", tl):
         actions.append({"action": "delete_channel", "channel_name": m.group(1).strip()})
 
     m = re.search(
-        r'\brename\s+(?:channel\s+|the\s+)?#?([a-z0-9_\-]{2,60})\s+to\s+#?([a-z0-9_\-]{2,60})', tl)
+        r"\brename\s+(?:channel\s+|the\s+)?#?([a-z0-9_\-]{2,60})\s+to\s+#?([a-z0-9_\-]{2,60})",
+        tl,
+    )
     if m:
-        actions.append({
-            "action": "rename_channel",
-            "channel_name": m.group(1).strip(),
-            "name": _slugify(m.group(2)),
-        })
+        actions.append(
+            {
+                "action": "rename_channel",
+                "channel_name": m.group(1).strip(),
+                "name": _slugify(m.group(2)),
+            }
+        )
 
     m = re.search(
-        r'\bset\s+(?:the\s+)?topic\s+(?:of\s+|for\s+)?#?([a-z0-9_\-]{2,60})\s+to\s+["\']?(.{2,200}?)["\']?\s*$', tl)
+        r'\bset\s+(?:the\s+)?topic\s+(?:of\s+|for\s+)?#?([a-z0-9_\-]{2,60})\s+to\s+["\']?(.{2,200}?)["\']?\s*$',
+        tl,
+    )
     if m:
-        actions.append({
-            "action": "set_topic",
-            "channel_name": m.group(1).strip(),
-            "topic": m.group(2).strip(),
-        })
+        actions.append(
+            {
+                "action": "set_topic",
+                "channel_name": m.group(1).strip(),
+                "topic": m.group(2).strip(),
+            }
+        )
 
     m = re.search(
-        r'\b(?:send|post)\s+(?:a\s+)?(?:message\s+)?["\']([^"\']{1,1800})["\']?\s+(?:to|in)\s+#?([a-z0-9_\-]{2,60})', tl)
+        r'\b(?:send|post)\s+(?:a\s+)?(?:message\s+)?["\']([^"\']{1,1800})["\']?\s+(?:to|in)\s+#?([a-z0-9_\-]{2,60})',
+        tl,
+    )
     if m:
-        actions.append({
-            "action": "send_message",
-            "content": m.group(1).strip(),
-            "channel_name": m.group(2).strip(),
-        })
+        actions.append(
+            {
+                "action": "send_message",
+                "content": m.group(1).strip(),
+                "channel_name": m.group(2).strip(),
+            }
+        )
 
-    m = re.search(r'\bpin\s+(?:message\s+)?(\d+)\s+(?:in|from)\s+#?([a-z0-9_\-]{2,60})', tl)
+    m = re.search(
+        r"\bpin\s+(?:message\s+)?(\d+)\s+(?:in|from)\s+#?([a-z0-9_\-]{2,60})", tl
+    )
     if m:
-        actions.append({
-            "action": "pin_message",
-            "message_id": m.group(1),
-            "channel_name": m.group(2).strip(),
-        })
+        actions.append(
+            {
+                "action": "pin_message",
+                "message_id": m.group(1),
+                "channel_name": m.group(2).strip(),
+            }
+        )
 
     return actions if actions else None
 
@@ -371,16 +482,17 @@ Source: /workspace/src/agents/<name>/main.py
 
 # ── Plan data model ───────────────────────────────────────────────────────────
 
+
 @dataclass
 class PlanStep:
     step_id: str
-    phase: int        # phases are sequential; steps in the same phase run in parallel
+    phase: int  # phases are sequential; steps in the same phase run in parallel
     task: str
     agent: str
-    expected: str     # brief description of what success looks like
-    status: str = "pending"   # pending | running | done | failed
+    expected: str  # brief description of what success looks like
+    status: str = "pending"  # pending | running | done | failed
     result: str = ""
-    depth: int = 0             # fix-attempt depth (0 = original, 1–10 = fix subtask)
+    depth: int = 0  # fix-attempt depth (0 = original, 1–10 = fix subtask)
     error_chain: list = field(default_factory=list)  # errors from prior fix attempts
 
 
@@ -393,7 +505,7 @@ class ExecutionPlan:
     retry_count: int = 0
     discord_message_id: Optional[str] = None
     context: str = ""
-    context_id: str = ""       # context stream ID (same as task_id for tasks)
+    context_id: str = ""  # context stream ID (same as task_id for tasks)
     created_at: float = field(default_factory=time.time)
     # Phases currently being advanced — guards against concurrent _check_phase_complete
     # calls (possible because asyncio.create_task fires multiple result handlers).
@@ -429,9 +541,13 @@ class ExecutionPlan:
             "created_at": self.created_at,
             "steps": [
                 {
-                    "step_id": s.step_id, "phase": s.phase, "agent": s.agent,
-                    "task": s.task, "expected": s.expected,
-                    "status": s.status, "result": s.result,
+                    "step_id": s.step_id,
+                    "phase": s.phase,
+                    "agent": s.agent,
+                    "task": s.task,
+                    "expected": s.expected,
+                    "status": s.status,
+                    "result": s.result,
                 }
                 for s in self.steps
             ],
@@ -440,6 +556,7 @@ class ExecutionPlan:
 
 # ── Chat session ─────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ChatSession:
     """
@@ -447,6 +564,7 @@ class ChatSession:
     A new session starts when the idle gap exceeds chat_idle_gap_secs OR the
     incoming message has low keyword overlap with the current session.
     """
+
     session_id: str
     name: str
     stream_key: str
@@ -459,23 +577,25 @@ class ChatSession:
 
 # ── Vote tracking ─────────────────────────────────────────────────────────────
 
+
 @dataclass
 class VoteState:
     """Tracks votes cast on a PLAN_PROPOSED event."""
+
     plan_id: str
-    deadline: float                 # monotonic time when voting closes
-    extended_until: float = 0.0    # extended deadline if any agent requested more time
-    votes: list = field(default_factory=list)   # list of vote payload dicts
+    deadline: float  # monotonic time when voting closes
+    extended_until: float = 0.0  # extended deadline if any agent requested more time
+    votes: list = field(default_factory=list)  # list of vote payload dicts
     resolved: bool = False
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-class OrchestratorAgent(BaseAgent):
 
-    think_interval         = 900   # 15 minutes
-    PLAN_TIMEOUT           = 1200  # stale plan expiry (20 min — accounts for agent startup time)
-    _CONVERSATION_TIMEOUT  = 900   # 15 min gap → reset context window
+class OrchestratorAgent(BaseAgent):
+    think_interval = 900  # 15 minutes
+    PLAN_TIMEOUT = 1200  # stale plan expiry (20 min — accounts for agent startup time)
+    _CONVERSATION_TIMEOUT = 900  # 15 min gap → reset context window
 
     # Planning prompt — requests phases + expected outcomes
     _PLAN_PROMPT = """\
@@ -537,36 +657,50 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._active_votes: dict[str, VoteState] = {}
 
     _OWN_TOOLS = [
-        ("route-to-executor",
-         "Execute shell commands, read/write files, run scripts, restart containers",
-         "event:task.assigned:executor",
-         ["executor", "shell", "command", "file"]),
-        ("route-to-code-search",
-         "Search codebases for functions, classes, patterns, or explain how code works",
-         "event:task.assigned:code_search",
-         ["code", "search", "codebase", "grep"]),
-        ("route-to-document-qa",
-         "Answer questions from documents/PDFs, review agent-stack architecture, generate LaTeX PDF reports",
-         "event:task.assigned:document_qa",
-         ["documents", "qa", "summarize", "latex", "architecture", "pdf", "report"]),
-        ("route-to-discord",
-         "Manage Discord server: create/delete channels, send messages, pin posts",
-         "event:task.assigned:discord",
-         ["discord", "channel", "message"]),
-        ("route-to-claude-code",
-         "Complex coding tasks, code editing, multi-file changes using Claude API",
-         "event:task.assigned:claude_code_agent",
-         ["claude", "code", "edit", "programming"]),
-        ("route-to-research",
-         "Research factual questions across the internet — returns sourced, consensus-checked answers",
-         "event:task.assigned:research",
-         ["research", "web", "search", "lookup", "facts", "current", "latest"]),
+        (
+            "route-to-executor",
+            "Execute shell commands, read/write files, run scripts, restart containers",
+            "event:task.assigned:executor",
+            ["executor", "shell", "command", "file"],
+        ),
+        (
+            "route-to-code-search",
+            "Search codebases for functions, classes, patterns, or explain how code works",
+            "event:task.assigned:code_search",
+            ["code", "search", "codebase", "grep"],
+        ),
+        (
+            "route-to-document-qa",
+            "Answer questions from documents/PDFs, review agent-stack architecture, generate LaTeX PDF reports",
+            "event:task.assigned:document_qa",
+            ["documents", "qa", "summarize", "latex", "architecture", "pdf", "report"],
+        ),
+        (
+            "route-to-discord",
+            "Manage Discord server: create/delete channels, send messages, pin posts",
+            "event:task.assigned:discord",
+            ["discord", "channel", "message"],
+        ),
+        (
+            "route-to-claude-code",
+            "Complex coding tasks, code editing, multi-file changes using Claude API",
+            "event:task.assigned:claude_code_agent",
+            ["claude", "code", "edit", "programming"],
+        ),
+        (
+            "route-to-research",
+            "Research factual questions across the internet — returns sourced, consensus-checked answers",
+            "event:task.assigned:research",
+            ["research", "web", "search", "lookup", "facts", "current", "latest"],
+        ),
     ]
 
     async def on_startup(self) -> None:
         log.info("orchestrator.startup")
         for name, desc, inv, tags in self._OWN_TOOLS:
-            await self.memory.register_tool(name, desc, "orchestrator", inv, tags, "orchestrator")
+            await self.memory.register_tool(
+                name, desc, "orchestrator", inv, tags, "orchestrator"
+            )
         log.info("orchestrator.tools_seeded", count=len(self._OWN_TOOLS))
         await self._load_learned_intents()
         await self._seed_intent_examples()
@@ -581,8 +715,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             )
             for row in interrupted:
                 await self.memory.upsert_plan(
-                    row["task_id"], row["plan_id"], row["original_task"],
-                    "interrupted", row["plan_json"],
+                    row["task_id"],
+                    row["plan_id"],
+                    row["original_task"],
+                    "interrupted",
+                    row["plan_json"],
                 )
 
     # ── Event dispatch ───────────────────────────────────────────────────────
@@ -624,18 +761,25 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 Event(
                     type=EventType.TASK_CREATED,
                     source="discord",
-                    payload={"task": task, "discord_message_id": discord_message_id or ""},
+                    payload={
+                        "task": task,
+                        "discord_message_id": discord_message_id or "",
+                    },
                     task_id=task_id,
                 ),
             )
             session.message_count += 1
             session.last_activity = time.time()
-            await self._respond_chat(task, task_id, discord_message_id, session_id=session.session_id)
+            await self._respond_chat(
+                task, task_id, discord_message_id, session_id=session.session_id
+            )
         elif intent == "clarify":
             session = await self._get_or_create_chat_session(task, hint_session_id)
             session.message_count += 1
             session.last_activity = time.time()
-            await self._respond_clarify(task, task_id, discord_message_id, session_id=session.session_id)
+            await self._respond_clarify(
+                task, task_id, discord_message_id, session_id=session.session_id
+            )
         else:
             # Detach planning so the event-handler returns immediately and acks
             # the task.created event.  The orchestrator can then receive and begin
@@ -643,13 +787,18 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             # built and dispatched.  Error handling is local to the background task.
             async def _plan_and_run() -> None:
                 try:
-                    await self._run_task(task, task_id, discord_message_id=discord_message_id)
+                    await self._run_task(
+                        task, task_id, discord_message_id=discord_message_id
+                    )
                 except Exception as exc:
                     log.error("orchestrator.plan_error", task=task[:80], error=str(exc))
                     await self._publish_reply(
                         f"⚠️ Planning error: {exc}",
-                        task_id, discord_message_id, original_task=task,
+                        task_id,
+                        discord_message_id,
+                        original_task=task,
                     )
+
             asyncio.create_task(_plan_and_run())
 
     # ── Intent classification ─────────────────────────────────────────────────
@@ -690,18 +839,27 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # Include recent conversation so pronouns like "the tool" / "it" resolve correctly.
         conv_ctx = ""
         if self._conversation:
-            lines = [f"  [{i+1}] User said: {entry[0][:120]}" for i, entry in enumerate(self._conversation)]
-            conv_ctx = "\nRecent conversation (use this to resolve references):\n" + "\n".join(lines) + "\n\n"
+            lines = [
+                f"  [{i + 1}] User said: {entry[0][:120]}"
+                for i, entry in enumerate(self._conversation)
+            ]
+            conv_ctx = (
+                "\nRecent conversation (use this to resolve references):\n"
+                + "\n".join(lines)
+                + "\n\n"
+            )
         messages = [
-            SystemMessage(content=(
-                "Classify the user message into exactly one word: chat, task, or clarify.\n"
-                "chat    — conversational; no action needed (questions, greetings, status).\n"
-                "task    — clear, actionable work that can be delegated to specialist agents.\n"
-                "clarify — actionable in principle but too vague or ambiguous to execute safely.\n"
-                "IMPORTANT: use the conversation context to resolve any references ('the tool', 'it', 'that').\n"
-                "If the reference resolves via context, classify as 'task' not 'clarify'.\n"
-                "Reply with exactly one word."
-            )),
+            SystemMessage(
+                content=(
+                    "Classify the user message into exactly one word: chat, task, or clarify.\n"
+                    "chat    — conversational; no action needed (questions, greetings, status).\n"
+                    "task    — clear, actionable work that can be delegated to specialist agents.\n"
+                    "clarify — actionable in principle but too vague or ambiguous to execute safely.\n"
+                    "IMPORTANT: use the conversation context to resolve any references ('the tool', 'it', 'that').\n"
+                    "If the reference resolves via context, classify as 'task' not 'clarify'.\n"
+                    "Reply with exactly one word."
+                )
+            ),
             HumanMessage(content=conv_ctx + t[:400]),
         ]
         try:
@@ -714,7 +872,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         except Exception as exc:
             log.warning("orchestrator.classify_failed", error=str(exc))
 
-        return "task"   # safe fallback — always attempt to help
+        return "task"  # safe fallback — always attempt to help
 
     async def _respond_chat(
         self,
@@ -728,14 +886,16 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if self._conversation:
             now = time.time()
             lines = [
-                f"  [{i+1}] ({int((now - ts) / 60)}m ago) You: {t[:150]}\n       Me: {r[:150]}"
+                f"  [{i + 1}] ({int((now - ts) / 60)}m ago) You: {t[:150]}\n       Me: {r[:150]}"
                 for i, (t, r, ts) in enumerate(self._conversation)
             ]
             conversation_context = "\n\nRecent conversation:\n" + "\n".join(lines)
 
         # If we still lack context, check the chat stream history before replying
         if session_id and not conversation_context:
-            hist = await self.resolve_from_context_history(task, session_id, lookback=15)
+            hist = await self.resolve_from_context_history(
+                task, session_id, lookback=15
+            )
             if hist:
                 conversation_context = f"\n\nFrom chat history:\n{hist}"
 
@@ -761,14 +921,18 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             session = self._chat_sessions.get(session_id)
             if session:
                 await self.memory.save_context_snapshot(
-                    session_id, "chat", session.name,
+                    session_id,
+                    "chat",
+                    session.name,
                     topic_category=session.topic_category,
                     keywords=list(session.keywords)[:30],
                     message_count=session.message_count,
                     snapshot_json={"last_task": task[:200], "last_reply": reply[:200]},
                 )
 
-        await self._publish_reply(reply, task_id, discord_message_id, original_task=task)
+        await self._publish_reply(
+            reply, task_id, discord_message_id, original_task=task
+        )
         log.info("orchestrator.chat_replied", task=task[:60])
 
     async def _respond_clarify(
@@ -786,29 +950,35 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if self._conversation:
             now = time.time()
             lines = [
-                f"  [{i+1}] ({int((now - entry[2]) / 60)}m ago) User: {entry[0][:120]}\n       Me: {entry[1][:120]}"
+                f"  [{i + 1}] ({int((now - entry[2]) / 60)}m ago) User: {entry[0][:120]}\n       Me: {entry[1][:120]}"
                 for i, entry in enumerate(self._conversation)
             ]
             conv_ctx = "\n\nRecent conversation:\n" + "\n".join(lines)
 
         # Check chat stream history before prompting the user
         if session_id and not conv_ctx:
-            hist = await self.resolve_from_context_history(task, session_id, lookback=20)
+            hist = await self.resolve_from_context_history(
+                task, session_id, lookback=20
+            )
             if hist:
                 conv_ctx = f"\n\nFrom chat history:\n{hist}"
 
         messages = [
-            SystemMessage(content=(
-                "The user's request may need clarification. "
-                "First check the conversation context — if the subject is already established there, "
-                "treat this as a follow-up and answer or act directly instead of asking again. "
-                "Otherwise ask exactly one short, specific question. "
-                "No preamble. No bullet lists. One sentence."
-            )),
+            SystemMessage(
+                content=(
+                    "The user's request may need clarification. "
+                    "First check the conversation context — if the subject is already established there, "
+                    "treat this as a follow-up and answer or act directly instead of asking again. "
+                    "Otherwise ask exactly one short, specific question. "
+                    "No preamble. No bullet lists. One sentence."
+                )
+            ),
             HumanMessage(content=task[:400] + conv_ctx),
         ]
         response = await self.llm_invoke(messages)
-        await self._publish_reply(response.content, task_id, discord_message_id, original_task=task)
+        await self._publish_reply(
+            response.content, task_id, discord_message_id, original_task=task
+        )
         log.info("orchestrator.clarify_asked", task=task[:60])
 
     # ── Session reset ─────────────────────────────────────────────────────────
@@ -819,7 +989,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         Called when a  session.reset  event arrives on the broadcast stream
         (typically from a  `reset session`  control channel command).
         """
-        cleared_conv  = len(self._conversation)
+        cleared_conv = len(self._conversation)
         cleared_chats = len(self._chat_sessions)
         self._conversation.clear()
         self._chat_sessions.clear()
@@ -877,9 +1047,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
           - Runtime entries: "INTENT_EXAMPLE intent=X text=Y…" string
         """
         content = e.get("content", "")
-        tags    = e.get("tags") or []
+        tags = e.get("tags") or []
         if isinstance(tags, str):
             import json as _json
+
             try:
                 tags = _json.loads(tags)
             except Exception:
@@ -888,17 +1059,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if content.startswith("INTENT_EXAMPLE intent="):
             # Parse "INTENT_EXAMPLE intent=task text=list all running…"
             try:
-                rest   = content[len("INTENT_EXAMPLE intent="):]
+                rest = content[len("INTENT_EXAMPLE intent=") :]
                 intent = rest.split()[0]
-                text   = rest[len(intent):].lstrip()
+                text = rest[len(intent) :].lstrip()
                 if text.startswith("text="):
                     text = text[5:]
             except Exception:
                 intent = "task"
-                text   = content
+                text = content
         else:
             # Seed / organic batch_store format: content is the plain text
-            text   = content
+            text = content
             # intent is the tag that is neither "intent", "seed", nor "classification"
             intent = next(
                 (t for t in tags if t not in ("intent", "seed", "classification")),
@@ -919,7 +1090,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 for e in entries
                 if e.get("topic") == "learned_intent"
             ]
-            log.info("orchestrator.learned_intents_loaded", count=len(self._learned_intents))
+            log.info(
+                "orchestrator.learned_intents_loaded", count=len(self._learned_intents)
+            )
         except Exception as exc:
             log.warning("orchestrator.learned_intents_load_failed", error=str(exc))
 
@@ -951,7 +1124,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             result = await self.memory.batch_store(entries)
             # Also populate the in-memory cache immediately
             for text, intent in _SEED_INTENTS:
-                self._learned_intents.append({"text": text, "intent": intent, "tags": ["seed"]})
+                self._learned_intents.append(
+                    {"text": text, "intent": intent, "tags": ["seed"]}
+                )
             if len(self._learned_intents) > 200:
                 self._learned_intents = self._learned_intents[-200:]
             log.info(
@@ -995,7 +1170,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         best_intent: str | None = None
         best_score = 0.0
         for ex in self._learned_intents:
-            ex_words = set(re.sub(r"[^a-z0-9\s]", "", ex.get("text", "").lower()).split())
+            ex_words = set(
+                re.sub(r"[^a-z0-9\s]", "", ex.get("text", "").lower()).split()
+            )
             union = task_words | ex_words
             if not union:
                 continue
@@ -1026,9 +1203,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         """
         import re as _re
 
-        idle_gap   = float(await self.bus.get_config("chat_idle_gap_secs", 1800))
-        kw_thresh  = float(await self.bus.get_config("chat_keyword_overlap", 0.4))
-        now        = time.time()
+        idle_gap = float(await self.bus.get_config("chat_idle_gap_secs", 1800))
+        kw_thresh = float(await self.bus.get_config("chat_keyword_overlap", 0.4))
+        now = time.time()
 
         # Hint from the bridge
         if hint_session_id and hint_session_id in self._chat_sessions:
@@ -1036,8 +1213,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         # Extract keywords from current message
         msg_words = set(
-            w for w in _re.sub(r"[^a-z0-9\s]", "", task.lower()).split()
-            if len(w) > 2
+            w for w in _re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 2
         )
 
         best_session: ChatSession | None = None
@@ -1065,9 +1241,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # New session
         session_id = str(uuid.uuid4())
         slug_words = [w for w in msg_words if len(w) > 3][:4]
-        name       = "-".join(slug_words) or "chat"
+        name = "-".join(slug_words) or "chat"
         stream_key = await self.bus.create_context_stream(
-            "chat", session_id, name,
+            "chat",
+            session_id,
+            name,
             metadata={"message_count": 0, "keywords": list(msg_words)[:30]},
         )
         session = ChatSession(
@@ -1079,18 +1257,24 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         # Classify topic
         category, confidence = await self.classify_topic(task)
-        session.topic_category   = category or ""
+        session.topic_category = category or ""
         session.topic_confidence = confidence
 
         # Ask user for topic label if confidence is low and we have enough sessions
         if category is None or (await self.should_ask_user_for_topic(confidence)):
-            log.debug("orchestrator.topic_unknown", task=task[:60], confidence=confidence)
+            log.debug(
+                "orchestrator.topic_unknown", task=task[:60], confidence=confidence
+            )
         else:
-            await self.memory.save_topic_pattern(category, list(msg_words)[:10], confidence)
+            await self.memory.save_topic_pattern(
+                category, list(msg_words)[:10], confidence
+            )
 
         # Persist initial snapshot
         await self.memory.save_context_snapshot(
-            session_id, "chat", name,
+            session_id,
+            "chat",
+            name,
             topic_category=category,
             keywords=list(msg_words)[:30],
             message_count=0,
@@ -1103,7 +1287,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             payload={"session_id": session_id, "name": name, "topic": category or ""},
             target="broadcast",
         )
-        log.info("orchestrator.chat_session_started", session_id=session_id[:8], name=name)
+        log.info(
+            "orchestrator.chat_session_started", session_id=session_id[:8], name=name
+        )
         return session
 
     async def _close_chat_session(self, session: ChatSession) -> None:
@@ -1122,7 +1308,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if value_score < 0.2:
             # Too brief — just close the context stream
             await self.bus.close_context(session.session_id)
-            log.debug("orchestrator.chat_session_discarded", session_id=session.session_id[:8])
+            log.debug(
+                "orchestrator.chat_session_discarded", session_id=session.session_id[:8]
+            )
             return
 
         # Generate a brief summary via LLM (only for valuable sessions)
@@ -1134,9 +1322,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             session.session_id,
             summary=summary,
             snapshot_json={
-                "name":          session.name,
-                "keywords":      list(session.keywords)[:30],
-                "topic":         session.topic_category,
+                "name": session.name,
+                "keywords": list(session.keywords)[:30],
+                "topic": session.topic_category,
                 "message_count": session.message_count,
             },
             value_score=value_score,
@@ -1145,11 +1333,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await self.emit(
             EventType.CHAT_SESSION_CLOSED,
             payload={
-                "session_id":  session.session_id,
-                "name":        session.name,
-                "messages":    session.message_count,
+                "session_id": session.session_id,
+                "name": session.name,
+                "messages": session.message_count,
                 "value_score": round(value_score, 2),
-                "summary":     summary,
+                "summary": summary,
             },
             target="broadcast",
         )
@@ -1177,14 +1365,14 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         )
 
     async def _handle_vote_extension(self, event: Event) -> None:
-        plan_id    = event.payload.get("plan_id", "")
-        vs         = self._active_votes.get(plan_id)
+        plan_id = event.payload.get("plan_id", "")
+        vs = self._active_votes.get(plan_id)
         if not vs or vs.resolved:
             return
-        requested  = int(event.payload.get("requested_ms", 0))
-        max_ext    = int(await self.bus.get_config("vote_max_extension_ms", 10_000))
-        granted    = min(requested, max_ext)
-        new_ext    = time.monotonic() + granted / 1000
+        requested = int(event.payload.get("requested_ms", 0))
+        max_ext = int(await self.bus.get_config("vote_max_extension_ms", 10_000))
+        granted = min(requested, max_ext)
+        new_ext = time.monotonic() + granted / 1000
         if new_ext > vs.extended_until:
             vs.extended_until = new_ext
         log.info(
@@ -1194,7 +1382,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             granted_ms=granted,
         )
 
-    async def _propose_plan_and_vote(self, plan: ExecutionPlan) -> tuple[bool, list[str]]:
+    async def _propose_plan_and_vote(
+        self, plan: ExecutionPlan
+    ) -> tuple[bool, list[str]]:
         """
         Broadcast a proposed plan, collect agent votes for vote_timeout_ms
         (plus any granted extensions), then decide whether to proceed.
@@ -1202,7 +1392,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         Returns (proceed, rejection_reasons).
         proceed=False means the plan should be revised before execution.
         """
-        vote_ms  = int(await self.bus.get_config("vote_timeout_ms", 3_000))
+        vote_ms = int(await self.bus.get_config("vote_timeout_ms", 3_000))
         deadline = time.monotonic() + vote_ms / 1000
 
         vs = VoteState(plan_id=plan.plan_id, deadline=deadline)
@@ -1211,8 +1401,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await self.emit(
             EventType.PLAN_PROPOSED,
             payload={
-                "plan_id":       plan.plan_id,
-                "task_id":       plan.task_id,
+                "plan_id": plan.plan_id,
+                "task_id": plan.task_id,
                 "original_task": plan.original_task[:200],
                 "steps": [
                     {"phase": s.phase, "agent": s.agent, "task": s.task[:80]}
@@ -1239,7 +1429,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             return True, []  # silence = unanimous approval
 
         rejections = [
-            v for v in vs.votes
+            v
+            for v in vs.votes
             if not v.get("approve", True) and float(v.get("confidence", 0)) >= 0.7
         ]
         if rejections:
@@ -1279,8 +1470,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # Conversation context (resolve follow-ups like "clean it up", "yes proceed")
         conversation_context = ""
         if self._conversation:
-            lines = [f"  [{i+1}] {t[:160]}" for i, (t, _r, _ts) in enumerate(self._conversation)]
-            conversation_context = "\nRecent conversation (oldest→newest):\n" + "\n".join(lines)
+            lines = [
+                f"  [{i + 1}] {t[:160]}"
+                for i, (t, _r, _ts) in enumerate(self._conversation)
+            ]
+            conversation_context = (
+                "\nRecent conversation (oldest→newest):\n" + "\n".join(lines)
+            )
 
         # Long-term memory — cap at 2 to avoid pollution
         prior_knowledge = (await self.recall(task))[:2]
@@ -1313,8 +1509,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             ]
         else:
             steps = await self._llm_plan(
-                task, context, conversation_context, retry_context,
-                task_id=task_id, discord_message_id=discord_message_id,
+                task,
+                context,
+                conversation_context,
+                retry_context,
+                task_id=task_id,
+                discord_message_id=discord_message_id,
             )
 
         # Planner asked for clarification — no plan to build
@@ -1323,15 +1523,25 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         # Create the task context stream (source of truth for all events in this task)
         import re as _re
-        slug_words = [w for w in _re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 3][:5]
+
+        slug_words = [
+            w for w in _re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 3
+        ][:5]
         task_slug = "-".join(slug_words) or "task"
         await self.bus.create_context_stream(
-            "task", task_id, task_slug,
-            metadata={"original_task": task[:200], "discord_message_id": discord_message_id or ""},
+            "task",
+            task_id,
+            task_slug,
+            metadata={
+                "original_task": task[:200],
+                "discord_message_id": discord_message_id or "",
+            },
         )
         # Save initial snapshot so the task is immediately recallable by ID
         await self.memory.save_context_snapshot(
-            task_id, "task", task_slug,
+            task_id,
+            "task",
+            task_slug,
             snapshot_json={"task": task[:500]},
             status="active",
         )
@@ -1348,9 +1558,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         phases = sorted(set(s.phase for s in steps))
         plan_summary = "\n".join(
-            f"  Phase {p}: " + " | ".join(
-                f"[{s.agent}] {s.task[:60]}" for s in steps if s.phase == p
-            )
+            f"  Phase {p}: "
+            + " | ".join(f"[{s.agent}] {s.task[:60]}" for s in steps if s.phase == p)
             for p in phases
         )
         await self._emit_plan_status(
@@ -1359,19 +1568,23 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         )
 
         # Voting round — specialists can contest before execution begins
-        if _plan_attempt < 2:   # max 2 revision cycles to avoid loops
+        if _plan_attempt < 2:  # max 2 revision cycles to avoid loops
             proceed, rejection_reasons = await self._propose_plan_and_vote(plan)
             if not proceed:
                 reason_ctx = "; ".join(rejection_reasons)
                 await self._run_task(
-                    task, task_id, discord_message_id,
-                    retry_context=f"\n[Plan revision {_plan_attempt+1}: agents objected. {reason_ctx}]",
+                    task,
+                    task_id,
+                    discord_message_id,
+                    retry_context=f"\n[Plan revision {_plan_attempt + 1}: agents objected. {reason_ctx}]",
                     _plan_attempt=_plan_attempt + 1,
                 )
                 return
 
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(task_id, plan.plan_id, task, "running", plan.to_dict())
+        await self.memory.upsert_plan(
+            task_id, plan.plan_id, task, "running", plan.to_dict()
+        )
         await self._dispatch_phase(plan, min(phases))
 
     async def _fit_plan_context(
@@ -1390,13 +1603,15 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
           2. conversation_context — trimmed to oldest N entries
           3. context (memory/tools) — dropped last
         """
-        limit   = await self._get_model_context_limit()
+        limit = await self._get_model_context_limit()
         # Reserve 25% for the reply and ~10% for the system prompt overhead
-        budget  = int(limit * 0.65)
-        base_tokens = self._estimate_tokens([
-            SystemMessage(content=self._PLAN_PROMPT),
-            HumanMessage(content=f"Task: {task}{retry_context}"),
-        ])
+        budget = int(limit * 0.65)
+        base_tokens = self._estimate_tokens(
+            [
+                SystemMessage(content=self._PLAN_PROMPT),
+                HumanMessage(content=f"Task: {task}{retry_context}"),
+            ]
+        )
         available = budget - base_tokens
 
         if available <= 0:
@@ -1418,21 +1633,34 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         trimmed_conv = ""
         if self._conversation:
             recent = list(self._conversation)[-3:]
-            lines = [f"  [{i+1}] {t[:160]}" for i, (t, _r, _ts) in enumerate(recent)]
+            lines = [f"  [{i + 1}] {t[:160]}" for i, (t, _r, _ts) in enumerate(recent)]
             trimmed_conv = "\nRecent conversation (last 3):\n" + "\n".join(lines)
-        if self._estimate_tokens([HumanMessage(content=context + trimmed_conv)]) <= available:
+        if (
+            self._estimate_tokens([HumanMessage(content=context + trimmed_conv)])
+            <= available
+        ):
             log.info("orchestrator.plan_context_trimmed", kept="conv_3", task=task[:60])
             return context + trimmed_conv + retry_context
 
         # Drop conversation entirely, keep memory/tools context
         if self._estimate_tokens([HumanMessage(content=context)]) <= available:
-            log.info("orchestrator.plan_context_trimmed", kept="context_only", task=task[:60])
+            log.info(
+                "orchestrator.plan_context_trimmed", kept="context_only", task=task[:60]
+            )
             return context + retry_context
 
         # Context alone is too large — truncate it to fit
-        max_ctx_chars = available * 4   # ~4 chars/token
-        truncated_ctx = context[:max_ctx_chars] + "\n[…context truncated]" if len(context) > max_ctx_chars else context
-        log.info("orchestrator.plan_context_trimmed", kept="context_truncated", task=task[:60])
+        max_ctx_chars = available * 4  # ~4 chars/token
+        truncated_ctx = (
+            context[:max_ctx_chars] + "\n[…context truncated]"
+            if len(context) > max_ctx_chars
+            else context
+        )
+        log.info(
+            "orchestrator.plan_context_trimmed",
+            kept="context_truncated",
+            task=task[:60],
+        )
         return truncated_ctx + retry_context
 
     async def _llm_plan(
@@ -1470,7 +1698,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             if "clarify" in data and task_id:
                 question = str(data["clarify"])
                 log.info("orchestrator.planner_clarify", question=question[:100])
-                await self._publish_reply(question, task_id, discord_message_id, original_task=task)
+                await self._publish_reply(
+                    question, task_id, discord_message_id, original_task=task
+                )
                 return []
 
             steps = self._parse_plan_steps(data)
@@ -1479,9 +1709,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         except Exception as exc:
             log.warning("orchestrator.plan_parse_failed", error=str(exc))
         # Hard fallback
-        return [PlanStep(step_id=str(uuid.uuid4()), phase=1, task=task, agent="executor", expected="")]
+        return [
+            PlanStep(
+                step_id=str(uuid.uuid4()),
+                phase=1,
+                task=task,
+                agent="executor",
+                expected="",
+            )
+        ]
 
-    _MAX_PLAN_STEPS = 8   # hard cap — prevents runaway plans from the LLM
+    _MAX_PLAN_STEPS = 8  # hard cap — prevents runaway plans from the LLM
 
     def _parse_plan_steps(self, data: dict) -> list[PlanStep]:
         raw = data.get("steps", [])
@@ -1502,13 +1740,15 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             task = str(s.get("task", "")).strip()
             if not task:
                 continue
-            steps.append(PlanStep(
-                step_id=str(uuid.uuid4()),
-                phase=max(1, int(s.get("phase", 1))),
-                task=task[:600],          # hard cap on step task length
-                agent=str(s.get("agent", "executor")).strip(),
-                expected=str(s.get("expected", "")).strip()[:200],
-            ))
+            steps.append(
+                PlanStep(
+                    step_id=str(uuid.uuid4()),
+                    phase=max(1, int(s.get("phase", 1))),
+                    task=task[:600],  # hard cap on step task length
+                    agent=str(s.get("agent", "executor")).strip(),
+                    expected=str(s.get("expected", "")).strip()[:200],
+                )
+            )
         return steps
 
     # ── Phase dispatch ───────────────────────────────────────────────────────
@@ -1550,7 +1790,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
             elif step.agent == "direct":
                 messages = [
-                    SystemMessage(content=SYSTEM_PROMPT + self.self_modify_context() + self.task_queue_context()),
+                    SystemMessage(
+                        content=SYSTEM_PROMPT
+                        + self.self_modify_context()
+                        + self.task_queue_context()
+                    ),
                     HumanMessage(content=f"Answer directly: {step.task}"),
                 ]
                 resp = await self.llm_invoke(messages)
@@ -1573,7 +1817,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     plan,
                     f"→ `[{step.agent}]` {step.task[:120]}",
                 )
-                log.info("orchestrator.dispatched", agent=step.agent, step_id=step.step_id)
+                log.info(
+                    "orchestrator.dispatched", agent=step.agent, step_id=step.step_id
+                )
 
         # Register discord action tracking for this phase
         if discord_count > 0:
@@ -1592,14 +1838,21 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # Phases with remote agent steps will be advanced when their results arrive.
         has_async = any(
             s.status == "running" and s.agent not in ("direct",)
-            for s in plan.steps if s.phase == phase
+            for s in plan.steps
+            if s.phase == phase
         )
         if not has_async:
             await self._check_phase_complete(plan)
 
     # ── Result handling ──────────────────────────────────────────────────────
 
-    SPECIALIST_ROLES = {"document_qa", "code_search", "executor", "claude_code_agent", "research"}
+    SPECIALIST_ROLES = {
+        "document_qa",
+        "code_search",
+        "executor",
+        "claude_code_agent",
+        "research",
+    }
 
     # Some agents listen on a different stream than their role name.
     _AGENT_STREAM = {
@@ -1610,9 +1863,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if event.source not in self.SPECIALIST_ROLES:
             return
 
-        result    = event.payload.get("result", "")
+        result = event.payload.get("result", "")
         subtask_id = event.payload.get("subtask_id")
-        parent_id  = event.payload.get("parent_task_id")
+        parent_id = event.payload.get("parent_task_id")
         log.info(
             "orchestrator.result_received",
             source=event.source,
@@ -1630,7 +1883,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             )
             step = next((s for s in plan.steps if s.step_id == subtask_id), None)
             if step:
-                passed, reason = self._validate_result(step.expected, result, source=event.source)
+                passed, reason = self._validate_result(
+                    step.expected, result, source=event.source
+                )
                 step.result = result
                 step.status = "done" if passed else "failed"
                 if not passed:
@@ -1638,12 +1893,16 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         plan, f"⚠️ `[{event.source}]` validation failed: {reason}"
                     )
                 else:
-                    await self._emit_plan_status(plan, f"✅ `[{event.source}]` step complete")
+                    await self._emit_plan_status(
+                        plan, f"✅ `[{event.source}]` step complete"
+                    )
             else:
                 # Fallback: mark first running step for this agent
                 for s in plan.steps:
                     if s.status == "running" and s.agent == event.source:
-                        passed, _ = self._validate_result(s.expected, result, source=event.source)
+                        passed, _ = self._validate_result(
+                            s.expected, result, source=event.source
+                        )
                         s.result = result
                         s.status = "done" if passed else "failed"
                         break
@@ -1664,7 +1923,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             subtask_id=subtask_id,
         )
         discord_message_id = None
-        effective_task_id  = parent_id or event.task_id
+        effective_task_id = parent_id or event.task_id
         if parent_id:
             ctx_meta = await self.bus.get_context_metadata(parent_id)
             if ctx_meta:
@@ -1686,7 +1945,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         entry = self._pending_discord[task_id]
         action = payload.get("action", "unknown")
         result = payload.get("result", "")
-        ok     = bool(payload.get("ok", True))
+        ok = bool(payload.get("ok", True))
         entry["results"].append((action, result, ok))
         entry["pending"] = max(0, entry["pending"] - 1)
 
@@ -1711,7 +1970,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             return
 
         # Discord-only task (no associated plan)
-        parts = [f"{'✅' if ok else '❌'} `{act}`: {res}" for act, res, ok in entry["results"]]
+        parts = [
+            f"{'✅' if ok else '❌'} `{act}`: {res}"
+            for act, res, ok in entry["results"]
+        ]
         await self._publish_reply(
             "\n".join(parts) or "Discord actions completed.",
             task_id,
@@ -1725,18 +1987,20 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
     # A result that is pure LLM prose without one of these is treated as a
     # planning reply, not completed work.
     _EXECUTION_PROOF_MARKERS = (
-        "Exit code:",          # executor ran a shell command
-        "[EXECUTOR_NO_CMD]",   # executor flagged no command — will fail below
-        "STDOUT:",             # executor ran a command with output
-        "STDERR:",             # executor ran a command (even if it errored)
-        "✅",                  # discord action confirmed
-        "❌",                  # discord action failed (still ran)
-        "[research]",          # research agent citation block
-        "[doc]",               # document_qa citation block
-        "code_search:",        # code search result header
+        "Exit code:",  # executor ran a shell command
+        "[EXECUTOR_NO_CMD]",  # executor flagged no command — will fail below
+        "STDOUT:",  # executor ran a command with output
+        "STDERR:",  # executor ran a command (even if it errored)
+        "✅",  # discord action confirmed
+        "❌",  # discord action failed (still ran)
+        "[research]",  # research agent citation block
+        "[doc]",  # document_qa citation block
+        "code_search:",  # code search result header
     )
 
-    def _validate_result(self, expected: str, result: str, source: str = "") -> tuple[bool, str]:
+    def _validate_result(
+        self, expected: str, result: str, source: str = ""
+    ) -> tuple[bool, str]:
         """
         Rule-based result validation. Returns (passed, reason).
 
@@ -1749,13 +2013,21 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         # Executor couldn't extract or run a command — it only chatted
         if result.startswith("[EXECUTOR_NO_CMD]"):
-            return False, "Executor produced no command — LLM described the task instead of running it"
+            return (
+                False,
+                "Executor produced no command — LLM described the task instead of running it",
+            )
 
         # Hard failure markers
         fail_markers = [
-            "Exit code: 1\n", "Exit code: 2\n", "Exit code: 127\n",
-            "Traceback (most recent", "Exception:", "not on the allowlist",
-            "Execution error:", "Command timed out",
+            "Exit code: 1\n",
+            "Exit code: 2\n",
+            "Exit code: 127\n",
+            "Traceback (most recent",
+            "Exception:",
+            "not on the allowlist",
+            "Execution error:",
+            "Command timed out",
         ]
         for m in fail_markers:
             if m in result:
@@ -1779,9 +2051,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 return False, f"Expected '{expected}' but result has no 'Exit code: 0'"
             # "file written" → result should mention a path or "written"
             if "file written" in exp_lower and not any(
-                kw in result_lower for kw in ("written", "created", "saved", "/workspace")
+                kw in result_lower
+                for kw in ("written", "created", "saved", "/workspace")
             ):
-                return False, f"Expected '{expected}' but result shows no file write confirmation"
+                return (
+                    False,
+                    f"Expected '{expected}' but result shows no file write confirmation",
+                )
 
         return True, ""
 
@@ -1797,11 +2073,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         """
         # Build a concise, search-engine-friendly query from the error
         # Strip ANSI codes and long tracebacks; keep the last meaningful line
-        clean_error = re.sub(r'\x1b\[[0-9;]*m', '', error)
-        error_lines = [line.strip() for line in clean_error.splitlines() if line.strip()]
+        clean_error = re.sub(r"\x1b\[[0-9;]*m", "", error)
+        error_lines = [
+            line.strip() for line in clean_error.splitlines() if line.strip()
+        ]
         # Prefer lines that look like error messages (contain "Error", "error", "failed", etc.)
         error_hint = next(
-            (line for line in reversed(error_lines) if re.search(r'error|failed|exception|not found|cannot', line, re.I)),
+            (
+                line
+                for line in reversed(error_lines)
+                if re.search(r"error|failed|exception|not found|cannot", line, re.I)
+            ),
             error_lines[-1] if error_lines else error[:120],
         )
         query = f"{error_hint[:100]} fix"
@@ -1810,7 +2092,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
                     f"{self._SEARXNG_URL}/search",
-                    params={"q": query, "format": "json", "language": "en", "safesearch": "0"},
+                    params={
+                        "q": query,
+                        "format": "json",
+                        "language": "en",
+                        "safesearch": "0",
+                    },
                 )
                 resp.raise_for_status()
                 results = resp.json().get("results", [])[:max_results]
@@ -1823,7 +2110,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         lines = []
         for r in results:
-            domain  = urlparse(r.get("url", "")).netloc.lstrip("www.")
+            domain = urlparse(r.get("url", "")).netloc.lstrip("www.")
             snippet = r.get("content", r.get("snippet", "")).strip()[:200]
             if snippet:
                 lines.append(f"  [{domain}] {snippet}")
@@ -1831,8 +2118,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if not lines:
             return ""
 
-        log.info("orchestrator.fix_research_found",
-                 query=query[:60], hits=len(lines))
+        log.info("orchestrator.fix_research_found", query=query[:60], hits=len(lines))
         return (
             f"\n\n[Internet search for '{query[:80]}' found these hints:]\n"
             + "\n".join(lines)
@@ -1862,7 +2148,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # Atomically claim this phase — bail if another coroutine already has it.
         # This must happen before the first `await` to be effective.
         if phase in plan._phases_advancing:
-            log.debug("orchestrator.phase_advance_skipped", plan_id=plan.plan_id, phase=phase)
+            log.debug(
+                "orchestrator.phase_advance_skipped", plan_id=plan.plan_id, phase=phase
+            )
             return
         plan._phases_advancing.add(phase)
 
@@ -1877,9 +2165,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 next_phase = max(s.phase for s in plan.steps) + 1
                 fix_steps_added = 0
                 for step in fixable:
-                    new_depth  = step.depth + 1
+                    new_depth = step.depth + 1
                     error_text = step.result[:300]
-                    error_chain = step.error_chain + [f"[depth {step.depth}] {error_text}"]
+                    error_chain = step.error_chain + [
+                        f"[depth {step.depth}] {error_text}"
+                    ]
 
                     # ── Strategy rotation ──────────────────────────────────
                     # depth 1–3: same agent, error context
@@ -1889,7 +2179,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     if new_depth <= 3:
                         fix_agent = step.agent
                         chain_ctx = "\n".join(f"  - {e}" for e in error_chain[-3:])
-                        fix_task  = (
+                        fix_task = (
                             f"{step.task}\n\n"
                             f"[Fix attempt {new_depth}: previous attempt failed.]\n"
                             f"Error history:\n{chain_ctx}\n"
@@ -1899,7 +2189,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         fix_agent = "claude_code_agent"
                         chain_ctx = "\n".join(f"  - {e}" for e in error_chain[-3:])
                         web_hints = await self._research_fix(step.task, error_text)
-                        fix_task  = (
+                        fix_task = (
                             f"A previous agent ({step.agent}) failed to complete this task.\n"
                             f"Original task: {step.task}\n\n"
                             f"Error history (most recent first):\n{chain_ctx}"
@@ -1912,19 +2202,25 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         web_hints = await self._research_fix(step.task, error_text)
                         try:
                             rephrase_messages = [
-                                SystemMessage(content=(
-                                    "A specialist agent repeatedly failed a subtask. "
-                                    "Reformulate the task in a completely different way that avoids the known failure mode. "
-                                    "Output only the reformulated task description — no preamble."
-                                )),
-                                HumanMessage(content=(
-                                    f"Original task: {step.task}\n"
-                                    f"Errors so far:\n" +
-                                    "\n".join(f"  - {e}" for e in error_chain[-3:]) +
-                                    web_hints
-                                )),
+                                SystemMessage(
+                                    content=(
+                                        "A specialist agent repeatedly failed a subtask. "
+                                        "Reformulate the task in a completely different way that avoids the known failure mode. "
+                                        "Output only the reformulated task description — no preamble."
+                                    )
+                                ),
+                                HumanMessage(
+                                    content=(
+                                        f"Original task: {step.task}\n"
+                                        f"Errors so far:\n"
+                                        + "\n".join(
+                                            f"  - {e}" for e in error_chain[-3:]
+                                        )
+                                        + web_hints
+                                    )
+                                ),
                             ]
-                            resp     = await self.llm_invoke(rephrase_messages)
+                            resp = await self.llm_invoke(rephrase_messages)
                             fix_task = resp.content.strip()
                         except Exception:
                             fix_task = step.task  # fallback to original
@@ -1940,17 +2236,19 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     )
                     plan.steps.append(fix_step)
                     fix_steps_added += 1
-                    step.status = "fixed"   # mark original as superseded
+                    step.status = "fixed"  # mark original as superseded
 
                     await self.emit(
                         EventType.TASK_FIX_SPAWNED,
                         payload={
                             "original_step_id": step.step_id,
-                            "fix_step_id":      fix_step.step_id,
-                            "depth":            new_depth,
-                            "agent":            fix_agent,
-                            "strategy":         "same" if new_depth <= 3 else ("escalate" if new_depth <= 6 else "reformulate"),
-                            "plan_id":          plan.plan_id,
+                            "fix_step_id": fix_step.step_id,
+                            "depth": new_depth,
+                            "agent": fix_agent,
+                            "strategy": "same"
+                            if new_depth <= 3
+                            else ("escalate" if new_depth <= 6 else "reformulate"),
+                            "plan_id": plan.plan_id,
                         },
                         target="broadcast",
                     )
@@ -1961,7 +2259,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         f"🔧 {fix_steps_added} fix subtask(s) spawned → phase {next_phase}",
                     )
                     plan._phases_advancing.discard(phase)
-                    await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "running", plan.to_dict())
+                    await self.memory.upsert_plan(
+                        plan.task_id,
+                        plan.plan_id,
+                        plan.original_task,
+                        "running",
+                        plan.to_dict(),
+                    )
                     await self._dispatch_phase(plan, next_phase)
                     return
 
@@ -1982,7 +2286,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 if hints and hints[:80] not in seen_queries:
                     seen_queries.add(hints[:80])
                     web_sections.append(hints.strip())
-            web_block = ("\n\n**Possible fixes found online:**\n" + "\n".join(web_sections)) if web_sections else ""
+            web_block = (
+                ("\n\n**Possible fixes found online:**\n" + "\n".join(web_sections))
+                if web_sections
+                else ""
+            )
             reply = (
                 f"❌ Could not complete after {max_depth} fix attempt(s).\n\n"
                 f"Failed steps:\n{error_lines}"
@@ -1993,18 +2301,31 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 plan, f"❌ Escalating to user — fix depth {max_depth} exhausted"
             )
             await self._publish_reply(
-                reply, plan.task_id, plan.discord_message_id, original_task=plan.original_task
+                reply,
+                plan.task_id,
+                plan.discord_message_id,
+                original_task=plan.original_task,
             )
             self._plans.pop(plan.task_id, None)
             await self._close_task_context(plan, success=False)
-            await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict())
+            await self.memory.upsert_plan(
+                plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict()
+            )
             await self._shutdown_plan_agents(plan)
         else:
             # Phase succeeded
             next_phase = phase + 1
             if next_phase <= plan.max_phase():
-                await self._emit_plan_status(plan, f"✅ Phase {phase} complete → phase {next_phase}")
-                await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "running", plan.to_dict())
+                await self._emit_plan_status(
+                    plan, f"✅ Phase {phase} complete → phase {next_phase}"
+                )
+                await self.memory.upsert_plan(
+                    plan.task_id,
+                    plan.plan_id,
+                    plan.original_task,
+                    "running",
+                    plan.to_dict(),
+                )
                 await self._dispatch_phase(plan, next_phase)
             else:
                 # All phases done — synthesise final reply
@@ -2023,7 +2344,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 )
                 self._plans.pop(plan.task_id, None)
                 await self._close_task_context(plan, success=True)
-                await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "completed", plan.to_dict())
+                await self.memory.upsert_plan(
+                    plan.task_id,
+                    plan.plan_id,
+                    plan.original_task,
+                    "completed",
+                    plan.to_dict(),
+                )
                 await self._shutdown_plan_agents(plan)
 
     async def _shutdown_plan_agents(self, plan: "ExecutionPlan") -> None:
@@ -2033,17 +2360,18 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         GPU memory and container resources immediately rather than waiting for
         the idle timeout.
         """
-        agents_used = {
-            s.agent for s in plan.steps
-            if s.agent in self._EPHEMERAL_AGENTS
-        }
+        agents_used = {s.agent for s in plan.steps if s.agent in self._EPHEMERAL_AGENTS}
         for agent in agents_used:
             await self.emit(
                 EventType.AGENT_SHUTDOWN,
                 payload={"plan_id": plan.plan_id, "reason": "plan_complete"},
                 target=agent,
             )
-            log.info("orchestrator.agent_shutdown_sent", agent=agent, plan_id=plan.plan_id[:8])
+            log.info(
+                "orchestrator.agent_shutdown_sent",
+                agent=agent,
+                plan_id=plan.plan_id[:8],
+            )
 
     # ── Context lifecycle ────────────────────────────────────────────────────
 
@@ -2057,9 +2385,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
           - Failed tasks still score >0 (failure cases are worth remembering)
           - Single-step trivial tasks score low
         """
-        steps_done   = sum(1 for s in plan.steps if s.status == "done")
-        steps_total  = len(plan.steps)
-        value_score  = (steps_done / max(steps_total, 1)) * (0.9 if success else 0.4)
+        steps_done = sum(1 for s in plan.steps if s.status == "done")
+        steps_total = len(plan.steps)
+        value_score = (steps_done / max(steps_total, 1)) * (0.9 if success else 0.4)
         if steps_total > 1:
             value_score = min(1.0, value_score + 0.2)
 
@@ -2083,11 +2411,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await self.emit(
             EventType.CONTEXT_CLOSED,
             payload={
-                "context_id":  plan.context_id or plan.task_id,
-                "task_id":     plan.task_id,
-                "success":     success,
+                "context_id": plan.context_id or plan.task_id,
+                "task_id": plan.task_id,
+                "success": success,
                 "value_score": round(value_score, 2),
-                "summary":     summary[:300],
+                "summary": summary[:300],
             },
             target="broadcast",
         )
@@ -2117,7 +2445,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
     # ── On-demand agent lifecycle ─────────────────────────────────────────────
 
-    _EPHEMERAL_AGENTS = {"document_qa", "code_search", "executor", "claude_code_agent", "research"}
+    _EPHEMERAL_AGENTS = {
+        "document_qa",
+        "code_search",
+        "executor",
+        "claude_code_agent",
+        "research",
+    }
 
     # Maps agent role name → Docker container_name (for docker start/stop).
     # Defaults to "agent_{role}" for anything not listed here.
@@ -2125,7 +2459,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         "claude_code_agent": "agent_claude_code",
     }
 
-    async def _ensure_agent_running(self, agent: str, plan: "ExecutionPlan | None" = None) -> bool:
+    async def _ensure_agent_running(
+        self, agent: str, plan: "ExecutionPlan | None" = None
+    ) -> bool:
         """Start an ephemeral agent container if it isn't already running.
         Uses `docker start` — no compose plugin required.
         Returns True on success, False if the container could not be started."""
@@ -2136,7 +2472,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._emit_plan_status(plan, f"🚀 Starting `{container}`…")
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "start", container,
+                "docker",
+                "start",
+                container,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2145,37 +2483,67 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 err = stderr.decode().strip()
                 # Container doesn't exist yet (never been run) — fall back to compose up
                 if "No such container" in err:
-                    log.info("orchestrator.agent_compose_up", agent=agent, container=container)
+                    log.info(
+                        "orchestrator.agent_compose_up",
+                        agent=agent,
+                        container=container,
+                    )
                     compose_proc = await asyncio.create_subprocess_exec(
-                        "docker", "compose", "up", "-d", "--no-deps", agent,
+                        "docker",
+                        "compose",
+                        "up",
+                        "-d",
+                        "--no-deps",
+                        agent,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=self.settings.compose_project_dir,
                     )
-                    _, compose_err = await asyncio.wait_for(compose_proc.communicate(), timeout=120)
+                    _, compose_err = await asyncio.wait_for(
+                        compose_proc.communicate(), timeout=120
+                    )
                     if compose_proc.returncode == 0:
-                        log.info("orchestrator.agent_created_and_started", agent=agent, container=container)
+                        log.info(
+                            "orchestrator.agent_created_and_started",
+                            agent=agent,
+                            container=container,
+                        )
                         if plan:
-                            await self._emit_plan_status(plan, f"✅ `{container}` created and started")
+                            await self._emit_plan_status(
+                                plan, f"✅ `{container}` created and started"
+                            )
                         return True
                     err = compose_err.decode().strip()[:200]
-                log.error("orchestrator.agent_start_failed", agent=agent, container=container, error=err[:200])
+                log.error(
+                    "orchestrator.agent_start_failed",
+                    agent=agent,
+                    container=container,
+                    error=err[:200],
+                )
                 if plan:
-                    await self._emit_plan_status(plan, f"❌ Failed to start `{container}`: {err[:200]}")
+                    await self._emit_plan_status(
+                        plan, f"❌ Failed to start `{container}`: {err[:200]}"
+                    )
                 return False
             log.info("orchestrator.agent_started", agent=agent, container=container)
             if plan:
                 await self._emit_plan_status(plan, f"✅ `{container}` started")
             return True
         except asyncio.TimeoutError:
-            log.error("orchestrator.agent_start_timeout", agent=agent, container=container)
+            log.error(
+                "orchestrator.agent_start_timeout", agent=agent, container=container
+            )
             if plan:
-                await self._emit_plan_status(plan, f"❌ Timed out starting `{container}` (60s)")
+                await self._emit_plan_status(
+                    plan, f"❌ Timed out starting `{container}` (60s)"
+                )
             return False
         except Exception as exc:
             log.error("orchestrator.agent_start_error", agent=agent, error=str(exc))
             if plan:
-                await self._emit_plan_status(plan, f"❌ Error starting `{container}`: {exc}")
+                await self._emit_plan_status(
+                    plan, f"❌ Error starting `{container}`: {exc}"
+                )
             return False
 
     # ── Discord action dispatch ───────────────────────────────────────────────
@@ -2190,18 +2558,20 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if actions is None:
             log.info("orchestrator.discord_action_llm_fallback", task=task[:80])
             messages = [
-                SystemMessage(content=(
-                    "Translate a Discord management request into a JSON array of action objects. No markdown. Output ONLY valid JSON.\n"
-                    "Valid actions: send_message, send_file, create_channel, delete_channel, rename_channel, "
-                    "set_topic, create_category, pin_message, list_channels, find_and_delete_duplicates\n"
-                    "Rules:\n"
-                    "- send_message MUST have a non-empty 'content' field with the literal text to send. NEVER emit send_message without concrete content.\n"
-                    "- send_file sends a file from /workspace to Discord. Required field: file_path (absolute path). Optional: channel_name or channel_id, content (caption).\n"
-                    "- To read/list channels use list_channels only.\n"
-                    "- To set a channel description use set_topic with a 'topic' field.\n"
-                    "- Do NOT combine list_channels with send_message in the same action array.\n"
-                    'Example: [{"action":"send_file","file_path":"/workspace/docs/report.pdf","channel_name":"agent-tasks","content":"Here is the report"}]'
-                )),
+                SystemMessage(
+                    content=(
+                        "Translate a Discord management request into a JSON array of action objects. No markdown. Output ONLY valid JSON.\n"
+                        "Valid actions: send_message, send_file, create_channel, delete_channel, rename_channel, "
+                        "set_topic, create_category, pin_message, list_channels, find_and_delete_duplicates\n"
+                        "Rules:\n"
+                        "- send_message MUST have a non-empty 'content' field with the literal text to send. NEVER emit send_message without concrete content.\n"
+                        "- send_file sends a file from /workspace to Discord. Required field: file_path (absolute path). Optional: channel_name or channel_id, content (caption).\n"
+                        "- To read/list channels use list_channels only.\n"
+                        "- To set a channel description use set_topic with a 'topic' field.\n"
+                        "- Do NOT combine list_channels with send_message in the same action array.\n"
+                        'Example: [{"action":"send_file","file_path":"/workspace/docs/report.pdf","channel_name":"agent-tasks","content":"Here is the report"}]'
+                    )
+                ),
                 HumanMessage(content=f"Discord task: {task}"),
             ]
             response = await self.llm_invoke(messages)
@@ -2224,12 +2594,23 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 continue
             # Skip send_message actions with no content — they'd fail in the bridge
             # and break the whole plan (LLMs sometimes emit these speculatively).
-            if action_payload.get("action") == "send_message" and not action_payload.get("content", "").strip():
-                log.warning("orchestrator.discord_action_skipped_empty_content", action=action_payload)
+            if (
+                action_payload.get("action") == "send_message"
+                and not action_payload.get("content", "").strip()
+            ):
+                log.warning(
+                    "orchestrator.discord_action_skipped_empty_content",
+                    action=action_payload,
+                )
                 continue
             action_payload["task_id"] = task_id
-            await self.emit(EventType.DISCORD_ACTION, payload=action_payload, target="broadcast")
-            log.info("orchestrator.discord_action_emitted", action=action_payload.get("action"))
+            await self.emit(
+                EventType.DISCORD_ACTION, payload=action_payload, target="broadcast"
+            )
+            log.info(
+                "orchestrator.discord_action_emitted",
+                action=action_payload.get("action"),
+            )
             emitted += 1
         return emitted
 
@@ -2248,7 +2629,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             source, result = raw_results[0]
             result = result.strip()
             if not result.startswith("Exit code:") and len(result) <= 1800:
-                await self._publish_reply(result, task_id, discord_message_id, original_task=original_task)
+                await self._publish_reply(
+                    result, task_id, discord_message_id, original_task=original_task
+                )
                 return
 
         summary_system = (
@@ -2264,7 +2647,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             HumanMessage(content=fixed + combined),
         ]
         response = await self.llm_invoke(messages)
-        await self._publish_reply(response.content, task_id, discord_message_id, original_task=original_task)
+        await self._publish_reply(
+            response.content, task_id, discord_message_id, original_task=original_task
+        )
 
     async def _publish_reply(
         self,
@@ -2280,7 +2665,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if original_task:
             now = time.time()
             # Reset context window if the user has been idle for > 15 minutes
-            if self._conversation and (now - self._conversation[-1][2]) > self._CONVERSATION_TIMEOUT:
+            if (
+                self._conversation
+                and (now - self._conversation[-1][2]) > self._CONVERSATION_TIMEOUT
+            ):
                 self._conversation.clear()
                 log.info("orchestrator.conversation_reset", reason="idle_timeout")
             self._conversation.append((original_task, result[:300], now))
@@ -2295,16 +2683,24 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         idle_gap = float(await self.bus.get_config("chat_idle_gap_secs", 1800))
         for session in list(self._chat_sessions.values()):
             if now - session.last_activity > idle_gap:
-                log.info("orchestrator.chat_session_idle_close", session_id=session.session_id[:8])
+                log.info(
+                    "orchestrator.chat_session_idle_close",
+                    session_id=session.session_id[:8],
+                )
                 await self._close_chat_session(session)
         stale = [
-            tid for tid, p in list(self._plans.items())
+            tid
+            for tid, p in list(self._plans.items())
             if now - p.created_at > self.PLAN_TIMEOUT
         ]
         for tid in stale:
             plan = self._plans.pop(tid)
-            log.warning("orchestrator.plan_expired", task_id=tid, task=plan.original_task[:60])
-            await self.memory.upsert_plan(tid, plan.plan_id, plan.original_task, "expired", plan.to_dict())
+            log.warning(
+                "orchestrator.plan_expired", task_id=tid, task=plan.original_task[:60]
+            )
+            await self.memory.upsert_plan(
+                tid, plan.plan_id, plan.original_task, "expired", plan.to_dict()
+            )
             running_steps = [s for s in plan.steps if s.status == "running"]
             await self._emit_plan_status(
                 plan,
@@ -2331,18 +2727,24 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             log.debug("orchestrator.think_idle")
             return
 
-        row     = pending[0]
+        row = pending[0]
         claimed = await self.memory.claim_task(row["id"])
         if not claimed:
             return
 
         task_text = row["task"]
-        task_id   = str(uuid.uuid4())
-        log.info("orchestrator.think_dequeued", db_task_id=row["id"], task=task_text[:80])
+        task_id = str(uuid.uuid4())
+        log.info(
+            "orchestrator.think_dequeued", db_task_id=row["id"], task=task_text[:80]
+        )
 
         await self.emit(
             EventType.THINK_CYCLE,
-            payload={"task": task_text[:300], "task_id": task_id, "db_task_id": row["id"]},
+            payload={
+                "task": task_text[:300],
+                "task_id": task_id,
+                "db_task_id": row["id"],
+            },
             target="broadcast",
         )
         try:
@@ -2378,7 +2780,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         stored_raw = await self.bus._client.hgetall(_ARCH_HASH_KEY)
         stored: dict[str, str] = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            (k.decode() if isinstance(k, bytes) else k): (
+                v.decode() if isinstance(v, bytes) else v
+            )
             for k, v in stored_raw.items()
         }
 
@@ -2414,8 +2818,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await self._write_arch_changelog(short_names)
 
         if not due_for_full_build:
-            log.info("orchestrator.arch_minor_update", files=short_names,
-                     next_full_build_in_h=round((_FULL_BUILD_INTERVAL - (time.time() - last_build)) / 3600, 1))
+            log.info(
+                "orchestrator.arch_minor_update",
+                files=short_names,
+                next_full_build_in_h=round(
+                    (_FULL_BUILD_INTERVAL - (time.time() - last_build)) / 3600, 1
+                ),
+            )
             return
 
         # ── Full build ────────────────────────────────────────────────────────
@@ -2424,7 +2833,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # rapid retry storm on the next think cycle.
         await self.bus._client.set(_ARCH_LAST_FULL_BUILD, str(time.time()))
 
-        task_id   = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
         task_desc = (
             "Full architecture review triggered by accumulated source changes. "
             "Recent changes include: " + ", ".join(short_names[:8]) + ". "
@@ -2434,20 +2843,23 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             plan_id=str(uuid.uuid4()),
             task_id=task_id,
             original_task=task_desc,
-            steps=[PlanStep(
-                step_id=str(uuid.uuid4()),
-                phase=1,
-                task=task_desc,
-                agent="document_qa",
-                expected="architecture PDF compiled and synced to Drive",
-            )],
+            steps=[
+                PlanStep(
+                    step_id=str(uuid.uuid4()),
+                    phase=1,
+                    task=task_desc,
+                    agent="document_qa",
+                    expected="architecture PDF compiled and synced to Drive",
+                )
+            ],
         )
         self._plans[task_id] = plan
         await self.memory.upsert_plan(
             task_id, plan.plan_id, task_desc, "running", plan.to_dict()
         )
         await self._emit_plan_status(
-            plan, f"📐 Daily arch build — spinning up document_qa: {', '.join(short_names[:5])}"
+            plan,
+            f"📐 Daily arch build — spinning up document_qa: {', '.join(short_names[:5])}",
         )
         await self._dispatch_phase(plan, 1)
 
@@ -2458,7 +2870,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         """
         try:
             _ARCH_CHANGELOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             entry = f"- `{ts}` — changed: {', '.join(short_names)}\n"
             with _ARCH_CHANGELOG_PATH.open("a") as f:
                 f.write(entry)

@@ -47,14 +47,14 @@ log = structlog.get_logger()
 # ── Defaults for runtime-configurable values ──────────────────────────────────
 
 CONFIG_DEFAULTS: dict[str, Any] = {
-    "vote_timeout_ms":        3_000,   # ms agents have to vote on a plan
-    "vote_max_extension_ms": 10_000,   # max extra ms one agent can request
-    "chat_idle_gap_secs":    1_800,    # 30 min idle → new chat session
-    "chat_keyword_overlap":    0.4,    # Jaccard threshold for same session
-    "max_concurrent_contexts":   5,    # per-agent context stream pool size
-    "topic_confidence_ask":    0.8,    # below this → ask user for category
-    "topic_min_sessions":       50,    # sessions before asking user at all
-    "max_fix_depth":            10,    # max strategy-rotating fix attempts
+    "vote_timeout_ms": 3_000,  # ms agents have to vote on a plan
+    "vote_max_extension_ms": 10_000,  # max extra ms one agent can request
+    "chat_idle_gap_secs": 1_800,  # 30 min idle → new chat session
+    "chat_keyword_overlap": 0.4,  # Jaccard threshold for same session
+    "max_concurrent_contexts": 5,  # per-agent context stream pool size
+    "topic_confidence_ask": 0.8,  # below this → ask user for category
+    "topic_min_sessions": 50,  # sessions before asking user at all
+    "max_fix_depth": 10,  # max strategy-rotating fix attempts
 }
 
 
@@ -68,101 +68,109 @@ def _slugify(name: str) -> str:
 
 class EventType(str, Enum):
     # Lifecycle
-    TASK_CREATED      = "task.created"
-    TASK_ASSIGNED     = "task.assigned"
-    TASK_COMPLETED    = "task.completed"
-    TASK_FAILED       = "task.failed"
+    TASK_CREATED = "task.created"
+    TASK_ASSIGNED = "task.assigned"
+    TASK_COMPLETED = "task.completed"
+    TASK_FAILED = "task.failed"
 
     # Agent actions
-    AGENT_STARTED     = "agent.started"
-    AGENT_THINKING    = "agent.thinking"
-    AGENT_TOOL_CALL   = "agent.tool_call"
+    AGENT_STARTED = "agent.started"
+    AGENT_THINKING = "agent.thinking"
+    AGENT_TOOL_CALL = "agent.tool_call"
     AGENT_TOOL_RESULT = "agent.tool_result"
-    AGENT_RESPONSE    = "agent.response"
+    AGENT_RESPONSE = "agent.response"
 
     # Memory
-    MEMORY_PROMOTED   = "memory.promoted"   # Short → long-term (Emrys)
+    MEMORY_PROMOTED = "memory.promoted"  # Short → long-term (Emrys)
     CONTEXT_RECOVERED = "context.recovered"
 
     # Approval gates
     APPROVAL_REQUIRED = "approval.required"
-    APPROVAL_GRANTED  = "approval.granted"
-    APPROVAL_DENIED   = "approval.denied"
+    APPROVAL_GRANTED = "approval.granted"
+    APPROVAL_DENIED = "approval.denied"
 
     # Parallel tasks
-    TASK_SPAWNED         = "task.spawned"         # sub-task dispatched by orchestrator
+    TASK_SPAWNED = "task.spawned"  # sub-task dispatched by orchestrator
 
     # Fix subtask (strategy-rotating retry on failure)
-    TASK_FIX_SPAWNED     = "task.fix_spawned"     # failed step spawned a fix subtask
+    TASK_FIX_SPAWNED = "task.fix_spawned"  # failed step spawned a fix subtask
 
     # Proactive reasoning
-    THINK_CYCLE          = "think.cycle"           # orchestrator autonomous think cycle
+    THINK_CYCLE = "think.cycle"  # orchestrator autonomous think cycle
 
     # Self-modification
     SELF_MODIFY_PROPOSED = "self.modify.proposed"  # agent proposes a code change
-    SELF_MODIFY_APPLIED  = "self.modify.applied"   # code change applied + restart requested
+    SELF_MODIFY_APPLIED = (
+        "self.modify.applied"  # code change applied + restart requested
+    )
 
     # Session management
-    SESSION_RESET        = "session.reset"          # wipe conversation/chat context
+    SESSION_RESET = "session.reset"  # wipe conversation/chat context
 
     # Discord management (agent → bridge)
-    DISCORD_ACTION       = "discord.action"        # request a Discord API action
-    DISCORD_ACTION_DONE  = "discord.action.done"   # bridge confirms action completed
+    DISCORD_ACTION = "discord.action"  # request a Discord API action
+    DISCORD_ACTION_DONE = "discord.action.done"  # bridge confirms action completed
 
     # Memory lifecycle
-    MEMORY_PRUNED        = "memory.pruned"          # long-term memory pruned; user warned
+    MEMORY_PRUNED = "memory.pruned"  # long-term memory pruned; user warned
 
     # Plan execution lifecycle
-    PLAN_STATUS          = "plan.status"            # step/phase progress update → Discord
-    PLAN_PROPOSED        = "plan.proposed"          # orchestrator broadcasts plan before executing
-    AGENT_VOTE           = "agent.vote"             # agent approves/rejects a proposed plan
-    VOTE_EXTENSION_REQUESTED = "vote.extension_requested"  # agent needs more deliberation time
+    PLAN_STATUS = "plan.status"  # step/phase progress update → Discord
+    PLAN_PROPOSED = "plan.proposed"  # orchestrator broadcasts plan before executing
+    AGENT_VOTE = "agent.vote"  # agent approves/rejects a proposed plan
+    VOTE_EXTENSION_REQUESTED = (
+        "vote.extension_requested"  # agent needs more deliberation time
+    )
 
     # Context stream lifecycle
-    CONTEXT_CREATED      = "context.created"        # orchestrator announces new named context stream
-    CONTEXT_CLOSED       = "context.closed"         # context stream closed + snapshot saved
-    CONTEXT_SNAPSHOT     = "context.snapshot"       # rolling mid-execution snapshot
+    CONTEXT_CREATED = (
+        "context.created"  # orchestrator announces new named context stream
+    )
+    CONTEXT_CLOSED = "context.closed"  # context stream closed + snapshot saved
+    CONTEXT_SNAPSHOT = "context.snapshot"  # rolling mid-execution snapshot
 
     # Chat session lifecycle
     CHAT_SESSION_STARTED = "chat.session_started"
-    CHAT_SESSION_CLOSED  = "chat.session_closed"
+    CHAT_SESSION_CLOSED = "chat.session_closed"
 
     # Topic classification (agent-learned categories)
-    TOPIC_CLASSIFIED     = "topic.classified"       # agent assigned a topic category to a context
+    TOPIC_CLASSIFIED = (
+        "topic.classified"  # agent assigned a topic category to a context
+    )
 
     # Runtime configuration
-    CONFIG_UPDATED       = "config.updated"         # agent/orchestrator updated a config value
+    CONFIG_UPDATED = "config.updated"  # agent/orchestrator updated a config value
 
     # Lifecycle control
-    AGENT_SHUTDOWN    = "agent.shutdown"    # orchestrator tells an ephemeral agent to exit
+    AGENT_SHUTDOWN = "agent.shutdown"  # orchestrator tells an ephemeral agent to exit
 
     # Checkpoint / fork
-    CHECKPOINT_REACHED = "checkpoint.reached"   # agent marks a named task boundary
+    CHECKPOINT_REACHED = "checkpoint.reached"  # agent marks a named task boundary
 
     # System
-    HEARTBEAT         = "system.heartbeat"
-    ERROR             = "system.error"
+    HEARTBEAT = "system.heartbeat"
+    ERROR = "system.error"
 
 
 @dataclass
 class Event:
     type: EventType
-    source: str                          # Agent role that produced this event
+    source: str  # Agent role that produced this event
     payload: dict[str, Any]
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: float = field(default_factory=time.time)
-    ttl_seconds: Optional[int] = None   # None = use stream MAXLEN, else explicit
+    ttl_seconds: Optional[int] = None  # None = use stream MAXLEN, else explicit
 
     def to_redis(self) -> dict[str, str]:
         """Serialize for Redis XADD (all values must be strings)."""
         return {
-            "event_id":   self.event_id,
-            "type":       self.type.value,
-            "source":     self.source,
-            "task_id":    self.task_id,
-            "timestamp":  str(self.timestamp),
-            "payload":    json.dumps(self.payload),
+            "event_id": self.event_id,
+            "type": self.type.value,
+            "source": self.source,
+            "task_id": self.task_id,
+            "timestamp": str(self.timestamp),
+            "payload": json.dumps(self.payload),
         }
 
     @classmethod
@@ -199,12 +207,12 @@ class EventBus:
         ctx:registry  →  context_id → JSON metadata
     """
 
-    STREAM_PREFIX     = "agents"
-    BROADCAST_STREAM  = "agents:broadcast"
-    CONTEXT_PREFIX    = "ctx"
-    CONTEXT_REGISTRY  = "ctx:registry"
-    MAX_STREAM_LEN    = 10_000          # Per stream — keeps Redis footprint bounded
-    CONFIG_PREFIX     = "config"
+    STREAM_PREFIX = "agents"
+    BROADCAST_STREAM = "agents:broadcast"
+    CONTEXT_PREFIX = "ctx"
+    CONTEXT_REGISTRY = "ctx:registry"
+    MAX_STREAM_LEN = 10_000  # Per stream — keeps Redis footprint bounded
+    CONFIG_PREFIX = "config"
 
     def __init__(self, redis_url: str):
         self._url = redis_url
@@ -306,7 +314,9 @@ class EventBus:
                 # Re-ensure consumer groups after reconnect
                 for key in keys:
                     try:
-                        await self._client.xgroup_create(key, group, id="0", mkstream=True)
+                        await self._client.xgroup_create(
+                            key, group, id="0", mkstream=True
+                        )
                     except aioredis.ResponseError as e:
                         if "BUSYGROUP" not in str(e):
                             raise
@@ -336,7 +346,9 @@ class EventBus:
         """Publish a response event and ack the triggering event atomically."""
         async with self._client.pipeline(transaction=True) as pipe:
             key = self._stream_key(target)
-            await pipe.xadd(key, event.to_redis(), maxlen=self.MAX_STREAM_LEN, approximate=True)
+            await pipe.xadd(
+                key, event.to_redis(), maxlen=self.MAX_STREAM_LEN, approximate=True
+            )
             await pipe.xack(ack_stream, ack_group, ack_entry_id)
             await pipe.execute()
 
@@ -367,22 +379,26 @@ class EventBus:
             return json.loads(existing)["stream"]
 
         entry = {
-            "type":       context_type,
-            "id":         context_id,
-            "name":       name,
-            "stream":     stream_key,
-            "status":     "active",
+            "type": context_type,
+            "id": context_id,
+            "name": name,
+            "stream": stream_key,
+            "status": "active",
             "created_at": time.time(),
             **(metadata or {}),
         }
         await self._client.hset(self.CONTEXT_REGISTRY, context_id, json.dumps(entry))
         # Touch the stream so it exists even before the first event
         try:
-            await self._client.xgroup_create(stream_key, "readers", id="0", mkstream=True)
+            await self._client.xgroup_create(
+                stream_key, "readers", id="0", mkstream=True
+            )
         except aioredis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
-        log.debug("event_bus.context_created", type=context_type, id=context_id, name=name)
+        log.debug(
+            "event_bus.context_created", type=context_type, id=context_id, name=name
+        )
         return stream_key
 
     async def publish_to_context(self, context_id: str, event: Event) -> str:
@@ -419,12 +435,12 @@ class EventBus:
 
     async def close_context(self, context_id: str) -> None:
         """Mark a context as closed in the registry."""
-        await self.update_context_metadata(context_id, status="closed", closed_at=time.time())
+        await self.update_context_metadata(
+            context_id, status="closed", closed_at=time.time()
+        )
         log.debug("event_bus.context_closed", context_id=context_id)
 
-    async def list_active_contexts(
-        self, context_type: str | None = None
-    ) -> list[dict]:
+    async def list_active_contexts(self, context_type: str | None = None) -> list[dict]:
         """
         Return all registered contexts sorted newest-first.
         Optionally filter by context_type ('task', 'chat', 'plan').
@@ -453,12 +469,11 @@ class EventBus:
         stream_key = meta["stream"]
         try:
             results = await self._client.xrange(stream_key, min=last_id, count=count)
-            return [
-                (entry_id, Event.from_redis(data))
-                for entry_id, data in results
-            ]
+            return [(entry_id, Event.from_redis(data)) for entry_id, data in results]
         except Exception as exc:
-            log.warning("event_bus.context_read_failed", context_id=context_id, error=str(exc))
+            log.warning(
+                "event_bus.context_read_failed", context_id=context_id, error=str(exc)
+            )
             return []
 
     async def consume_context_stream(
@@ -545,11 +560,13 @@ class EventBus:
             return decision
         return "denied"
 
-    async def set_approval(self, approval_id: str, decision: str, ex: int = 600) -> None:
+    async def set_approval(
+        self, approval_id: str, decision: str, ex: int = 600
+    ) -> None:
         """
         Record an approval decision and unblock any waiter.
         """
-        key        = f"approval:{approval_id}"
+        key = f"approval:{approval_id}"
         notify_key = f"approval:notify:{approval_id}"
         await self._client.set(key, decision, ex=ex)
         await self._client.lpush(notify_key, decision)

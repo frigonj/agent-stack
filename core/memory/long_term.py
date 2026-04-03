@@ -30,7 +30,7 @@ _encoder = None
 # In-process LRU cache keyed on SHA-256(text).
 # Prevents re-encoding identical queries across the lifetime of one agent process.
 # 500 entries ≈ 750 KB of float32 vectors — negligible memory cost.
-_EMBED_CACHE_MAX  = 500
+_EMBED_CACHE_MAX = 500
 _embed_cache: dict[str, list[float]] = {}
 
 
@@ -38,6 +38,7 @@ def _get_encoder():
     global _encoder
     if _encoder is None:
         from sentence_transformers import SentenceTransformer
+
         _encoder = SentenceTransformer("all-MiniLM-L6-v2")
     return _encoder
 
@@ -51,7 +52,7 @@ def _embed_texts(texts: list[str]) -> list[list[float] | None]:
     """
     results: list[list[float] | None] = [None] * len(texts)
     to_encode_indices: list[int] = []
-    to_encode_texts:   list[str] = []
+    to_encode_texts: list[str] = []
 
     for i, text in enumerate(texts):
         key = hashlib.sha256(text.encode()).hexdigest()
@@ -65,19 +66,19 @@ def _embed_texts(texts: list[str]) -> list[list[float] | None]:
         return results  # all cache hits
 
     try:
-        model   = _get_encoder()
+        model = _get_encoder()
         vectors = model.encode(to_encode_texts)
         for idx, (orig_i, text, vec) in enumerate(
             zip(to_encode_indices, to_encode_texts, vectors)
         ):
-            v   = vec.tolist()
+            v = vec.tolist()
             key = hashlib.sha256(text.encode()).hexdigest()
             # Simple FIFO eviction when cache is full
             if len(_embed_cache) >= _EMBED_CACHE_MAX:
                 oldest = next(iter(_embed_cache))
                 del _embed_cache[oldest]
             _embed_cache[key] = v
-            results[orig_i]   = v
+            results[orig_i] = v
     except Exception as exc:
         log.warning("memory.embed_failed", error=str(exc))
         # results already has None for un-encoded indices
@@ -264,11 +265,13 @@ _SCHEMA = [
 async def _configure_conn(conn: AsyncConnection) -> None:
     """Register pgvector codec on each new pool connection."""
     from pgvector.psycopg import register_vector_async
+
     await register_vector_async(conn)
     await conn.commit()
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
+
 
 class LongTermMemory:
     """
@@ -322,12 +325,15 @@ class LongTermMemory:
             )
             row = await cur.fetchone()
             crashed = row is not None and row["status"] == "OPEN"
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO agent_status (agent, status, current_task, updated_at)
                 VALUES (%s, 'OPEN', '', NOW())
                 ON CONFLICT (agent) DO UPDATE SET
                     status = 'OPEN', current_task = '', updated_at = NOW()
-            """, (self._agent,))
+            """,
+                (self._agent,),
+            )
         status = "CRASH" if crashed else "OK"
         log.info("memory.session_opened", agent=self._agent, status=status)
         return {"status": status, "agent": self._agent}
@@ -337,12 +343,12 @@ class LongTermMemory:
         async with pool.connection() as conn:
             cur = await conn.execute(
                 "SELECT status, current_task FROM agent_status WHERE agent = %s",
-                (self._agent,)
+                (self._agent,),
             )
             row = await cur.fetchone()
             cur = await conn.execute(
                 "SELECT summary FROM handoffs WHERE agent = %s ORDER BY id DESC LIMIT 1",
-                (self._agent,)
+                (self._agent,),
             )
             handoff = await cur.fetchone()
         result = {
@@ -358,7 +364,7 @@ class LongTermMemory:
         async with pool.connection() as conn:
             await conn.execute(
                 "UPDATE agent_status SET current_task = %s, updated_at = NOW() WHERE agent = %s",
-                (note, self._agent)
+                (note, self._agent),
             )
         log.debug("memory.checkpoint", agent=self._agent, note=note)
 
@@ -367,25 +373,33 @@ class LongTermMemory:
         async with pool.connection() as conn:
             await conn.execute(
                 "INSERT INTO handoffs (agent, summary) VALUES (%s, %s)",
-                (self._agent, summary)
+                (self._agent, summary),
             )
             await conn.execute(
                 "UPDATE agent_status SET status = 'CLEAN', updated_at = NOW() WHERE agent = %s",
-                (self._agent,)
+                (self._agent,),
             )
         log.info("memory.session_closed", agent=self._agent)
 
     # ── Knowledge store ──────────────────────────────────────────────────────
 
-    async def store(self, content: str, topic: str,
-                    tags: Optional[list[str]] = None, kind: str = "finding") -> dict:
+    async def store(
+        self,
+        content: str,
+        topic: str,
+        tags: Optional[list[str]] = None,
+        kind: str = "finding",
+    ) -> dict:
         [embedding] = await asyncio.to_thread(_embed_texts, [content])
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
                 VALUES (%s, %s, %s, %s, %s, %s)
-            """, (self._agent, topic, topic, content, json.dumps(tags or []), embedding))
+            """,
+                (self._agent, topic, topic, content, json.dumps(tags or []), embedding),
+            )
         log.info("memory.promoted", topic=topic, kind=kind)
         return {"status": "stored"}
 
@@ -397,20 +411,23 @@ class LongTermMemory:
         pool = await self._get_pool()
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.executemany("""
+                await cur.executemany(
+                    """
                     INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, [
-                    (
-                        self._agent,
-                        e.get("topic", "general"),
-                        e.get("topic", "general"),
-                        e.get("content", ""),
-                        json.dumps(e.get("tags") or []),
-                        embeddings[i],
-                    )
-                    for i, e in enumerate(entries)
-                ])
+                """,
+                    [
+                        (
+                            self._agent,
+                            e.get("topic", "general"),
+                            e.get("topic", "general"),
+                            e.get("content", ""),
+                            json.dumps(e.get("tags") or []),
+                            embeddings[i],
+                        )
+                        for i, e in enumerate(entries)
+                    ],
+                )
         log.info("memory.batch_promoted", count=len(entries))
         return {"status": "stored", "count": len(entries)}
 
@@ -420,7 +437,8 @@ class LongTermMemory:
         """Full-text search via PostgreSQL tsvector."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            cur = await conn.execute("""
+            cur = await conn.execute(
+                """
                 SELECT id, agent, topic, title, content, tags, created_at
                 FROM knowledge
                 WHERE to_tsvector('english', title || ' ' || content)
@@ -430,7 +448,9 @@ class LongTermMemory:
                     plainto_tsquery('english', %s)
                 ) DESC
                 LIMIT %s
-            """, (query, query, limit))
+            """,
+                (query, query, limit),
+            )
             rows = await cur.fetchall()
         log.debug("memory.recalled", query=query, results=len(rows))
         return list(rows)
@@ -442,19 +462,24 @@ class LongTermMemory:
             return await self.recall(query, limit)
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            cur = await conn.execute("""
+            cur = await conn.execute(
+                """
                 SELECT id, agent, topic, title, content, tags, created_at,
                        1 - (embedding <=> %s::vector) AS similarity
                 FROM knowledge
                 WHERE embedding IS NOT NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            """, (embedding, embedding, limit))
+            """,
+                (embedding, embedding, limit),
+            )
             rows = await cur.fetchall()
         log.debug("memory.vector_recalled", query=query, results=len(rows))
         return list(rows)
 
-    async def search(self, query: str, semantic: bool = False, limit: int = 5) -> list[dict]:
+    async def search(
+        self, query: str, semantic: bool = False, limit: int = 5
+    ) -> list[dict]:
         if semantic:
             try:
                 return await self.vector_search(query, limit)
@@ -485,33 +510,45 @@ class LongTermMemory:
             if to_delete == 0:
                 return 0
 
-            await conn.execute("""
+            await conn.execute(
+                """
                 DELETE FROM knowledge
                 WHERE id IN (
                     SELECT id FROM knowledge
                     ORDER BY created_at ASC
                     LIMIT %s
                 )
-            """, (to_delete,))
+            """,
+                (to_delete,),
+            )
 
         log.info("memory.pruned", deleted=to_delete, remaining=total - to_delete)
         return to_delete
 
     # ── Active plan ledger ───────────────────────────────────────────────────
 
-    async def upsert_plan(self, task_id: str, plan_id: str, original_task: str,
-                          status: str, plan_json: dict) -> None:
+    async def upsert_plan(
+        self,
+        task_id: str,
+        plan_id: str,
+        original_task: str,
+        status: str,
+        plan_json: dict,
+    ) -> None:
         """Create or update a plan row. Called on plan creation and every status change."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO active_plans (task_id, plan_id, original_task, status, plan_json)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (task_id) DO UPDATE SET
                     status     = EXCLUDED.status,
                     plan_json  = EXCLUDED.plan_json,
                     updated_at = NOW()
-            """, (task_id, plan_id, original_task[:500], status, json.dumps(plan_json)))
+            """,
+                (task_id, plan_id, original_task[:500], status, json.dumps(plan_json)),
+            )
         log.debug("memory.plan_upserted", task_id=task_id, status=status)
 
     async def load_active_plans(self) -> list[dict]:
@@ -606,7 +643,9 @@ class LongTermMemory:
 
     # ── Open task queue ──────────────────────────────────────────────────────
 
-    async def enqueue_task(self, task: str, priority: int = 5, agent: str = "orchestrator") -> int:
+    async def enqueue_task(
+        self, task: str, priority: int = 5, agent: str = "orchestrator"
+    ) -> int:
         """Add a task to the persistent work queue. Returns the new task id."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
@@ -623,7 +662,9 @@ class LongTermMemory:
         log.info("memory.task_enqueued", task_id=task_id, priority=priority)
         return task_id
 
-    async def get_pending_tasks(self, limit: int = 5, agent: str = "orchestrator") -> list[dict]:
+    async def get_pending_tasks(
+        self, limit: int = 5, agent: str = "orchestrator"
+    ) -> list[dict]:
         """
         Return pending tasks ordered by priority then age.
         These are consumed by the think loop without any LLM call.
@@ -708,8 +749,15 @@ class LongTermMemory:
                     tags        = EXCLUDED.tags,
                     embedding   = EXCLUDED.embedding
                 """,
-                (name, description, owner_agent, invocation,
-                 json.dumps(tags or []), created_by, embedding),
+                (
+                    name,
+                    description,
+                    owner_agent,
+                    invocation,
+                    json.dumps(tags or []),
+                    created_by,
+                    embedding,
+                ),
             )
         log.debug("memory.tool_registered", name=name, owner=owner_agent)
 
@@ -778,7 +826,9 @@ class LongTermMemory:
     # Successful task→command mappings are stored here so the executor can
     # re-run known operations without an LLM call.
 
-    async def store_capability(self, task: str, command: str, tags: Optional[list[str]] = None) -> None:
+    async def store_capability(
+        self, task: str, command: str, tags: Optional[list[str]] = None
+    ) -> None:
         """
         Persist a task→command mapping so the executor can reuse it.
         Uses an upsert on title so re-running the same task refreshes the entry.
@@ -791,7 +841,11 @@ class LongTermMemory:
                 VALUES ('executor', 'capability', %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
-                (task.lower().strip(), command, json.dumps(tags or ["executor", "capability"])),
+                (
+                    task.lower().strip(),
+                    command,
+                    json.dumps(tags or ["executor", "capability"]),
+                ),
             )
         log.debug("memory.capability_stored", task=task[:80], command=command[:80])
 
@@ -886,10 +940,19 @@ class LongTermMemory:
                     updated_at       = NOW()
                 """,
                 (
-                    context_id, snapshot_seq, context_type, name, status,
-                    topic_category, json.dumps(keywords or []),
-                    summary, json.dumps(snapshot_json or {}),
-                    value_score, message_count, embedding, checkpoint_label,
+                    context_id,
+                    snapshot_seq,
+                    context_type,
+                    name,
+                    status,
+                    topic_category,
+                    json.dumps(keywords or []),
+                    summary,
+                    json.dumps(snapshot_json or {}),
+                    value_score,
+                    message_count,
+                    embedding,
+                    checkpoint_label,
                 ),
             )
         log.debug(
@@ -951,14 +1014,21 @@ class LongTermMemory:
                         VALUES (%s, %s, %s, %s, 'closed', %s, %s, %s, %s, %s, %s, NOW())
                         """,
                         (
-                            context_id, next_seq,
-                            live["context_type"], live["name"],
-                            live["topic_category"], live["keywords"],
-                            summary, json.dumps(snapshot_json),
-                            value_score, live["message_count"],
+                            context_id,
+                            next_seq,
+                            live["context_type"],
+                            live["name"],
+                            live["topic_category"],
+                            live["keywords"],
+                            summary,
+                            json.dumps(snapshot_json),
+                            value_score,
+                            live["message_count"],
                         ),
                     )
-        log.info("memory.context_closed", context_id=context_id, value_score=value_score)
+        log.info(
+            "memory.context_closed", context_id=context_id, value_score=value_score
+        )
 
     async def get_context_snapshot(
         self, context_id: str, snapshot_seq: int = 0
@@ -1078,7 +1148,9 @@ class LongTermMemory:
             )
             live = await cur.fetchone()
             if not live:
-                log.warning("memory.checkpoint_no_live_row", context_id=context_id, label=label)
+                log.warning(
+                    "memory.checkpoint_no_live_row", context_id=context_id, label=label
+                )
                 return 0
 
             await conn.execute(
@@ -1090,11 +1162,17 @@ class LongTermMemory:
                 VALUES (%s, %s, %s, %s, 'checkpoint', %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    context_id, next_seq,
-                    live["context_type"], live["name"],
-                    live["topic_category"], live["keywords"],
-                    summary, json.dumps(snapshot_json),
-                    message_count, live["embedding"], label,
+                    context_id,
+                    next_seq,
+                    live["context_type"],
+                    live["name"],
+                    live["topic_category"],
+                    live["keywords"],
+                    summary,
+                    json.dumps(snapshot_json),
+                    message_count,
+                    live["embedding"],
+                    label,
                 ),
             )
         log.info(
@@ -1164,7 +1242,9 @@ class LongTermMemory:
         Returns the checkpoint row that was used as the step-off point,
         or None if no matching checkpoint exists.
         """
-        checkpoint = await self.get_latest_named_checkpoint(source_context_id, label=label)
+        checkpoint = await self.get_latest_named_checkpoint(
+            source_context_id, label=label
+        )
         if not checkpoint:
             log.warning(
                 "memory.fork_no_checkpoint",
@@ -1174,11 +1254,14 @@ class LongTermMemory:
             return None
 
         fork_json = {
-            **(json.loads(checkpoint["snapshot_json"]) if isinstance(checkpoint["snapshot_json"], str)
-               else (checkpoint["snapshot_json"] or {})),
+            **(
+                json.loads(checkpoint["snapshot_json"])
+                if isinstance(checkpoint["snapshot_json"], str)
+                else (checkpoint["snapshot_json"] or {})
+            ),
             "forked_from_context_id": source_context_id,
-            "forked_from_seq":        checkpoint["snapshot_seq"],
-            "forked_from_label":      checkpoint["checkpoint_label"],
+            "forked_from_seq": checkpoint["snapshot_seq"],
+            "forked_from_label": checkpoint["checkpoint_label"],
         }
 
         pool = await self._get_pool()
@@ -1252,6 +1335,7 @@ class LongTermMemory:
                 new_count = row["match_count"] + 1
                 # Confidence converges toward 1.0 as match_count grows (log scale)
                 import math
+
                 new_conf = min(0.99, 0.5 + 0.5 * math.log1p(new_count) / math.log1p(50))
                 await conn.execute(
                     "UPDATE topic_patterns SET match_count = %s, confidence = %s, updated_at = NOW() WHERE id = %s",
@@ -1262,7 +1346,9 @@ class LongTermMemory:
                     "INSERT INTO topic_patterns (category, keywords, confidence, created_by) VALUES (%s, %s::jsonb, %s, %s)",
                     (category, json.dumps(sorted(keywords)), confidence, created_by),
                 )
-        log.debug("memory.topic_pattern_saved", category=category, keywords=keywords[:5])
+        log.debug(
+            "memory.topic_pattern_saved", category=category, keywords=keywords[:5]
+        )
 
     async def search_topic_patterns(
         self, keywords: list[str], limit: int = 5
@@ -1312,4 +1398,8 @@ class LongTermMemory:
                 """,
                 (category, json.dumps(sorted(keywords))),
             )
-        log.info("memory.topic_pattern_confirmed", category=category, confirmed_by=confirmed_by)
+        log.info(
+            "memory.topic_pattern_confirmed",
+            category=category,
+            confirmed_by=confirmed_by,
+        )

@@ -53,15 +53,15 @@ PORT = int(os.environ.get("RESTART_HELPER_PORT", "7799"))
 # Maps friendly service names → Docker container names
 CONTAINER_MAP: dict[str, str] = {
     "orchestrator": "agent_orchestrator",
-    "executor":     "agent_executor",
-    "code-search":  "agent_code_search",
-    "code_search":  "agent_code_search",
-    "document-qa":  "agent_document_qa",
-    "document_qa":  "agent_document_qa",
-    "discord":      "agent_discord_bridge",
-    "claude":       "agent_claude_code",
-    "redis":        "agent_redis",
-    "postgres":     "agent_postgres",
+    "executor": "agent_executor",
+    "code-search": "agent_code_search",
+    "code_search": "agent_code_search",
+    "document-qa": "agent_document_qa",
+    "document_qa": "agent_document_qa",
+    "discord": "agent_discord_bridge",
+    "claude": "agent_claude_code",
+    "redis": "agent_redis",
+    "postgres": "agent_postgres",
 }
 
 # Containers included in "restart all"
@@ -85,12 +85,15 @@ LM_STUDIO_PATHS = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _container_is_running(name: str) -> bool:
     """Return True if the container exists and is currently running."""
     try:
         r = subprocess.run(
             ["docker", "inspect", "--format", "{{.State.Running}}", name],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return r.returncode == 0 and r.stdout.strip() == "true"
     except Exception:
@@ -120,7 +123,10 @@ def _restart_container(name: str) -> dict:
     except subprocess.TimeoutExpired:
         return {"ok": False, "message": f"Timeout starting {name}"}
     except FileNotFoundError:
-        return {"ok": False, "message": "docker command not found — is Docker Desktop running?"}
+        return {
+            "ok": False,
+            "message": "docker command not found — is Docker Desktop running?",
+        }
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
@@ -134,8 +140,17 @@ def _find_lm_studio() -> Path | None:
     # Fall back to querying running processes
     try:
         r = subprocess.run(
-            ["wmic", "process", "where", "name='LM Studio.exe'", "get", "ExecutablePath"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='LM Studio.exe'",
+                "get",
+                "ExecutablePath",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in r.stdout.splitlines():
             line = line.strip()
@@ -153,7 +168,8 @@ def _restart_lm_studio() -> dict:
     # 1. Kill existing process (ignore errors — it may not be running)
     kill = subprocess.run(
         ["taskkill", "/IM", "LM Studio.exe", "/F"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     log.info("taskkill: %s", (kill.stdout or kill.stderr).strip())
     time.sleep(2)
@@ -173,8 +189,10 @@ def _restart_lm_studio() -> dict:
     try:
         subprocess.Popen(
             [str(lm_path)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            if sys.platform == "win32" else 0,
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            if sys.platform == "win32"
+            else 0,
         )
         log.info("launched LM Studio from %s", lm_path)
         return {"ok": True, "message": f"LM Studio restarted ({lm_path})"}
@@ -186,7 +204,9 @@ def _get_status() -> dict:
     try:
         r = subprocess.run(
             ["docker", "ps", "--format", "table {{.Names}}\t{{.Status}}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return {"ok": True, "output": r.stdout}
     except Exception as e:
@@ -200,7 +220,7 @@ def _do_restart(service: str) -> dict:
         results = [_restart_container(c) for c in AGENT_CONTAINERS]
         ok_count = sum(1 for r in results if r["ok"])
         return {
-            "ok":      ok_count > 0,
+            "ok": ok_count > 0,
             "message": f"Restarted {ok_count}/{len(AGENT_CONTAINERS)} containers",
             "details": results,
         }
@@ -212,9 +232,11 @@ def _do_restart(service: str) -> dict:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
-class RestartHandler(http.server.BaseHTTPRequestHandler):
 
-    def log_message(self, fmt, *args):  # silence default access log; structlog handles it
+class RestartHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(
+        self, fmt, *args
+    ):  # silence default access log; structlog handles it
         pass
 
     def _send_json(self, status: int, data: dict) -> None:
@@ -228,7 +250,9 @@ class RestartHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/")
         if path in ("", "/health"):
-            self._send_json(200, {"ok": True, "service": "host_restart_helper", "port": PORT})
+            self._send_json(
+                200, {"ok": True, "service": "host_restart_helper", "port": PORT}
+            )
         elif path == "/status":
             self._send_json(200, _get_status())
         else:

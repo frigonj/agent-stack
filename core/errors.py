@@ -14,36 +14,38 @@ from enum import Enum
 
 class AgentError(str, Enum):
     # Command execution errors
-    COMMAND_TIMEOUT   = "command_timeout"    # Command exceeded time budget
-    COMMAND_DENIED    = "command_denied"     # User denied approval gate
-    COMMAND_BLOCKED   = "command_blocked"    # Command not on allowlist
-    COMMAND_FAILED    = "command_failed"     # Non-zero exit code, no recovery
+    COMMAND_TIMEOUT = "command_timeout"  # Command exceeded time budget
+    COMMAND_DENIED = "command_denied"  # User denied approval gate
+    COMMAND_BLOCKED = "command_blocked"  # Command not on allowlist
+    COMMAND_FAILED = "command_failed"  # Non-zero exit code, no recovery
 
     # Approval gate errors
-    APPROVAL_TIMEOUT  = "approval_timeout"   # No decision within timeout window
-    APPROVAL_DENIED   = "approval_denied"    # User explicitly denied
+    APPROVAL_TIMEOUT = "approval_timeout"  # No decision within timeout window
+    APPROVAL_DENIED = "approval_denied"  # User explicitly denied
 
     # Parsing / protocol errors
-    PARSE_FAILURE     = "parse_failure"      # Could not extract command/intent
-    SCHEMA_VIOLATION  = "schema_violation"   # Event payload missing required field
+    PARSE_FAILURE = "parse_failure"  # Could not extract command/intent
+    SCHEMA_VIOLATION = "schema_violation"  # Event payload missing required field
 
     # LLM / inference errors
-    LLM_UNAVAILABLE   = "llm_unavailable"    # LM Studio unreachable
-    LLM_TIMEOUT       = "llm_timeout"        # LLM call exceeded budget
-    LLM_CIRCUIT_OPEN  = "llm_circuit_open"   # Circuit breaker open; LM Studio down
-    LLM_CONTEXT_EXCEEDED = "llm_context_exceeded"  # Input too large even after truncation
+    LLM_UNAVAILABLE = "llm_unavailable"  # LM Studio unreachable
+    LLM_TIMEOUT = "llm_timeout"  # LLM call exceeded budget
+    LLM_CIRCUIT_OPEN = "llm_circuit_open"  # Circuit breaker open; LM Studio down
+    LLM_CONTEXT_EXCEEDED = (
+        "llm_context_exceeded"  # Input too large even after truncation
+    )
 
     # Memory errors
-    MEMORY_FAILURE    = "memory_failure"     # PostgreSQL unreachable or query failed
-    EMBED_FAILURE     = "embed_failure"      # Sentence-transformer encoding failed
+    MEMORY_FAILURE = "memory_failure"  # PostgreSQL unreachable or query failed
+    EMBED_FAILURE = "embed_failure"  # Sentence-transformer encoding failed
 
     # Task lifecycle errors
-    TASK_TIMEOUT      = "task_timeout"       # Plan exceeded PLAN_TIMEOUT
-    TASK_NOT_FOUND    = "task_not_found"     # Referenced task_id unknown
-    MAX_RETRIES       = "max_retries"        # Phase exhausted retry budget
+    TASK_TIMEOUT = "task_timeout"  # Plan exceeded PLAN_TIMEOUT
+    TASK_NOT_FOUND = "task_not_found"  # Referenced task_id unknown
+    MAX_RETRIES = "max_retries"  # Phase exhausted retry budget
 
     # Generic
-    UNKNOWN           = "unknown"            # Catch-all for unexpected errors
+    UNKNOWN = "unknown"  # Catch-all for unexpected errors
 
 
 def error_payload(

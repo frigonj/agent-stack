@@ -14,6 +14,7 @@ from core.memory.long_term import LongTermMemory
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture
 async def mem():
     m = LongTermMemory(
@@ -46,6 +47,7 @@ def _make_pool_mock(fetchone_result=None, fetchall_result=None):
 
 # ── Constructor ───────────────────────────────────────────────────────────────
 
+
 def test_init():
     """LongTermMemory stores url and agent name."""
     m = LongTermMemory(
@@ -59,10 +61,13 @@ def test_init():
 
 # ── open_session ──────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_open_session_clean(mem):
     """open_session returns status=OK when agent was cleanly shut down."""
-    mock_pool, mock_conn, mock_cur = _make_pool_mock(fetchone_result={"status": "CLEAN"})
+    mock_pool, mock_conn, mock_cur = _make_pool_mock(
+        fetchone_result={"status": "CLEAN"}
+    )
 
     with patch.object(mem, "_get_pool", new=AsyncMock(return_value=mock_pool)):
         result = await mem.open_session()
@@ -95,13 +100,16 @@ async def test_open_session_new_agent(mem):
 
 # ── store ─────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_store(mem):
     """store() inserts a knowledge row and returns status=stored."""
     mock_pool, mock_conn, _ = _make_pool_mock()
 
-    with patch.object(mem, "_get_pool", new=AsyncMock(return_value=mock_pool)), \
-         patch("core.memory.long_term._embed_texts", return_value=[[0.1] * 384]):
+    with (
+        patch.object(mem, "_get_pool", new=AsyncMock(return_value=mock_pool)),
+        patch("core.memory.long_term._embed_texts", return_value=[[0.1] * 384]),
+    ):
         result = await mem.store(
             content="Auth retry uses exponential backoff",
             topic="bugfix",
@@ -116,6 +124,7 @@ async def test_store(mem):
 
 
 # ── close_session ─────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_close_session(mem):
@@ -132,6 +141,7 @@ async def test_close_session(mem):
 
 
 # ── batch_store ───────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_batch_store_empty(mem):
@@ -154,8 +164,13 @@ async def test_batch_store_entries(mem):
     mock_pool, mock_conn, _ = _make_pool_mock()
     mock_conn.executemany = AsyncMock()
 
-    with patch.object(mem, "_get_pool", new=AsyncMock(return_value=mock_pool)), \
-         patch("core.memory.long_term._embed_texts", return_value=[[0.1] * 384, [0.2] * 384]):
+    with (
+        patch.object(mem, "_get_pool", new=AsyncMock(return_value=mock_pool)),
+        patch(
+            "core.memory.long_term._embed_texts",
+            return_value=[[0.1] * 384, [0.2] * 384],
+        ),
+    ):
         result = await mem.batch_store(entries)
 
     assert result["count"] == 2

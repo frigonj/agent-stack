@@ -90,7 +90,7 @@ async def test_idle_watchdog_fires(monkeypatch):
     agent = _MinimalAgent(settings)
     agent.bus = mock_bus
     agent.memory = mock_memory
-    agent._idle_timeout = 1   # 1 second idle timeout
+    agent._idle_timeout = 1  # 1 second idle timeout
 
     start = time.monotonic()
     await asyncio.wait_for(agent.start(), timeout=5.0)
@@ -112,6 +112,7 @@ async def test_idle_watchdog_resets_on_event(monkeypatch):
     async def _mock_consume_with_events(*args, **kwargs):
         nonlocal event_count
         from core.events.bus import Event, EventType
+
         for _ in range(3):
             event = Event(
                 type=EventType.AGENT_STARTED,
@@ -142,7 +143,7 @@ async def test_idle_watchdog_resets_on_event(monkeypatch):
 
     settings = MagicMock()
     settings.agent_role = "test_idle_agent2"
-    settings.redis_url  = "redis://localhost:6379"
+    settings.redis_url = "redis://localhost:6379"
     settings.database_url = "postgresql://localhost/test"
     settings.lm_studio_url = "http://localhost:1234"
     settings.lm_studio_model = "test-model"
@@ -174,7 +175,7 @@ def _make_executor(monkeypatch) -> ExecutorAgent:
     """Create an ExecutorAgent with mocked bus and memory."""
     settings = MagicMock()
     settings.agent_role = "executor"
-    settings.redis_url  = "redis://localhost:6379"
+    settings.redis_url = "redis://localhost:6379"
     settings.database_url = "postgresql://localhost/test"
     settings.lm_studio_url = "http://localhost:1234"
     settings.lm_studio_model = "test-model"

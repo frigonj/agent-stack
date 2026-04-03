@@ -32,17 +32,18 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LM_STUDIO_URL   = os.getenv("LM_STUDIO_URL",   "http://localhost:1234")
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "qwen2.5-14b")
 
-BASELINE_FILE   = Path(__file__).parent / "throughput_baseline.json"
-REGRESSION_THRESHOLD = 0.20   # 20% drop triggers a failure
+BASELINE_FILE = Path(__file__).parent / "throughput_baseline.json"
+REGRESSION_THRESHOLD = 0.20  # 20% drop triggers a failure
 
 # Minimum token count to consider a response valid for KPI purposes
 MIN_TOKENS = 20
 
 
 # ── Pytest plugin: --update-kpi flag ─────────────────────────────────────────
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -54,6 +55,7 @@ def pytest_addoption(parser):
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def update_kpi(request):
@@ -74,20 +76,24 @@ def _save_baseline(data: dict) -> None:
 
 # ── Token counting ────────────────────────────────────────────────────────────
 
+
 def _count_tokens(text: str) -> int:
     try:
         import tiktoken
+
         enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text, disallowed_special=()))
     except ImportError:
-        return len(text) // 4   # conservative fallback
+        return len(text) // 4  # conservative fallback
 
 
 # ── LM Studio reachability check ─────────────────────────────────────────────
 
+
 def _lm_studio_available() -> bool:
     try:
         import httpx
+
         r = httpx.get(f"{LM_STUDIO_URL}/api/v0/models", timeout=3)
         return r.status_code == 200
     except Exception:
@@ -101,6 +107,7 @@ lm_studio_available = pytest.mark.skipif(
 
 
 # ── KPI measurement helper ────────────────────────────────────────────────────
+
 
 async def _measure_tps(prompt: str, expected_min_tokens: int = MIN_TOKENS) -> dict:
     """
@@ -123,28 +130,29 @@ async def _measure_tps(prompt: str, expected_min_tokens: int = MIN_TOKENS) -> di
         HumanMessage(content=prompt),
     ]
 
-    t0       = time.monotonic()
+    t0 = time.monotonic()
     response = await llm.ainvoke(messages)
-    elapsed  = time.monotonic() - t0
+    elapsed = time.monotonic() - t0
 
     content = response.content or ""
-    tokens  = _count_tokens(content)
-    tps     = tokens / elapsed if elapsed > 0 else 0.0
+    tokens = _count_tokens(content)
+    tps = tokens / elapsed if elapsed > 0 else 0.0
 
     assert tokens >= expected_min_tokens, (
         f"Response too short ({tokens} tokens) — model may not be loaded."
     )
 
     return {
-        "tokens":    tokens,
+        "tokens": tokens,
         "elapsed_s": round(elapsed, 3),
-        "tps":       round(tps, 2),
-        "model":     LM_STUDIO_MODEL,
-        "prompt":    prompt[:80],
+        "tps": round(tps, 2),
+        "model": LM_STUDIO_MODEL,
+        "prompt": prompt[:80],
     }
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 @pytest.mark.kpi
@@ -155,12 +163,14 @@ async def test_simple_prompt_throughput(update_kpi, baseline):
     Fails if throughput drops by more than REGRESSION_THRESHOLD vs stored baseline.
     """
     kpi_key = "simple_prompt_tps"
-    prompt  = "List five uses of Redis in three words each."
+    prompt = "List five uses of Redis in three words each."
 
     result = await _measure_tps(prompt)
-    tps    = result["tps"]
+    tps = result["tps"]
 
-    print(f"\n[KPI] {kpi_key}: {tps:.1f} tok/s  ({result['tokens']} tokens in {result['elapsed_s']}s)")
+    print(
+        f"\n[KPI] {kpi_key}: {tps:.1f} tok/s  ({result['tokens']} tokens in {result['elapsed_s']}s)"
+    )
 
     if update_kpi:
         new_baseline = dict(baseline)
@@ -170,10 +180,10 @@ async def test_simple_prompt_throughput(update_kpi, baseline):
 
     if kpi_key in baseline:
         stored_tps = baseline[kpi_key]["tps_baseline"]
-        min_tps    = stored_tps * (1.0 - REGRESSION_THRESHOLD)
+        min_tps = stored_tps * (1.0 - REGRESSION_THRESHOLD)
         assert tps >= min_tps, (
             f"Throughput regression: {tps:.1f} tok/s < {min_tps:.1f} tok/s "
-            f"(baseline {stored_tps:.1f} tok/s, threshold -{REGRESSION_THRESHOLD*100:.0f}%)"
+            f"(baseline {stored_tps:.1f} tok/s, threshold -{REGRESSION_THRESHOLD * 100:.0f}%)"
         )
     else:
         # First run — save baseline automatically
@@ -191,7 +201,7 @@ async def test_long_context_throughput(update_kpi, baseline):
     """
     kpi_key = "long_context_tps"
     # Simulate a realistic agent prompt (system + task)
-    prompt  = (
+    prompt = (
         "You are a code analysis specialist. The following Python module implements "
         "an asynchronous Redis Streams event bus. Summarise its key design decisions "
         "in no more than four bullet points.\n\n"
@@ -204,9 +214,11 @@ async def test_long_context_throughput(update_kpi, baseline):
     )
 
     result = await _measure_tps(prompt, expected_min_tokens=30)
-    tps    = result["tps"]
+    tps = result["tps"]
 
-    print(f"\n[KPI] {kpi_key}: {tps:.1f} tok/s  ({result['tokens']} tokens in {result['elapsed_s']}s)")
+    print(
+        f"\n[KPI] {kpi_key}: {tps:.1f} tok/s  ({result['tokens']} tokens in {result['elapsed_s']}s)"
+    )
 
     if update_kpi:
         existing = dict(baseline)
@@ -216,7 +228,7 @@ async def test_long_context_throughput(update_kpi, baseline):
 
     if kpi_key in baseline:
         stored_tps = baseline[kpi_key]["tps_baseline"]
-        min_tps    = stored_tps * (1.0 - REGRESSION_THRESHOLD)
+        min_tps = stored_tps * (1.0 - REGRESSION_THRESHOLD)
         assert tps >= min_tps, (
             f"Long-context throughput regression: {tps:.1f} < {min_tps:.1f} tok/s"
         )
@@ -252,7 +264,7 @@ async def test_llm_lock_contention_overhead(update_kpi, baseline):
     ]
 
     # Single call baseline
-    t0       = time.monotonic()
+    t0 = time.monotonic()
     await llm.ainvoke(msgs)
     single_s = time.monotonic() - t0
 
@@ -276,6 +288,7 @@ async def test_llm_lock_contention_overhead(update_kpi, baseline):
 
 # ── Mock-based throughput recorder (runs in CI without LM Studio) ─────────────
 
+
 @pytest.mark.asyncio
 @pytest.mark.kpi
 async def test_mock_tps_metric_recorded():
@@ -287,11 +300,15 @@ async def test_mock_tps_metric_recorded():
     MOCK_RESPONSE_TOKENS = 50
     MOCK_ELAPSED = 0.5
     # Build a 50-token string (approx chars//4)
-    mock_text = "word " * MOCK_RESPONSE_TOKENS    # ~5 chars/word × 50 = 250 chars → ~62 tokens
+    mock_text = (
+        "word " * MOCK_RESPONSE_TOKENS
+    )  # ~5 chars/word × 50 = 250 chars → ~62 tokens
     # Use exact count via our helper
     tokens = _count_tokens(mock_text)
     assert tokens > 0
 
     tps = tokens / MOCK_ELAPSED
     assert tps > 0, "TPS calculation failed"
-    print(f"\n[KPI-mock] Simulated {tps:.1f} tok/s from {tokens} tokens in {MOCK_ELAPSED}s")
+    print(
+        f"\n[KPI-mock] Simulated {tps:.1f} tok/s from {tokens} tokens in {MOCK_ELAPSED}s"
+    )

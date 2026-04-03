@@ -36,248 +36,281 @@ log = structlog.get_logger()
 # The description is embedded for semantic search — include usage examples so the
 # planner can generate correct CMD: lines without guessing syntax.
 _BUILTIN_TOOLS: list[tuple[str, str, str, list[str]]] = [
-
     # ── Docker ────────────────────────────────────────────────────────────────
-    ("list-docker-containers",
-     "List all running Docker containers with name, status, ports. "
-     "Example: CMD: docker ps",
-     "shell:docker ps",
-     ["docker", "containers", "status", "list"]),
-
-    ("list-all-docker-containers",
-     "List all Docker containers including stopped ones. "
-     "Example: CMD: docker ps -a",
-     "shell:docker ps -a",
-     ["docker", "containers", "stopped"]),
-
-    ("docker-logs",
-     "Tail logs of a Docker container. "
-     "Example: CMD: docker logs --tail 100 agent_orchestrator",
-     "shell:docker logs --tail 100 <container_name>",
-     ["docker", "logs", "debug"]),
-
-    ("docker-restart",
-     "Restart a Docker container by name. Requires AUTO_APPROVED tier. "
-     "Example: CMD: docker restart agent_executor",
-     "shell:docker restart <container_name>",
-     ["docker", "restart", "container"]),
-
-    ("docker-exec",
-     "Run a command inside a running container. "
-     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
-     "shell:docker exec <container> <command>",
-     ["docker", "exec", "container"]),
-
-    ("docker-inspect",
-     "Show detailed container metadata (env vars, mounts, network). "
-     "Example: CMD: docker inspect agent_orchestrator",
-     "shell:docker inspect <container_name>",
-     ["docker", "inspect", "metadata"]),
-
-    ("docker-compose-ps",
-     "Show status of all compose services. "
-     "Example: CMD: docker compose ps",
-     "shell:docker compose ps",
-     ["docker", "compose", "services", "status"]),
-
+    (
+        "list-docker-containers",
+        "List all running Docker containers with name, status, ports. "
+        "Example: CMD: docker ps",
+        "shell:docker ps",
+        ["docker", "containers", "status", "list"],
+    ),
+    (
+        "list-all-docker-containers",
+        "List all Docker containers including stopped ones. Example: CMD: docker ps -a",
+        "shell:docker ps -a",
+        ["docker", "containers", "stopped"],
+    ),
+    (
+        "docker-logs",
+        "Tail logs of a Docker container. "
+        "Example: CMD: docker logs --tail 100 agent_orchestrator",
+        "shell:docker logs --tail 100 <container_name>",
+        ["docker", "logs", "debug"],
+    ),
+    (
+        "docker-restart",
+        "Restart a Docker container by name. Requires AUTO_APPROVED tier. "
+        "Example: CMD: docker restart agent_executor",
+        "shell:docker restart <container_name>",
+        ["docker", "restart", "container"],
+    ),
+    (
+        "docker-exec",
+        "Run a command inside a running container. "
+        "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+        "shell:docker exec <container> <command>",
+        ["docker", "exec", "container"],
+    ),
+    (
+        "docker-inspect",
+        "Show detailed container metadata (env vars, mounts, network). "
+        "Example: CMD: docker inspect agent_orchestrator",
+        "shell:docker inspect <container_name>",
+        ["docker", "inspect", "metadata"],
+    ),
+    (
+        "docker-compose-ps",
+        "Show status of all compose services. Example: CMD: docker compose ps",
+        "shell:docker compose ps",
+        ["docker", "compose", "services", "status"],
+    ),
     # ── File operations ───────────────────────────────────────────────────────
-    ("read-file",
-     "Print file contents to stdout. "
-     "Example: CMD: cat /workspace/src/core/config.py",
-     "shell:cat <file_path>",
-     ["file", "read", "cat"]),
-
-    ("list-directory",
-     "List files and directories. Use -la for details, -R for recursive. "
-     "Example: CMD: ls -la /workspace/src/agents/",
-     "shell:ls -la <directory>",
-     ["file", "list", "directory", "ls"]),
-
-    ("find-files",
-     "Find files by name pattern recursively. "
-     "Example: CMD: find /workspace -name '*.py' -not -path '*/__pycache__/*'",
-     "shell:find <dir> -name '<pattern>'",
-     ["file", "find", "search", "pattern"]),
-
-    ("grep-in-files",
-     "Search file contents for a pattern. -r recursive, -n line numbers, -l files only. "
-     "Example: CMD: grep -rn 'EventType' /workspace/src/core/",
-     "shell:grep -rn '<pattern>' <directory>",
-     ["grep", "search", "text", "pattern", "code"]),
-
-    ("head-file",
-     "Print first N lines of a file. "
-     "Example: CMD: head -50 /workspace/src/agents/orchestrator/main.py",
-     "shell:head -<N> <file_path>",
-     ["file", "read", "head"]),
-
-    ("tail-file",
-     "Print last N lines of a file (useful for logs). "
-     "Example: CMD: tail -100 /workspace/logs/orchestrator.log",
-     "shell:tail -<N> <file_path>",
-     ["file", "read", "tail", "logs"]),
-
-    ("write-file",
-     "Write content to a file using tee. Requires AUTO_APPROVED tier. "
-     "Example: CMD: tee /workspace/tools/my-script.sh << 'EOF'\\n#!/bin/bash\\n...\\nEOF",
-     "shell:tee <file_path> << 'EOF'\\n<content>\\nEOF",
-     ["file", "write", "create", "tee"]),
-
-    ("make-executable",
-     "Make a script executable with chmod. "
-     "Example: CMD: chmod +x /workspace/tools/my-script.sh",
-     "shell:chmod +x <file_path>",
-     ["file", "chmod", "executable", "script"]),
-
-    ("disk-usage",
-     "Show disk space usage of a directory or volume. "
-     "Example: CMD: df -h /workspace",
-     "shell:df -h <path>",
-     ["disk", "storage", "usage", "workspace"]),
-
-    ("directory-size",
-     "Show the size of each subdirectory. "
-     "Example: CMD: du -sh /workspace/*/",
-     "shell:du -sh <path>/*/",
-     ["disk", "size", "directory"]),
-
+    (
+        "read-file",
+        "Print file contents to stdout. "
+        "Example: CMD: cat /workspace/src/core/config.py",
+        "shell:cat <file_path>",
+        ["file", "read", "cat"],
+    ),
+    (
+        "list-directory",
+        "List files and directories. Use -la for details, -R for recursive. "
+        "Example: CMD: ls -la /workspace/src/agents/",
+        "shell:ls -la <directory>",
+        ["file", "list", "directory", "ls"],
+    ),
+    (
+        "find-files",
+        "Find files by name pattern recursively. "
+        "Example: CMD: find /workspace -name '*.py' -not -path '*/__pycache__/*'",
+        "shell:find <dir> -name '<pattern>'",
+        ["file", "find", "search", "pattern"],
+    ),
+    (
+        "grep-in-files",
+        "Search file contents for a pattern. -r recursive, -n line numbers, -l files only. "
+        "Example: CMD: grep -rn 'EventType' /workspace/src/core/",
+        "shell:grep -rn '<pattern>' <directory>",
+        ["grep", "search", "text", "pattern", "code"],
+    ),
+    (
+        "head-file",
+        "Print first N lines of a file. "
+        "Example: CMD: head -50 /workspace/src/agents/orchestrator/main.py",
+        "shell:head -<N> <file_path>",
+        ["file", "read", "head"],
+    ),
+    (
+        "tail-file",
+        "Print last N lines of a file (useful for logs). "
+        "Example: CMD: tail -100 /workspace/logs/orchestrator.log",
+        "shell:tail -<N> <file_path>",
+        ["file", "read", "tail", "logs"],
+    ),
+    (
+        "write-file",
+        "Write content to a file using tee. Requires AUTO_APPROVED tier. "
+        "Example: CMD: tee /workspace/tools/my-script.sh << 'EOF'\\n#!/bin/bash\\n...\\nEOF",
+        "shell:tee <file_path> << 'EOF'\\n<content>\\nEOF",
+        ["file", "write", "create", "tee"],
+    ),
+    (
+        "make-executable",
+        "Make a script executable with chmod. "
+        "Example: CMD: chmod +x /workspace/tools/my-script.sh",
+        "shell:chmod +x <file_path>",
+        ["file", "chmod", "executable", "script"],
+    ),
+    (
+        "disk-usage",
+        "Show disk space usage of a directory or volume. "
+        "Example: CMD: df -h /workspace",
+        "shell:df -h <path>",
+        ["disk", "storage", "usage", "workspace"],
+    ),
+    (
+        "directory-size",
+        "Show the size of each subdirectory. Example: CMD: du -sh /workspace/*/",
+        "shell:du -sh <path>/*/",
+        ["disk", "size", "directory"],
+    ),
     # ── Git ───────────────────────────────────────────────────────────────────
-    ("git-log",
-     "Show recent git commit history with author and message. "
-     "Example: CMD: git -C /workspace/src log --oneline -20",
-     "shell:git -C <repo_path> log --oneline -<N>",
-     ["git", "log", "history", "commits"]),
-
-    ("git-status",
-     "Show working tree status — modified, staged, untracked files. "
-     "Example: CMD: git -C /workspace/src status",
-     "shell:git -C <repo_path> status",
-     ["git", "status", "changes"]),
-
-    ("git-diff",
-     "Show unstaged changes in the working tree. "
-     "Example: CMD: git -C /workspace/src diff",
-     "shell:git -C <repo_path> diff",
-     ["git", "diff", "changes"]),
-
-    ("git-pull",
-     "Pull latest changes from remote. "
-     "Example: CMD: git -C /workspace/src pull",
-     "shell:git -C <repo_path> pull",
-     ["git", "pull", "update", "sync"]),
-
+    (
+        "git-log",
+        "Show recent git commit history with author and message. "
+        "Example: CMD: git -C /workspace/src log --oneline -20",
+        "shell:git -C <repo_path> log --oneline -<N>",
+        ["git", "log", "history", "commits"],
+    ),
+    (
+        "git-status",
+        "Show working tree status — modified, staged, untracked files. "
+        "Example: CMD: git -C /workspace/src status",
+        "shell:git -C <repo_path> status",
+        ["git", "status", "changes"],
+    ),
+    (
+        "git-diff",
+        "Show unstaged changes in the working tree. "
+        "Example: CMD: git -C /workspace/src diff",
+        "shell:git -C <repo_path> diff",
+        ["git", "diff", "changes"],
+    ),
+    (
+        "git-pull",
+        "Pull latest changes from remote. Example: CMD: git -C /workspace/src pull",
+        "shell:git -C <repo_path> pull",
+        ["git", "pull", "update", "sync"],
+    ),
     # ── Python / pip ──────────────────────────────────────────────────────────
-    ("run-python-script",
-     "Execute a Python script. "
-     "Example: CMD: python3 /workspace/tools/check_health.py",
-     "shell:python3 <script_path>",
-     ["python", "script", "run", "execute"]),
-
-    ("pip-install",
-     "Install a Python package. Requires REQUIRES_APPROVAL tier. "
-     "Example: CMD: pip install requests",
-     "shell:pip install <package_name>",
-     ["pip", "install", "python", "package"]),
-
-    ("pip-list",
-     "List installed Python packages and versions. "
-     "Example: CMD: pip list",
-     "shell:pip list",
-     ["pip", "python", "packages", "installed"]),
-
-    ("run-pytest",
-     "Run the test suite with pytest. "
-     "Example: CMD: pytest /workspace/src/tests/unit/ -v",
-     "shell:pytest <test_path> -v",
-     ["pytest", "test", "unit", "testing"]),
-
+    (
+        "run-python-script",
+        "Execute a Python script. "
+        "Example: CMD: python3 /workspace/tools/check_health.py",
+        "shell:python3 <script_path>",
+        ["python", "script", "run", "execute"],
+    ),
+    (
+        "pip-install",
+        "Install a Python package. Requires REQUIRES_APPROVAL tier. "
+        "Example: CMD: pip install requests",
+        "shell:pip install <package_name>",
+        ["pip", "install", "python", "package"],
+    ),
+    (
+        "pip-list",
+        "List installed Python packages and versions. Example: CMD: pip list",
+        "shell:pip list",
+        ["pip", "python", "packages", "installed"],
+    ),
+    (
+        "run-pytest",
+        "Run the test suite with pytest. "
+        "Example: CMD: pytest /workspace/src/tests/unit/ -v",
+        "shell:pytest <test_path> -v",
+        ["pytest", "test", "unit", "testing"],
+    ),
     # ── Redis ─────────────────────────────────────────────────────────────────
-    ("redis-list-keys",
-     "List all Redis keys matching a pattern. "
-     "Example: CMD: docker exec agent_redis redis-cli keys 'agents:*'",
-     "shell:docker exec agent_redis redis-cli keys '<pattern>'",
-     ["redis", "keys", "list"]),
-
-    ("redis-get-key",
-     "Get the value of a Redis key. "
-     "Example: CMD: docker exec agent_redis redis-cli get 'agent:status:orchestrator'",
-     "shell:docker exec agent_redis redis-cli get '<key>'",
-     ["redis", "get", "value"]),
-
-    ("redis-stream-length",
-     "Get the number of entries in a Redis stream. "
-     "Example: CMD: docker exec agent_redis redis-cli xlen agents:orchestrator",
-     "shell:docker exec agent_redis redis-cli xlen <stream_name>",
-     ["redis", "stream", "length", "queue"]),
-
-    ("redis-stream-read",
-     "Read recent entries from a Redis stream. "
-     "Example: CMD: docker exec agent_redis redis-cli xrevrange agents:broadcast + - COUNT 10",
-     "shell:docker exec agent_redis redis-cli xrevrange <stream> + - COUNT <N>",
-     ["redis", "stream", "read", "events"]),
-
+    (
+        "redis-list-keys",
+        "List all Redis keys matching a pattern. "
+        "Example: CMD: docker exec agent_redis redis-cli keys 'agents:*'",
+        "shell:docker exec agent_redis redis-cli keys '<pattern>'",
+        ["redis", "keys", "list"],
+    ),
+    (
+        "redis-get-key",
+        "Get the value of a Redis key. "
+        "Example: CMD: docker exec agent_redis redis-cli get 'agent:status:orchestrator'",
+        "shell:docker exec agent_redis redis-cli get '<key>'",
+        ["redis", "get", "value"],
+    ),
+    (
+        "redis-stream-length",
+        "Get the number of entries in a Redis stream. "
+        "Example: CMD: docker exec agent_redis redis-cli xlen agents:orchestrator",
+        "shell:docker exec agent_redis redis-cli xlen <stream_name>",
+        ["redis", "stream", "length", "queue"],
+    ),
+    (
+        "redis-stream-read",
+        "Read recent entries from a Redis stream. "
+        "Example: CMD: docker exec agent_redis redis-cli xrevrange agents:broadcast + - COUNT 10",
+        "shell:docker exec agent_redis redis-cli xrevrange <stream> + - COUNT <N>",
+        ["redis", "stream", "read", "events"],
+    ),
     # ── PostgreSQL ────────────────────────────────────────────────────────────
-    ("postgres-query",
-     "Run an SQL query against the agent memory database. "
-     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT topic, COUNT(*) FROM knowledge GROUP BY topic;'",
-     "shell:docker exec agent_postgres psql -U agent -d agentmem -c '<SQL>'",
-     ["postgres", "sql", "database", "query"]),
-
-    ("postgres-count-knowledge",
-     "Count knowledge entries in the agent long-term memory database. "
-     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
-     "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
-     ["postgres", "memory", "knowledge", "count"]),
-
-    ("postgres-list-tools",
-     "List all registered tools in the shared tool registry. "
-     "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
-     "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
-     ["postgres", "tools", "registry", "list"]),
-
+    (
+        "postgres-query",
+        "Run an SQL query against the agent memory database. "
+        "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT topic, COUNT(*) FROM knowledge GROUP BY topic;'",
+        "shell:docker exec agent_postgres psql -U agent -d agentmem -c '<SQL>'",
+        ["postgres", "sql", "database", "query"],
+    ),
+    (
+        "postgres-count-knowledge",
+        "Count knowledge entries in the agent long-term memory database. "
+        "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+        "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT COUNT(*) FROM knowledge;'",
+        ["postgres", "memory", "knowledge", "count"],
+    ),
+    (
+        "postgres-list-tools",
+        "List all registered tools in the shared tool registry. "
+        "Example: CMD: docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
+        "shell:docker exec agent_postgres psql -U agent -d agentmem -c 'SELECT name, owner_agent FROM tools ORDER BY name;'",
+        ["postgres", "tools", "registry", "list"],
+    ),
     # ── Process / system ──────────────────────────────────────────────────────
-    ("list-processes",
-     "List running processes. Use grep to filter. "
-     "Example: CMD: ps aux | grep python",
-     "shell:ps aux | grep <process_name>",
-     ["processes", "system", "ps"]),
-
-    ("check-port",
-     "Check if a port is listening. "
-     "Example: CMD: ss -tlnp | grep 6379",
-     "shell:ss -tlnp | grep <port>",
-     ["network", "port", "listening"]),
-
-    ("curl-endpoint",
-     "Make an HTTP request to an endpoint. Requires REQUIRES_APPROVAL. "
-     "Example: CMD: curl -s http://localhost:1234/api/v0/models | python3 -m json.tool",
-     "shell:curl -s <url>",
-     ["curl", "http", "network", "api"]),
-
+    (
+        "list-processes",
+        "List running processes. Use grep to filter. "
+        "Example: CMD: ps aux | grep python",
+        "shell:ps aux | grep <process_name>",
+        ["processes", "system", "ps"],
+    ),
+    (
+        "check-port",
+        "Check if a port is listening. Example: CMD: ss -tlnp | grep 6379",
+        "shell:ss -tlnp | grep <port>",
+        ["network", "port", "listening"],
+    ),
+    (
+        "curl-endpoint",
+        "Make an HTTP request to an endpoint. Requires REQUIRES_APPROVAL. "
+        "Example: CMD: curl -s http://localhost:1234/api/v0/models | python3 -m json.tool",
+        "shell:curl -s <url>",
+        ["curl", "http", "network", "api"],
+    ),
     # ── Workspace / agent stack ───────────────────────────────────────────────
-    ("list-workspace-tools",
-     "List all saved reusable scripts in /workspace/tools/. "
-     "Example: CMD: ls -la /workspace/tools/",
-     "shell:ls -la /workspace/tools/",
-     ["tools", "scripts", "workspace", "list"]),
-
-    ("list-agent-sources",
-     "List all agent source directories in the stack. "
-     "Example: CMD: ls /workspace/src/agents/",
-     "shell:ls /workspace/src/agents/",
-     ["agents", "source", "list"]),
-
-    ("show-redis-streams",
-     "List all Redis event streams and their lengths. "
-     "Example: CMD: docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
-     "shell:docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
-     ["redis", "streams", "events", "agents"]),
-
-    ("show-agent-status",
-     "Show the current status (idle/busy) of all agents from Redis. "
-     "Example: CMD: docker exec agent_redis redis-cli keys 'agent:status:*'",
-     "shell:docker exec agent_redis redis-cli keys 'agent:status:*'",
-     ["agents", "status", "redis", "monitoring"]),
+    (
+        "list-workspace-tools",
+        "List all saved reusable scripts in /workspace/tools/. "
+        "Example: CMD: ls -la /workspace/tools/",
+        "shell:ls -la /workspace/tools/",
+        ["tools", "scripts", "workspace", "list"],
+    ),
+    (
+        "list-agent-sources",
+        "List all agent source directories in the stack. "
+        "Example: CMD: ls /workspace/src/agents/",
+        "shell:ls /workspace/src/agents/",
+        ["agents", "source", "list"],
+    ),
+    (
+        "show-redis-streams",
+        "List all Redis event streams and their lengths. "
+        "Example: CMD: docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
+        "shell:docker exec agent_redis redis-cli --no-auth-warning keys 'agents:*'",
+        ["redis", "streams", "events", "agents"],
+    ),
+    (
+        "show-agent-status",
+        "Show the current status (idle/busy) of all agents from Redis. "
+        "Example: CMD: docker exec agent_redis redis-cli keys 'agent:status:*'",
+        "shell:docker exec agent_redis redis-cli keys 'agent:status:*'",
+        ["agents", "status", "redis", "monitoring"],
+    ),
 ]
 
 
@@ -286,19 +319,63 @@ _BUILTIN_TOOLS: list[tuple[str, str, str, list[str]]] = [
 
 _CMD_PREFIXES = tuple(
     sorted(
-        {"ls", "cat", "find", "grep", "echo", "pwd", "wc", "head", "tail", "diff",
-         "sort", "uniq", "stat", "env", "which", "docker", "docker-compose",
-         "git", "pip", "pip3", "python", "python3", "pytest", "npm", "yarn",
-         "apt", "apt-get", "tee", "cp", "mv", "rm", "chmod", "mkdir", "touch",
-         "curl", "wget", "patch", "chown",
-         "df", "du", "ps", "ss", "lsof", "netstat", "uname", "uptime", "free"},
-        key=len, reverse=True,  # longer prefixes first to avoid shadowing
+        {
+            "ls",
+            "cat",
+            "find",
+            "grep",
+            "echo",
+            "pwd",
+            "wc",
+            "head",
+            "tail",
+            "diff",
+            "sort",
+            "uniq",
+            "stat",
+            "env",
+            "which",
+            "docker",
+            "docker-compose",
+            "git",
+            "pip",
+            "pip3",
+            "python",
+            "python3",
+            "pytest",
+            "npm",
+            "yarn",
+            "apt",
+            "apt-get",
+            "tee",
+            "cp",
+            "mv",
+            "rm",
+            "chmod",
+            "mkdir",
+            "touch",
+            "curl",
+            "wget",
+            "patch",
+            "chown",
+            "df",
+            "du",
+            "ps",
+            "ss",
+            "lsof",
+            "netstat",
+            "uname",
+            "uptime",
+            "free",
+        },
+        key=len,
+        reverse=True,  # longer prefixes first to avoid shadowing
     )
 )
 
 _INLINE_PATTERN = re.compile(
-    r'^(?:run|execute|exec(?:ute)?|please\s+run|can you\s+run)?\s*'
-    r'((?:' + '|'.join(re.escape(p) for p in _CMD_PREFIXES) + r')\s+\S.{0,500})$',
+    r"^(?:run|execute|exec(?:ute)?|please\s+run|can you\s+run)?\s*"
+    r"((?:" + "|".join(re.escape(p) for p in _CMD_PREFIXES) + r")\s+\S.{0,500})$",
     re.IGNORECASE,
 )
 
@@ -444,39 +521,74 @@ Container name: agent_research
 # be rolled back (force-push, package installs that change the image, deletions).
 
 SAFE_COMMANDS = {
-    "ls", "cat", "find", "grep", "echo", "pwd", "wc",
-    "head", "tail", "diff", "sort", "uniq", "stat",
-    "env", "printenv", "which", "type", "id",
+    "ls",
+    "cat",
+    "find",
+    "grep",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "diff",
+    "sort",
+    "uniq",
+    "stat",
+    "env",
+    "printenv",
+    "which",
+    "type",
+    "id",
     # Read-only system introspection
-    "df", "du", "ps", "ss", "lsof", "netstat", "uname", "uptime", "free",
+    "df",
+    "du",
+    "ps",
+    "ss",
+    "lsof",
+    "netstat",
+    "uname",
+    "uptime",
+    "free",
 }
 
 # Run automatically; emits AUDIT event so every action is visible in #agent-logs
 AUTO_APPROVED_COMMANDS = {
     # Container lifecycle within the stack
-    "docker",           # start/restart/stop/logs/exec/inspect (NOT rm/rmi)
+    "docker",  # start/restart/stop/logs/exec/inspect (NOT rm/rmi)
     "docker-compose",
     # Workspace file writes
-    "tee",              # write files inside /workspace — blocked for /workspace/user outside tests
-    "mkdir", "touch", "chmod", "cp",
+    "tee",  # write files inside /workspace — blocked for /workspace/user outside tests
+    "mkdir",
+    "touch",
+    "chmod",
+    "cp",
     # In-container code execution
-    "python", "python3",
-    "pytest",           # run test suite — bounded to container, no external effects
+    "python",
+    "python3",
+    "pytest",  # run test suite — bounded to container, no external effects
     # Non-destructive git operations
-    "git",              # log/diff/status/show/fetch/pull — push/commit still blocked
+    "git",  # log/diff/status/show/fetch/pull — push/commit still blocked
     # Tool scripts
-    "bash", "sh",
+    "bash",
+    "sh",
 }
 
 # Require explicit Discord approval — destructive, network-external, or irreversible
 REQUIRES_APPROVAL = {
     # Package management (modifies the container image effectively)
-    "pip", "pip3", "npm", "yarn",
-    "apt", "apt-get",
+    "pip",
+    "pip3",
+    "npm",
+    "yarn",
+    "apt",
+    "apt-get",
     # External network calls
-    "curl", "wget",
+    "curl",
+    "wget",
     # Destructive file operations (can delete user data)
-    "rm", "mv", "patch",
+    "rm",
+    "mv",
+    "patch",
     # Privileged container operations (permanent removal)
     "chown",
 }
@@ -486,11 +598,12 @@ _PIP_SAFE_SUBCOMMANDS = {"list", "show", "freeze", "check", "inspect"}
 
 
 class ExecutorAgent(BaseAgent):
-
     async def on_startup(self) -> None:
         log.info("executor.startup")
         for name, desc, inv, tags in _BUILTIN_TOOLS:
-            await self.memory.register_tool(name, desc, "executor", inv, tags, "executor")
+            await self.memory.register_tool(
+                name, desc, "executor", inv, tags, "executor"
+            )
         log.info("executor.tools_seeded", count=len(_BUILTIN_TOOLS))
         await self._seed_workspace_scripts()
         discovered = await self._scan_workspace_tools()
@@ -505,6 +618,7 @@ class ExecutorAgent(BaseAgent):
         on first start without needing a separate bind mount.
         """
         import shutil
+
         src_tools = Path("/workspace/src/workspace/tools")
         if not src_tools.exists():
             return
@@ -519,7 +633,11 @@ class ExecutorAgent(BaseAgent):
                     copied += 1
                     log.info("executor.seed_script_copied", script=script.name)
                 except Exception as exc:
-                    log.warning("executor.seed_script_copy_failed", script=script.name, error=str(exc))
+                    log.warning(
+                        "executor.seed_script_copy_failed",
+                        script=script.name,
+                        error=str(exc),
+                    )
         if copied:
             log.info("executor.seed_scripts_installed", count=copied)
 
@@ -546,21 +664,27 @@ class ExecutorAgent(BaseAgent):
             try:
                 lines = script.read_text(errors="ignore").splitlines()
             except Exception as exc:
-                log.warning("executor.scan_tool_read_error", path=str(script), error=str(exc))
+                log.warning(
+                    "executor.scan_tool_read_error", path=str(script), error=str(exc)
+                )
                 continue
 
             description = ""
-            usage       = ""
+            usage = ""
             tags: list[str] = ["workspace-tool", "script"]
 
-            for line in lines[:20]:   # only parse the header block
+            for line in lines[:20]:  # only parse the header block
                 stripped = line.strip()
                 if stripped.startswith("# Description:"):
-                    description = stripped[len("# Description:"):].strip()
+                    description = stripped[len("# Description:") :].strip()
                 elif stripped.startswith("# Usage:"):
-                    usage = stripped[len("# Usage:"):].strip()
+                    usage = stripped[len("# Usage:") :].strip()
                 elif stripped.startswith("# Tags:"):
-                    extra = [t.strip() for t in stripped[len("# Tags:"):].split(",") if t.strip()]
+                    extra = [
+                        t.strip()
+                        for t in stripped[len("# Tags:") :].split(",")
+                        if t.strip()
+                    ]
                     tags.extend(extra)
 
             if not description:
@@ -577,7 +701,9 @@ class ExecutorAgent(BaseAgent):
             await self.memory.register_tool(
                 tool_name, description, "executor", invocation, tags, "workspace-scan"
             )
-            log.debug("executor.workspace_tool_registered", name=tool_name, script=script.name)
+            log.debug(
+                "executor.workspace_tool_registered", name=tool_name, script=script.name
+            )
             count += 1
 
         return count
@@ -613,13 +739,16 @@ class ExecutorAgent(BaseAgent):
             local_tool = self._find_local_tool(task)
             if local_tool:
                 log.info("executor.local_tool_hit", tool=local_tool, task=task[:80])
-                result = await self._run_command(f"bash {local_tool}", task, task_id, timeout=timeout)
+                result = await self._run_command(
+                    f"bash {local_tool}", task, task_id, timeout=timeout
+                )
             else:
                 # ── 3. Search shared tool registry ────────────────────────
                 tool_hits = await self.search_tools(task)
                 shell_hit = next(
                     (
-                        t for t in tool_hits
+                        t
+                        for t in tool_hits
                         if t["invocation"].startswith("shell:")
                         and t.get("similarity", 0) >= 0.82
                         and "{" not in t["invocation"]  # skip parameterised templates
@@ -628,16 +757,27 @@ class ExecutorAgent(BaseAgent):
                 )
                 if shell_hit:
                     cmd = shell_hit["invocation"][6:]  # strip "shell:" prefix
-                    log.info("executor.tool_registry_hit",
-                             tool=shell_hit["name"], sim=round(shell_hit.get("similarity", 0), 3))
+                    log.info(
+                        "executor.tool_registry_hit",
+                        tool=shell_hit["name"],
+                        sim=round(shell_hit.get("similarity", 0), 3),
+                    )
                     await self.memory.increment_tool_usage(shell_hit["name"])
-                    result = await self._run_command(cmd, task, task_id, timeout=timeout)
+                    result = await self._run_command(
+                        cmd, task, task_id, timeout=timeout
+                    )
                 else:
                     # ── 4. Try capability registry (no LLM) ───────────────────
                     cached_cmd = await self.memory.lookup_capability(task)
                     if cached_cmd:
-                        log.info("executor.capability_hit", task=task[:80], cmd=cached_cmd[:80])
-                        result = await self._run_command(cached_cmd, task, task_id, timeout=timeout)
+                        log.info(
+                            "executor.capability_hit",
+                            task=task[:80],
+                            cmd=cached_cmd[:80],
+                        )
+                        result = await self._run_command(
+                            cached_cmd, task, task_id, timeout=timeout
+                        )
                     else:
                         # ── 5. Fall back to LLM with multi-step ReAct loop ────
                         tools_ctx = self.format_tools_context(tool_hits)
@@ -648,7 +788,9 @@ class ExecutorAgent(BaseAgent):
 
                         async def _exec_action(action_type: str, payload: str) -> str:
                             if action_type == "CMD":
-                                return await self._run_command(payload, task, task_id, timeout=timeout)
+                                return await self._run_command(
+                                    payload, task, task_id, timeout=timeout
+                                )
                             return f"Unknown action: {action_type}"
 
                         result = await self.agent_loop(
@@ -658,15 +800,31 @@ class ExecutorAgent(BaseAgent):
                         )
 
                         # Store successful result in capability cache for future reuse
-                        if result and not result.startswith("Command denied") and not result.startswith("Error"):
+                        if (
+                            result
+                            and not result.startswith("Command denied")
+                            and not result.startswith("Error")
+                        ):
                             tool_tags = ["executor", "multi-step"]
-                            await self.memory.store_capability(task, result[:200], tool_tags)
-                            words = [w for w in re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 2][:4]
+                            await self.memory.store_capability(
+                                task, result[:200], tool_tags
+                            )
+                            words = [
+                                w
+                                for w in re.sub(
+                                    r"[^a-z0-9\s]", "", task.lower()
+                                ).split()
+                                if len(w) > 2
+                            ][:4]
                             tool_name = "-".join(words)[:50]
                             if tool_name:
                                 await self.memory.register_tool(
-                                    tool_name, task[:120], "executor",
-                                    f"shell:{result[:200]}", tool_tags, self.role,
+                                    tool_name,
+                                    task[:120],
+                                    "executor",
+                                    f"shell:{result[:200]}",
+                                    tool_tags,
+                                    self.role,
                                 )
 
         await self.emit(
@@ -675,7 +833,10 @@ class ExecutorAgent(BaseAgent):
         )
 
         # Stage findings for long-term memory
-        if any(kw in task.lower() for kw in ["bug", "error", "pattern", "found", "discovered", "improve"]):
+        if any(
+            kw in task.lower()
+            for kw in ["bug", "error", "pattern", "found", "discovered", "improve"]
+        ):
             self.stage_finding(
                 content=f"Executor task: {task}\nResult: {result[:500]}",
                 topic="execution_findings",
@@ -683,7 +844,10 @@ class ExecutorAgent(BaseAgent):
             )
 
         # Mark self-modifications in memory immediately
-        if any(kw in task.lower() for kw in ["modify", "update", "patch", "rewrite", "fix code"]):
+        if any(
+            kw in task.lower()
+            for kw in ["modify", "update", "patch", "rewrite", "fix code"]
+        ):
             await self.promote_now(
                 content=f"Self-modification applied.\nTask: {task}\nOutcome: {result[:400]}",
                 topic="self_modification",
@@ -710,11 +874,23 @@ class ExecutorAgent(BaseAgent):
         """
         if not TOOLS_DIR.exists():
             return None
-        task_words = set(re.sub(r"[^a-z0-9\s]", "", task.lower()).split()) - {"the", "a", "an", "in", "of", "for", "to"}
+        task_words = set(re.sub(r"[^a-z0-9\s]", "", task.lower()).split()) - {
+            "the",
+            "a",
+            "an",
+            "in",
+            "of",
+            "for",
+            "to",
+        }
         best_path: str | None = None
         best_score = 0
         for script in TOOLS_DIR.glob("*.sh"):
-            name_words = set(re.sub(r"[^a-z0-9\s]", " ", script.stem.replace("-", " ").replace("_", " ")).split())
+            name_words = set(
+                re.sub(
+                    r"[^a-z0-9\s]", " ", script.stem.replace("-", " ").replace("_", " ")
+                ).split()
+            )
             score = len(task_words & name_words)
             if score >= 2 and score > best_score:
                 best_score = score
@@ -731,7 +907,11 @@ class ExecutorAgent(BaseAgent):
         try:
             TOOLS_DIR.mkdir(parents=True, exist_ok=True)
             # Derive a descriptive name from task keywords
-            words = [w for w in re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 2][:5]
+            words = [
+                w
+                for w in re.sub(r"[^a-z0-9\s]", "", task.lower()).split()
+                if len(w) > 2
+            ][:5]
             name = "-".join(words)[:50]
             if not name:
                 return
@@ -761,10 +941,10 @@ class ExecutorAgent(BaseAgent):
         # Command not found → try known binary aliases
         if "not found" in combined or "command not found" in combined:
             aliases: dict[str, str] = {
-                "python":  "python3",
+                "python": "python3",
                 "python3": "python",
-                "pip":     "pip3",
-                "pip3":    "pip",
+                "pip": "pip3",
+                "pip3": "pip",
             }
             alt = aliases.get(base_cmd)
             if alt:
@@ -777,16 +957,27 @@ class ExecutorAgent(BaseAgent):
     # Certain subcommands within AUTO_APPROVED bases are still destructive.
     # If the full command matches any of these patterns, escalate to REQUIRES_APPROVAL.
     _ESCALATE_PATTERNS: list[re.Pattern] = [
-        re.compile(r'\bdocker\s+(rm|rmi|volume\s+rm|network\s+rm|system\s+prune)\b', re.I),
-        re.compile(r'\bgit\s+(push|commit|reset|rebase|merge|cherry-pick|force)\b', re.I),
-        re.compile(r'\btee\b.*/workspace/(user|projects)/', re.I),  # outside container workspace
+        re.compile(
+            r"\bdocker\s+(rm|rmi|volume\s+rm|network\s+rm|system\s+prune)\b", re.I
+        ),
+        re.compile(
+            r"\bgit\s+(push|commit|reset|rebase|merge|cherry-pick|force)\b", re.I
+        ),
+        re.compile(
+            r"\btee\b.*/workspace/(user|projects)/", re.I
+        ),  # outside container workspace
     ]
 
     def _needs_escalation(self, cmd: str) -> bool:
         return any(p.search(cmd) for p in self._ESCALATE_PATTERNS)
 
     async def _run_command(
-        self, cmd: str, task: str, task_id: str, timeout: int = 60, _recovery: bool = False
+        self,
+        cmd: str,
+        task: str,
+        task_id: str,
+        timeout: int = 60,
+        _recovery: bool = False,
     ) -> str:
         """Run a shell command after three-tier trust check."""
         try:
@@ -843,8 +1034,15 @@ class ExecutorAgent(BaseAgent):
                 recovery = self._try_command_recovery(base_cmd, parts, out, err)
                 if recovery:
                     alt_cmd, reason = recovery
-                    log.info("executor.auto_recovery", original=cmd, recovery=alt_cmd, reason=reason)
-                    return await self._run_command(alt_cmd, task, task_id, timeout, _recovery=True)
+                    log.info(
+                        "executor.auto_recovery",
+                        original=cmd,
+                        recovery=alt_cmd,
+                        reason=reason,
+                    )
+                    return await self._run_command(
+                        alt_cmd, task, task_id, timeout, _recovery=True
+                    )
 
             return truncate_command_output(output)
 
@@ -889,7 +1087,9 @@ class ExecutorAgent(BaseAgent):
         )
 
         decision = await self.bus.wait_for_approval(approval_id, timeout=300)
-        log.info("executor.approval_decision", decision=decision, approval_id=approval_id)
+        log.info(
+            "executor.approval_decision", decision=decision, approval_id=approval_id
+        )
         return decision == "approved"
 
     async def on_shutdown(self) -> None:

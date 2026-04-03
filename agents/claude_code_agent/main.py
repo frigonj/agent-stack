@@ -31,21 +31,21 @@ import structlog
 
 log = structlog.get_logger()
 
-MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "1024"))
-STREAM     = "agents:claude_code"
-GROUP      = "claude_code_group"
-CONSUMER   = "claude_code_agent"
-BROADCAST  = "agents:broadcast"
+STREAM = "agents:claude_code"
+GROUP = "claude_code_group"
+CONSUMER = "claude_code_agent"
+BROADCAST = "agents:broadcast"
 
 # Hard caps on tool output returned to Claude.
 # The account rate limit is 10,000 input tokens/minute.
 # Tool definitions + system prompt + history already consume ~800 tokens,
 # so individual tool outputs must stay small to avoid 429s.
-_MAX_FILE_CHARS    = 6_000   # ~1,500 tokens
-_MAX_SHELL_CHARS   = 4_000   # ~1,000 tokens
-_MAX_SEARCH_CHARS  = 3_000   # ~750 tokens
-_MAX_GLOB_RESULTS  = 50
+_MAX_FILE_CHARS = 6_000  # ~1,500 tokens
+_MAX_SHELL_CHARS = 4_000  # ~1,000 tokens
+_MAX_SEARCH_CHARS = 3_000  # ~750 tokens
+_MAX_GLOB_RESULTS = 50
 
 # Maximum tool-use iterations per task. Each iteration re-sends the full
 # conversation history, so cost compounds quickly. Keep this low.
@@ -78,7 +78,10 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Absolute or /workspace/src-relative path"},
+                "path": {
+                    "type": "string",
+                    "description": "Absolute or /workspace/src-relative path",
+                },
             },
             "required": ["path"],
         },
@@ -89,7 +92,7 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path":    {"type": "string", "description": "Path to write"},
+                "path": {"type": "string", "description": "Path to write"},
                 "content": {"type": "string", "description": "File content"},
             },
             "required": ["path", "content"],
@@ -112,8 +115,14 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "command":         {"type": "string",  "description": "Shell command to execute"},
-                "timeout_seconds": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 30)",
+                },
             },
             "required": ["command"],
         },
@@ -124,8 +133,14 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "pattern":   {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
-                "directory": {"type": "string", "description": "Base directory (default /workspace/src)"},
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern, e.g. '**/*.py'",
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Base directory (default /workspace/src)",
+                },
             },
             "required": ["pattern"],
         },
@@ -136,9 +151,15 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "pattern":   {"type": "string", "description": "Regex or literal string"},
-                "path":      {"type": "string", "description": "Directory or file to search (default /workspace/src)"},
-                "file_glob": {"type": "string", "description": "File pattern filter, e.g. '*.py'"},
+                "pattern": {"type": "string", "description": "Regex or literal string"},
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search (default /workspace/src)",
+                },
+                "file_glob": {
+                    "type": "string",
+                    "description": "File pattern filter, e.g. '*.py'",
+                },
             },
             "required": ["pattern"],
         },
@@ -147,6 +168,7 @@ TOOLS: list[dict] = [
 
 
 # ── Tool implementations ──────────────────────────────────────────────────────
+
 
 def _resolve(path: str) -> str:
     """Resolve workspace-relative paths to absolute."""
@@ -161,7 +183,10 @@ async def _read_file(path: str) -> str:
         with open(path, encoding="utf-8", errors="replace") as f:
             content = f.read()
         if len(content) > _MAX_FILE_CHARS:
-            content = content[:_MAX_FILE_CHARS] + f"\n... (truncated — {len(content)} chars total; use search_content to find specific sections)"
+            content = (
+                content[:_MAX_FILE_CHARS]
+                + f"\n... (truncated — {len(content)} chars total; use search_content to find specific sections)"
+            )
         return content
     except FileNotFoundError:
         return f"Error: file not found: {path}"
@@ -201,13 +226,18 @@ async def _run_shell(command: str, timeout_seconds: int = 30) -> str:
             stderr=asyncio.subprocess.STDOUT,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_seconds
+            )
         except asyncio.TimeoutError:
             proc.kill()
             return f"Error: command timed out after {timeout_seconds}s"
         output = stdout.decode("utf-8", errors="replace")
         if len(output) > _MAX_SHELL_CHARS:
-            output = output[:_MAX_SHELL_CHARS] + "\n... (truncated — use tail/grep to see more)"
+            output = (
+                output[:_MAX_SHELL_CHARS]
+                + "\n... (truncated — use tail/grep to see more)"
+            )
         return output or "(no output)"
     except Exception as e:
         return f"Error: {e}"
@@ -223,7 +253,9 @@ async def _search_files(pattern: str, directory: str = "/workspace/src") -> str:
         results = sorted(matches)
         out = "\n".join(results[:_MAX_GLOB_RESULTS])
         if len(results) > _MAX_GLOB_RESULTS:
-            out += f"\n... ({len(results) - _MAX_GLOB_RESULTS} more — refine your pattern)"
+            out += (
+                f"\n... ({len(results) - _MAX_GLOB_RESULTS} more — refine your pattern)"
+            )
         return out
     except Exception as e:
         return f"Error: {e}"
@@ -236,8 +268,11 @@ async def _search_content(
 ) -> str:
     if not path.startswith("/"):
         path = _resolve(path)
-    cmd = ["grep", "-rn", "--include=" + file_glob, pattern, path] if file_glob else \
-          ["grep", "-rn", pattern, path]
+    cmd = (
+        ["grep", "-rn", "--include=" + file_glob, pattern, path]
+        if file_glob
+        else ["grep", "-rn", pattern, path]
+    )
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -247,7 +282,10 @@ async def _search_content(
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         output = stdout.decode("utf-8", errors="replace")
         if len(output) > _MAX_SEARCH_CHARS:
-            output = output[:_MAX_SEARCH_CHARS] + "\n... (truncated — narrow pattern or use file_glob)"
+            output = (
+                output[:_MAX_SEARCH_CHARS]
+                + "\n... (truncated — narrow pattern or use file_glob)"
+            )
         return output or "No matches found"
     except asyncio.TimeoutError:
         return "Search timed out"
@@ -256,18 +294,25 @@ async def _search_content(
 
 
 TOOL_HANDLERS: dict = {
-    "read_file":      lambda i: _read_file(i["path"]),
-    "write_file":     lambda i: _write_file(i["path"], i["content"]),
-    "list_dir":       lambda i: _list_dir(i["path"]),
-    "run_shell":      lambda i: _run_shell(i["command"], i.get("timeout_seconds", 30)),
-    "search_files":   lambda i: _search_files(i["pattern"], i.get("directory", "/workspace/src")),
-    "search_content": lambda i: _search_content(i["pattern"], i.get("path", "/workspace/src"), i.get("file_glob")),
+    "read_file": lambda i: _read_file(i["path"]),
+    "write_file": lambda i: _write_file(i["path"], i["content"]),
+    "list_dir": lambda i: _list_dir(i["path"]),
+    "run_shell": lambda i: _run_shell(i["command"], i.get("timeout_seconds", 30)),
+    "search_files": lambda i: _search_files(
+        i["pattern"], i.get("directory", "/workspace/src")
+    ),
+    "search_content": lambda i: _search_content(
+        i["pattern"], i.get("path", "/workspace/src"), i.get("file_glob")
+    ),
 }
 
 
 # ── Agentic loop ──────────────────────────────────────────────────────────────
 
-async def _api_call_with_retry(client: anthropic.AsyncAnthropic, **kwargs) -> anthropic.types.Message:
+
+async def _api_call_with_retry(
+    client: anthropic.AsyncAnthropic, **kwargs
+) -> anthropic.types.Message:
     """Call client.messages.create with exponential backoff on 429."""
     delay = 10  # seconds — start conservatively given the tight TPM window
     for attempt in range(5):
@@ -321,12 +366,16 @@ async def run_task(client: anthropic.AsyncAnthropic, task: str) -> str:
                 result = await handler(block.input)
             else:
                 result = f"Unknown tool: {block.name}"
-            log.info("claude_code_agent.tool", tool=block.name, result_len=len(str(result)))
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": block.id,
-                "content":     str(result),
-            })
+            log.info(
+                "claude_code_agent.tool", tool=block.name, result_len=len(str(result))
+            )
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(result),
+                }
+            )
 
         messages.append({"role": "user", "content": tool_results})
 
@@ -335,19 +384,25 @@ async def run_task(client: anthropic.AsyncAnthropic, task: str) -> str:
 
 # ── Event handling ────────────────────────────────────────────────────────────
 
+
 async def _handle_event(
     redis: aioredis.Redis,
     client: anthropic.AsyncAnthropic,
     data: dict,
 ) -> None:
-    if data.get("type") not in ("task.created", "task.assigned", "claude.task", "claude.escalation"):
+    if data.get("type") not in (
+        "task.created",
+        "task.assigned",
+        "claude.task",
+        "claude.escalation",
+    ):
         return
 
-    payload        = json.loads(data.get("payload", "{}"))
-    task           = payload.get("task", "").strip()
-    task_id        = data.get("task_id", str(uuid.uuid4()))
+    payload = json.loads(data.get("payload", "{}"))
+    task = payload.get("task", "").strip()
+    task_id = data.get("task_id", str(uuid.uuid4()))
     parent_task_id = payload.get("parent_task_id", "")
-    subtask_id     = payload.get("subtask_id", "")
+    subtask_id = payload.get("subtask_id", "")
 
     if not task:
         return
@@ -361,17 +416,19 @@ async def _handle_event(
     await redis.xadd(
         BROADCAST,
         {
-            "event_id":  str(uuid.uuid4()),
-            "type":      "task.completed",
-            "source":    "claude_code_agent",
-            "task_id":   parent_task_id or task_id,
+            "event_id": str(uuid.uuid4()),
+            "type": "task.completed",
+            "source": "claude_code_agent",
+            "task_id": parent_task_id or task_id,
             "timestamp": str(time.time()),
-            "payload":   json.dumps({
-                "task_id":        parent_task_id or task_id,
-                "subtask_id":     subtask_id,
-                "parent_task_id": parent_task_id,
-                "result":         result,
-            }),
+            "payload": json.dumps(
+                {
+                    "task_id": parent_task_id or task_id,
+                    "subtask_id": subtask_id,
+                    "parent_task_id": parent_task_id,
+                    "result": result,
+                }
+            ),
         },
         maxlen=10_000,
         approximate=True,
@@ -380,11 +437,12 @@ async def _handle_event(
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+
 async def main_loop() -> None:
     redis_url = os.environ["REDIS_URL"]
-    api_key   = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
 
-    redis  = await aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
+    redis = await aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
     try:

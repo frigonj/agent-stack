@@ -25,7 +25,11 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage as _HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage as _HumanMessage,
+    SystemMessage,
+)
 from langchain_openai import ChatOpenAI
 
 from core.events.bus import Event, EventBus, EventType
@@ -43,21 +47,26 @@ from core.context import (
 # Try tiktoken for accurate counts; fall back to chars//4 if unavailable.
 try:
     import tiktoken
+
     _tok_enc = tiktoken.get_encoding("cl100k_base")  # good approximation for Qwen2.5
 
     def _count_tokens(text: str) -> int:
         return len(_tok_enc.encode(text, disallowed_special=()))
 except ImportError:
+
     def _count_tokens(text: str) -> int:  # type: ignore[misc]
         return len(text) // 4
+
 
 log = structlog.get_logger()
 
 # ── Agent loop action parsing ─────────────────────────────────────────────────
 # Matches lines like "CMD: docker ps" or "SEARCH: EventType" or "READ: /workspace/docs/x.pdf"
-_ACTION_RE = re.compile(r'^(?P<prefix>CMD|SEARCH|READ):\s*(?P<payload>.+)$', re.MULTILINE)
+_ACTION_RE = re.compile(
+    r"^(?P<prefix>CMD|SEARCH|READ):\s*(?P<payload>.+)$", re.MULTILINE
+)
 # Matches "DONE: <answer>" — the LLM signals it is finished
-_DONE_RE   = re.compile(r'^DONE:\s*(?P<answer>.+)', re.MULTILINE | re.DOTALL)
+_DONE_RE = re.compile(r"^DONE:\s*(?P<answer>.+)", re.MULTILINE | re.DOTALL)
 
 
 class BaseAgent(ABC):
@@ -89,7 +98,7 @@ class BaseAgent(ABC):
         )
         self.llm = ChatOpenAI(
             base_url=f"{settings.lm_studio_url}/v1",
-            api_key="lm-studio",           # LM Studio doesn't require a real key
+            api_key="lm-studio",  # LM Studio doesn't require a real key
             model=settings.lm_studio_model,
             temperature=0.1,
             streaming=True,
@@ -98,11 +107,11 @@ class BaseAgent(ABC):
 
         self._running = False
         self._stopped = False
-        self._findings: list[dict] = []    # Staged for promotion on shutdown
+        self._findings: list[dict] = []  # Staged for promotion on shutdown
         self._stop_event: Optional[asyncio.Event] = None
         # context_id → asyncio.Task for multi-context consumer pool
         self._context_tasks: dict[str, asyncio.Task] = {}
-        self._model_context_limit: Optional[int] = None   # cached from LM Studio
+        self._model_context_limit: Optional[int] = None  # cached from LM Studio
         self._last_event_time: float = time.monotonic()
         # Counts concurrently running event-handler tasks.
         # Status is only set to "idle" when this reaches zero.
@@ -115,8 +124,8 @@ class BaseAgent(ABC):
         # ── Circuit breaker state ─────────────────────────────────────────────
         # Tracks consecutive LM Studio failures. After CIRCUIT_THRESHOLD failures
         # the circuit opens and llm_invoke() fails fast (or uses Claude fallback).
-        self._circuit_failures:   int   = 0
-        self._circuit_open:       bool  = False
+        self._circuit_failures: int = 0
+        self._circuit_open: bool = False
         self._circuit_open_since: float = 0.0
 
         # Optional Claude API fallback (only active when ANTHROPIC_API_KEY is set)
@@ -124,8 +133,9 @@ class BaseAgent(ABC):
         if _api_key:
             try:
                 from langchain_anthropic import ChatAnthropic
+
                 self._claude_fallback: Optional[Any] = ChatAnthropic(
-                    model="claude-haiku-4-5-20251001",   # cheapest/fastest for fallback
+                    model="claude-haiku-4-5-20251001",  # cheapest/fastest for fallback
                     api_key=_api_key,
                     temperature=0.1,
                     max_tokens=2048,
@@ -156,7 +166,11 @@ class BaseAgent(ABC):
 
         # Announce presence
         await self.bus.publish(
-            Event(type=EventType.AGENT_STARTED, source=self.role, payload={"role": self.role}),
+            Event(
+                type=EventType.AGENT_STARTED,
+                source=self.role,
+                payload={"role": self.role},
+            ),
             target="broadcast",
         )
 
@@ -241,7 +255,7 @@ class BaseAgent(ABC):
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
         log.debug("agent.context_unsubscribed", role=self.role, context_id=context_id)
 
@@ -267,15 +281,16 @@ class BaseAgent(ABC):
                 continue
             stream_key, entry_id, event = item
             self._last_event_time = time.monotonic()
-            asyncio.create_task(self._handle_context_and_ack(stream_key, entry_id, event, context_id))
+            asyncio.create_task(
+                self._handle_context_and_ack(stream_key, entry_id, event, context_id)
+            )
 
     async def _handle_context_and_ack(
         self, stream: str, entry_id: str, event: "Event", context_id: str
     ) -> None:
+        group = f"{self.role}_ctx_group"
         try:
-            group = f"{self.role}_ctx_group"
             await self.handle_context_event(event, context_id)
-            await self.bus.ack(stream, group, entry_id)
         except Exception as exc:
             log.error(
                 "agent.context_event_error",
@@ -283,6 +298,9 @@ class BaseAgent(ABC):
                 context_id=context_id,
                 error=str(exc),
             )
+            await self._emit_error(event, exc)
+            return
+        await self.bus.ack(stream, group, entry_id)
 
     async def handle_context_event(self, event: "Event", context_id: str) -> None:
         """
@@ -326,7 +344,7 @@ class BaseAgent(ABC):
                 )
                 break  # stop was requested
             except asyncio.TimeoutError:
-                pass   # normal — interval elapsed
+                pass  # normal — interval elapsed
 
             if not self._running:
                 break
@@ -401,21 +419,37 @@ class BaseAgent(ABC):
         if event.type == EventType.AGENT_SHUTDOWN:
             await self.bus.ack(stream, self.group_name, entry_id)
             log.info("agent.shutdown_received", role=self.role)
+            # Wait for any in-flight task handlers to finish before tearing down.
+            drain_deadline = time.monotonic() + 120
+            while self._active_tasks > 0 and time.monotonic() < drain_deadline:
+                await asyncio.sleep(0.5)
+            if self._active_tasks > 0:
+                log.warning(
+                    "agent.shutdown_drain_timeout",
+                    role=self.role,
+                    active=self._active_tasks,
+                )
             await self.stop(summary="shutdown requested by orchestrator")
             return
 
         self._active_tasks += 1
-        await self._set_status("busy", task=event.payload.get("task", event.type.value)[:80])
+        await self._set_status(
+            "busy", task=event.payload.get("task", event.type.value)[:80]
+        )
         try:
             await self.handle_event(event)
             await self.bus.ack(stream, self.group_name, entry_id)
         except Exception as exc:
-            log.error("agent.event_error", role=self.role, error=str(exc), event_id=event.event_id)
+            log.error(
+                "agent.event_error",
+                role=self.role,
+                error=str(exc),
+                event_id=event.event_id,
+            )
             await self._emit_error(event, exc)
         finally:
-            self._active_tasks -= 1
-            if self._active_tasks <= 0:
-                self._active_tasks = 0
+            self._active_tasks = max(0, self._active_tasks - 1)
+            if self._active_tasks == 0:
                 await self._set_status("idle")
 
     _STATUS_KEY_PREFIX = "agent:status"
@@ -424,17 +458,19 @@ class BaseAgent(ABC):
     async def _set_status(self, status: str, task: str = "") -> None:
         """Publish agent status to Redis for the control script to query."""
         try:
-            payload = json.dumps({
-                "status":  status,
-                "task":    task,
-                "since":   time.time(),
-                "queue":   await self._queue_depth(),
-            })
+            payload = json.dumps(
+                {
+                    "status": status,
+                    "task": task,
+                    "since": time.time(),
+                    "queue": await self._queue_depth(),
+                }
+            )
             await self.bus._client.setex(
                 f"{self._STATUS_KEY_PREFIX}:{self.role}", self._STATUS_TTL, payload
             )
-        except Exception:
-            pass  # status publishing is best-effort; never block the event loop
+        except Exception as exc:
+            log.warning("agent.status_publish_failed", role=self.role, error=str(exc))
 
     async def _queue_depth(self) -> int:
         """Return the number of pending (unprocessed) messages in this agent's stream."""
@@ -444,17 +480,17 @@ class BaseAgent(ABC):
             for g in groups:
                 lag = g.get("lag") or g.get("pel-count") or 0
                 return int(lag)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("agent.queue_depth_failed", role=self.role, error=str(exc))
         return 0
 
     # ── LLM call management ─────────────────────────────────────────────────
 
     # Redis key used as a distributed mutex across all agent containers.
     # Only one agent may hold this lock at a time, preventing KV cache exhaustion.
-    _LLM_LOCK_KEY  = "llm:lock"
-    _LLM_LOCK_TTL  = 120          # seconds — auto-releases if agent crashes mid-call
-    _LLM_LOCK_POLL = 1.5          # seconds between acquire attempts
+    _LLM_LOCK_KEY = "llm:lock"
+    _LLM_LOCK_TTL = 120  # seconds — auto-releases if agent crashes mid-call
+    _LLM_LOCK_POLL = 1.5  # seconds between acquire attempts
 
     async def _get_model_context_limit(self) -> int:
         """
@@ -486,8 +522,8 @@ class BaseAgent(ABC):
         return self._model_context_limit
 
     # ── Circuit breaker constants ────────────────────────────────────────────
-    CIRCUIT_THRESHOLD   = 3     # consecutive failures before opening
-    CIRCUIT_RESET_SECS  = 60    # seconds before attempting half-open probe
+    CIRCUIT_THRESHOLD = 3  # consecutive failures before opening
+    CIRCUIT_RESET_SECS = 60  # seconds before attempting half-open probe
 
     def _estimate_tokens(self, messages: list) -> int:
         """Token estimate using tiktoken when available, chars//4 as fallback."""
@@ -497,7 +533,9 @@ class BaseAgent(ABC):
             total += _count_tokens(content)
         return total
 
-    async def _budget_content_chars(self, system_msg: str, fixed_content: str = "") -> int:
+    async def _budget_content_chars(
+        self, system_msg: str, fixed_content: str = ""
+    ) -> int:
         """
         Return the character budget available for variable document/code content.
 
@@ -510,11 +548,11 @@ class BaseAgent(ABC):
 
         Returns at least 1 000 chars so there's always something useful to send.
         """
-        ctx_limit   = await self._get_model_context_limit()
-        input_cap   = int(ctx_limit * 0.70)          # 25% reply + 5% overhead
-        sys_tokens  = self._estimate_tokens([SystemMessage(content=system_msg)])
-        fixed_toks  = _count_tokens(fixed_content) if fixed_content else 0
-        available   = max(1_000, (input_cap - sys_tokens - fixed_toks) * 4)
+        ctx_limit = await self._get_model_context_limit()
+        input_cap = int(ctx_limit * 0.70)  # 25% reply + 5% overhead
+        sys_tokens = self._estimate_tokens([SystemMessage(content=system_msg)])
+        fixed_toks = _count_tokens(fixed_content) if fixed_content else 0
+        available = max(1_000, (input_cap - sys_tokens - fixed_toks) * 4)
         log.debug(
             "agent.content_budget",
             role=self.role,
@@ -595,22 +633,22 @@ class BaseAgent(ABC):
 
         # Exhausted max_steps — force a final synthesis
         log.warning("agent_loop.max_steps_reached", role=self.role, max_steps=max_steps)
-        msgs = msgs + [_HumanMessage(
-            content="You have reached the step limit. Summarise what you found and provide your best answer now. Start your response with DONE: "
-        )]
+        msgs = msgs + [
+            _HumanMessage(
+                content="You have reached the step limit. Summarise what you found and provide your best answer now. Start your response with DONE: "
+            )
+        ]
         final = await self.llm_invoke(msgs)
         done_m = _DONE_RE.search(final.content)
         return done_m.group("answer").strip() if done_m else final.content.strip()
 
-    async def _prune_loop_observations(
-        self, messages: list, incoming_obs: str
-    ) -> list:
+    async def _prune_loop_observations(self, messages: list, incoming_obs: str) -> list:
         """
         Drop the oldest OBSERVATION HumanMessages (index ≥ 2) when the
         conversation is approaching the model's context limit, so the loop
         can keep running without hitting a hard truncation.
         """
-        limit  = await self._get_model_context_limit()
+        limit = await self._get_model_context_limit()
         budget = int(limit * 0.70)
         candidate = messages + [_HumanMessage(content=incoming_obs)]
 
@@ -618,9 +656,11 @@ class BaseAgent(ABC):
             pruned = False
             for i in range(2, len(messages)):
                 msg = messages[i]
-                if isinstance(msg, _HumanMessage) and "OBSERVATION:" in (msg.content or ""):
+                if isinstance(msg, _HumanMessage) and "OBSERVATION:" in (
+                    msg.content or ""
+                ):
                     log.debug("agent_loop.obs_pruned", role=self.role, index=i)
-                    messages = messages[:i] + messages[i + 1:]
+                    messages = messages[:i] + messages[i + 1 :]
                     candidate = messages + [_HumanMessage(content=incoming_obs)]
                     pruned = True
                     break
@@ -666,18 +706,21 @@ class BaseAgent(ABC):
             raise RuntimeError(AgentError.LLM_CIRCUIT_OPEN.value)
 
         # ── Context limit pre-check ──────────────────────────────────────────
-        limit    = await self._get_model_context_limit()
-        budget   = int(limit * 0.75)   # reserve 25% for reply
+        limit = await self._get_model_context_limit()
+        budget = int(limit * 0.75)  # reserve 25% for reply
         estimated = self._estimate_tokens(messages)
         if estimated > budget:
             from langchain_core.messages import HumanMessage
-            last      = messages[-1]
+
+            last = messages[-1]
             # Remaining token budget for the last message → chars
             remaining_tokens = max(50, budget - self._estimate_tokens(messages[:-1]))
             # Approximate chars from tokens (tiktoken averages ~4 chars/token for English)
             max_chars = remaining_tokens * 4
-            truncated_content = last.content[:max_chars] + "\n[…input truncated to fit context window]"
-            messages  = messages[:-1] + [HumanMessage(content=truncated_content)]
+            truncated_content = (
+                last.content[:max_chars] + "\n[…input truncated to fit context window]"
+            )
+            messages = messages[:-1] + [HumanMessage(content=truncated_content)]
             log.warning(
                 "agent.input_truncated",
                 role=self.role,
@@ -701,12 +744,12 @@ class BaseAgent(ABC):
         #   llm:lock:released — pub/sub channel; PUBLISH wakes up waiters.
         #
         lock_priority = 0 if self.role == "orchestrator" else 1
-        nonce         = str(id(messages))
-        member        = f"{self.role}:{nonce}"
-        lock_value    = member
-        queue_key     = f"{self._LLM_LOCK_KEY}:queue"
-        notify_chan    = f"{self._LLM_LOCK_KEY}:released"
-        acquired      = False
+        nonce = str(id(messages))
+        member = f"{self.role}:{nonce}"
+        lock_value = member
+        queue_key = f"{self._LLM_LOCK_KEY}:queue"
+        notify_chan = f"{self._LLM_LOCK_KEY}:released"
+        acquired = False
 
         # Register in the priority queue
         await self.bus._client.zadd(queue_key, {member: lock_priority}, nx=True)
@@ -719,14 +762,18 @@ class BaseAgent(ABC):
                 front = await self.bus._client.zrange(queue_key, 0, 0)
                 if front and front[0] == member:
                     ok = await self.bus._client.set(
-                        self._LLM_LOCK_KEY, lock_value,
-                        nx=True, ex=self._LLM_LOCK_TTL,
+                        self._LLM_LOCK_KEY,
+                        lock_value,
+                        nx=True,
+                        ex=self._LLM_LOCK_TTL,
                     )
                     if ok:
                         acquired = True
                         continue
 
-                log.debug("agent.llm_lock_waiting", role=self.role, priority=lock_priority)
+                log.debug(
+                    "agent.llm_lock_waiting", role=self.role, priority=lock_priority
+                )
                 pubsub = self.bus._client.pubsub()
                 await pubsub.subscribe(notify_chan)
                 try:
@@ -737,6 +784,7 @@ class BaseAgent(ABC):
                         async for msg in pubsub.listen():
                             if msg["type"] == "message":
                                 return
+
                     await asyncio.wait_for(
                         _wait_for_release(), timeout=float(self._LLM_LOCK_TTL)
                     )
@@ -754,13 +802,13 @@ class BaseAgent(ABC):
             result = await self.llm.ainvoke(messages)
             # Successful call — reset circuit breaker
             self._circuit_failures = 0
-            self._circuit_open     = False
+            self._circuit_open = False
             return result
         except Exception as exc:
             # Track failures for circuit breaker
             self._circuit_failures += 1
             if self._circuit_failures >= self.CIRCUIT_THRESHOLD:
-                self._circuit_open       = True
+                self._circuit_open = True
                 self._circuit_open_since = time.monotonic()
                 log.error(
                     "agent.circuit_opened",
@@ -779,19 +827,25 @@ class BaseAgent(ABC):
 
     # ── Memory helpers ───────────────────────────────────────────────────────
 
-    def stage_finding(self, content: str, topic: str, tags: Optional[list[str]] = None) -> None:
+    def stage_finding(
+        self, content: str, topic: str, tags: Optional[list[str]] = None
+    ) -> None:
         """
         Stage a finding for promotion to Emrys on shutdown.
         Use this instead of immediate store() for batching efficiency.
         """
-        self._findings.append({
-            "content": content,
-            "topic": topic,
-            "tags": tags or [self.role],
-            "kind": "finding",
-        })
+        self._findings.append(
+            {
+                "content": content,
+                "topic": topic,
+                "tags": tags or [self.role],
+                "kind": "finding",
+            }
+        )
 
-    async def promote_now(self, content: str, topic: str, tags: Optional[list[str]] = None) -> None:
+    async def promote_now(
+        self, content: str, topic: str, tags: Optional[list[str]] = None
+    ) -> None:
         """Immediately promote a critical finding to long-term memory."""
         await self.memory.store(content, topic, tags or [self.role])
         await self.bus.publish(
@@ -828,7 +882,9 @@ class BaseAgent(ABC):
             sim = t.get("similarity", 0)
             if sim and sim < 0.3:
                 continue  # skip low-relevance hits
-            lines.append(f"- **{t['name']}** (owner: {t['owner_agent']}): {t['description']}")
+            lines.append(
+                f"- **{t['name']}** (owner: {t['owner_agent']}): {t['description']}"
+            )
             lines.append(f"  invoke: `{t['invocation']}`")
         if len(lines) == 1:
             return ""  # all hits filtered out
@@ -878,11 +934,26 @@ class BaseAgent(ABC):
                     target="broadcast",
                 )
         except Exception as exc:
-            log.warning("agent.memory_health_check_failed", error=str(exc))
+            import psycopg  # noqa: PLC0415
+
+            if isinstance(exc, psycopg.OperationalError):
+                log.error(
+                    "agent.memory_db_unreachable",
+                    role=self.role,
+                    error=str(exc),
+                )
+                await self.emit(
+                    EventType.ERROR,
+                    payload={"error": f"PostgreSQL unreachable during memory health check: {exc}"},
+                )
+            else:
+                log.warning("agent.memory_health_check_failed", error=str(exc))
 
     # ── Emit helpers ─────────────────────────────────────────────────────────
 
-    async def emit(self, event_type: EventType, payload: dict, target: str = "broadcast") -> None:
+    async def emit(
+        self, event_type: EventType, payload: dict, target: str = "broadcast"
+    ) -> None:
         await self.bus.publish(
             Event(type=event_type, source=self.role, payload=payload),
             target=target,
@@ -971,10 +1042,10 @@ class BaseAgent(ABC):
         await self.emit(
             EventType.AGENT_VOTE,
             payload={
-                "plan_id":    plan_id,
-                "agent":      self.role,
-                "approve":    approve,
-                "reason":     reason[:300],
+                "plan_id": plan_id,
+                "agent": self.role,
+                "approve": approve,
+                "reason": reason[:300],
                 "confidence": round(confidence, 3),
             },
             target="broadcast",
@@ -997,19 +1068,17 @@ class BaseAgent(ABC):
         await self.emit(
             EventType.VOTE_EXTENSION_REQUESTED,
             payload={
-                "plan_id":      plan_id,
-                "agent":        self.role,
+                "plan_id": plan_id,
+                "agent": self.role,
                 "requested_ms": extra_ms,
-                "reason":       reason[:200],
+                "reason": reason[:200],
             },
             target="broadcast",
         )
 
     # ── Topic classification ──────────────────────────────────────────────────
 
-    async def classify_topic(
-        self, text: str
-    ) -> tuple[str | None, float]:
+    async def classify_topic(self, text: str) -> tuple[str | None, float]:
         """
         Classify *text* into a topic category using patterns stored in long-term memory.
 
@@ -1020,9 +1089,9 @@ class BaseAgent(ABC):
         accumulated, the caller should ask the user for the correct label.
         """
         import re as _re
+
         keywords = [
-            w for w in _re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
-            if len(w) > 2
+            w for w in _re.sub(r"[^a-z0-9\s]", "", text.lower()).split() if len(w) > 2
         ]
         if not keywords:
             return None, 0.0
@@ -1037,7 +1106,7 @@ class BaseAgent(ABC):
 
         best = matches[0]
         confidence = best.get("confidence", 0.0)
-        category   = best.get("category")
+        category = best.get("category")
 
         # Reward the pattern for this match
         try:
@@ -1081,13 +1150,14 @@ class BaseAgent(ABC):
         or no content overlaps with the question keywords.
         """
         import re as _re
+
         entries = await self.bus.read_context_stream(context_id, count=lookback)
         if not entries:
             return None
 
         q_words = set(_re.sub(r"[^a-z0-9\s]", "", question.lower()).split())
         best_score = 0
-        best_text  = None
+        best_text = None
 
         for _entry_id, event in reversed(entries):
             payload_text = " ".join(str(v) for v in event.payload.values())
@@ -1098,7 +1168,7 @@ class BaseAgent(ABC):
             score = len(q_words & words) / len(union)
             if score > best_score:
                 best_score = score
-                best_text  = payload_text[:500]
+                best_text = payload_text[:500]
 
         # Only surface if there is meaningful overlap
         if best_score >= 0.25 and best_text:

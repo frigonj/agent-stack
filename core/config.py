@@ -19,10 +19,15 @@ class Settings(BaseSettings):
     redis_url: str = Field("redis://localhost:6379", validation_alias="REDIS_URL")
 
     # Long-term memory (PostgreSQL + pgvector)
-    database_url: str = Field("postgresql://agent:agent@postgres:5432/agentmem", validation_alias="DATABASE_URL")
+    database_url: str = Field(
+        "postgresql://agent:agent@postgres:5432/agentmem",
+        validation_alias="DATABASE_URL",
+    )
 
     # LM Studio
-    lm_studio_url: str = Field("http://host.docker.internal:1234", validation_alias="LM_STUDIO_URL")
+    lm_studio_url: str = Field(
+        "http://host.docker.internal:1234", validation_alias="LM_STUDIO_URL"
+    )
     lm_studio_model: str = Field("qwen2.5-14b", validation_alias="LM_STUDIO_MODEL")
 
     # Agent identity
@@ -32,7 +37,9 @@ class Settings(BaseSettings):
     agent_version: str = Field("", validation_alias="AGENT_VERSION")
 
     # Working directory containing docker-compose.yml (used for compose up fallback)
-    compose_project_dir: str = Field("/workspace/src", validation_alias="COMPOSE_PROJECT_DIR")
+    compose_project_dir: str = Field(
+        "/workspace/src", validation_alias="COMPOSE_PROJECT_DIR"
+    )
 
     # Logging
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")

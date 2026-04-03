@@ -32,7 +32,7 @@ def _make_stub(name: str) -> types.ModuleType:
 
 if "psycopg" not in sys.modules:
     psycopg = _make_stub("psycopg")
-    psycopg.__path__ = []   # mark as package so sub-imports work
+    psycopg.__path__ = []  # mark as package so sub-imports work
     # Attrs referenced at import time in long_term.py
     psycopg.AsyncConnection = MagicMock()
     psycopg.AsyncClientCursor = MagicMock()
