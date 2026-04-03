@@ -409,25 +409,30 @@ class LongTermMemory:
         texts = [e.get("content", "") for e in entries]
         embeddings = await asyncio.to_thread(_embed_texts, texts)
         pool = await self._get_pool()
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.executemany(
-                    """
-                    INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                    [
-                        (
-                            self._agent,
-                            e.get("topic", "general"),
-                            e.get("topic", "general"),
-                            e.get("content", ""),
-                            json.dumps(e.get("tags") or []),
-                            embeddings[i],
-                        )
-                        for i, e in enumerate(entries)
-                    ],
-                )
+        try:
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.executemany(
+                        """
+                        INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                        [
+                            (
+                                self._agent,
+                                e.get("topic", "general"),
+                                e.get("topic", "general"),
+                                e.get("content", ""),
+                                json.dumps(e.get("tags") or []),
+                                embeddings[i],
+                            )
+                            for i, e in enumerate(entries)
+                        ],
+                    )
+                await conn.commit()
+        except Exception as exc:
+            log.error("memory.batch_store_failed", count=len(entries), error=str(exc))
+            raise
         log.info("memory.batch_promoted", count=len(entries))
         return {"status": "stored", "count": len(entries)}
 

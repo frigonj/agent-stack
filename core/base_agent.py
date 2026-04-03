@@ -19,6 +19,7 @@ import json
 import os
 import signal
 import time
+import uuid
 from abc import ABC, abstractmethod
 import re
 from typing import Any, Awaitable, Callable, Optional
@@ -438,7 +439,6 @@ class BaseAgent(ABC):
         )
         try:
             await self.handle_event(event)
-            await self.bus.ack(stream, self.group_name, entry_id)
         except Exception as exc:
             log.error(
                 "agent.event_error",
@@ -448,6 +448,7 @@ class BaseAgent(ABC):
             )
             await self._emit_error(event, exc)
         finally:
+            await self.bus.ack(stream, self.group_name, entry_id)
             self._active_tasks = max(0, self._active_tasks - 1)
             if self._active_tasks == 0:
                 await self._set_status("idle")
@@ -494,30 +495,60 @@ class BaseAgent(ABC):
 
     async def _get_model_context_limit(self) -> int:
         """
-        Fetch the loaded model's max context length from LM Studio's REST API.
-        Cached after the first successful call. Returns a conservative default on failure.
+        Fetch the loaded model's actual runtime context length from LM Studio.
+
+        Strategy (in priority order):
+        1. /v1/models  → context_window field (reflects actual loaded n_ctx)
+        2. /api/v0/models → context_length (prefer over max_context_length which
+           is the server maximum, not what the model was loaded with)
+        3. Fallback: 4096 (conservative safe default)
+
+        Cached after the first successful call.
         """
         if self._model_context_limit is not None:
             return self._model_context_limit
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(f"{self.settings.lm_studio_url}/api/v0/models")
-                r.raise_for_status()
-                data = r.json()
-                models = data if isinstance(data, list) else data.get("data", [])
-                for m in models:
-                    ctx = m.get("max_context_length") or m.get("context_length")
+                # Preferred: /v1/models returns context_window = actual loaded n_ctx
+                try:
+                    r1 = await client.get(f"{self.settings.lm_studio_url}/v1/models")
+                    r1.raise_for_status()
+                    data1 = r1.json()
+                    models1 = data1 if isinstance(data1, list) else data1.get("data", [])
+                    for m in models1:
+                        ctx = m.get("context_window") or m.get("context_length")
+                        if ctx:
+                            self._model_context_limit = int(ctx)
+                            log.info(
+                                "agent.model_context_limit",
+                                role=self.role,
+                                limit=self._model_context_limit,
+                                source="/v1/models",
+                            )
+                            return self._model_context_limit
+                except Exception:
+                    pass
+
+                # Fallback: /api/v0/models — use context_length, not max_context_length
+                # max_context_length is the server's ceiling, not the loaded model's n_ctx
+                r2 = await client.get(f"{self.settings.lm_studio_url}/api/v0/models")
+                r2.raise_for_status()
+                data2 = r2.json()
+                models2 = data2 if isinstance(data2, list) else data2.get("data", [])
+                for m in models2:
+                    ctx = m.get("context_length") or m.get("max_context_length")
                     if ctx:
                         self._model_context_limit = int(ctx)
                         log.info(
                             "agent.model_context_limit",
                             role=self.role,
                             limit=self._model_context_limit,
+                            source="/api/v0/models",
                         )
                         return self._model_context_limit
         except Exception as exc:
             log.warning("agent.context_limit_fetch_failed", error=str(exc))
-        # Conservative fallback: 4096 tokens → ~16 000 chars
+        # Conservative fallback: 4096 tokens
         self._model_context_limit = 4096
         return self._model_context_limit
 
@@ -744,7 +775,7 @@ class BaseAgent(ABC):
         #   llm:lock:released — pub/sub channel; PUBLISH wakes up waiters.
         #
         lock_priority = 0 if self.role == "orchestrator" else 1
-        nonce = str(id(messages))
+        nonce = uuid.uuid4().hex
         member = f"{self.role}:{nonce}"
         lock_value = member
         queue_key = f"{self._LLM_LOCK_KEY}:queue"
