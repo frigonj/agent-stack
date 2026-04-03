@@ -749,8 +749,6 @@ class BaseAgent(ABC):
         budget = int(limit * 0.75)  # reserve 25% for reply
         estimated = self._estimate_tokens(messages)
         if estimated > budget:
-            from langchain_core.messages import HumanMessage
-
             last = messages[-1]
             # Remaining token budget for the last message → chars
             remaining_tokens = max(50, budget - self._estimate_tokens(messages[:-1]))
@@ -759,7 +757,7 @@ class BaseAgent(ABC):
             truncated_content = (
                 last.content[:max_chars] + "\n[…input truncated to fit context window]"
             )
-            messages = messages[:-1] + [HumanMessage(content=truncated_content)]
+            messages = messages[:-1] + [_HumanMessage(content=truncated_content)]
             log.warning(
                 "agent.input_truncated",
                 role=self.role,
@@ -838,27 +836,41 @@ class BaseAgent(ABC):
             raise
 
         try:
-            result = await self.llm.ainvoke(messages)
+            try:
+                result = await self.llm.ainvoke(messages)
+            except Exception as exc:
+                # On context overflow: correct the cached limit and retry once
+                # with a truncated last message, so callers never see the error.
+                err_str = str(exc)
+                _ctx_match = re.search(r"n_ctx:\s*(\d+)", err_str)
+                if not _ctx_match:
+                    raise
+                actual_ctx = int(_ctx_match.group(1))
+                log.warning(
+                    "agent.context_overflow_retry",
+                    role=self.role,
+                    was=self._model_context_limit,
+                    actual_ctx=actual_ctx,
+                )
+                self._model_context_limit = actual_ctx
+                self._model_context_limit_ts = time.monotonic()
+                # Truncate last message to fit inside the corrected limit
+                retry_budget = int(actual_ctx * 0.75)
+                prior_tokens = self._estimate_tokens(messages[:-1])
+                remaining_tokens = max(50, retry_budget - prior_tokens)
+                last = messages[-1]
+                truncated_content = (
+                    last.content[: remaining_tokens * 4]
+                    + "\n[…input truncated to fit context window]"
+                )
+                messages = messages[:-1] + [_HumanMessage(content=truncated_content)]
+                result = await self.llm.ainvoke(messages)
+
             # Successful call — reset circuit breaker
             self._circuit_failures = 0
             self._circuit_open = False
             return result
         except Exception as exc:
-            # If LM Studio reports a context overflow, extract the actual n_ctx
-            # and update our cached limit so the next call truncates correctly.
-            err_str = str(exc)
-            _ctx_match = re.search(r"n_ctx:\s*(\d+)", err_str)
-            if _ctx_match:
-                actual_ctx = int(_ctx_match.group(1))
-                if actual_ctx != self._model_context_limit:
-                    log.warning(
-                        "agent.context_limit_corrected",
-                        role=self.role,
-                        was=self._model_context_limit,
-                        now=actual_ctx,
-                    )
-                    self._model_context_limit = actual_ctx
-                    self._model_context_limit_ts = time.monotonic()
             # Track failures for circuit breaker
             self._circuit_failures += 1
             if self._circuit_failures >= self.CIRCUIT_THRESHOLD:
