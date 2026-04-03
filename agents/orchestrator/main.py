@@ -54,6 +54,13 @@ _ARCH_CHANGELOG_PATH = Path("/workspace/docs/generated/CHANGELOG.md")
 # How often a full LLM+LaTeX build is allowed (seconds). Configurable via env.
 _FULL_BUILD_INTERVAL = int(os.getenv("ARCH_FULL_BUILD_INTERVAL", str(86400)))
 
+# ── Optimizer idle trigger ────────────────────────────────────────────────────
+# Orchestrator dispatches the optimizer when it has been idle for this long
+# AND the optimizer has not run within the cooldown window.
+_OPT_LAST_RUN_KEY = "optimizer:last_run"  # Unix timestamp (str) in Redis
+_OPT_IDLE_TRIGGER_S = int(os.getenv("OPTIMIZER_IDLE_TRIGGER_S", str(15 * 60)))  # 15 min
+_OPT_COOLDOWN_S = int(os.getenv("OPTIMIZER_COOLDOWN_S", str(12 * 3600)))        # 12 h
+
 WATCHED_PATHS: list[str] = [
     "/workspace/src/docker-compose.yml",
     "/workspace/src/core/base_agent.py",
@@ -69,6 +76,7 @@ WATCHED_PATHS: list[str] = [
     "/workspace/src/agents/research/main.py",
     "/workspace/src/agents/discord_bridge/main.py",
     "/workspace/src/agents/claude_code_agent/main.py",
+    "/workspace/src/agents/developer/main.py",
     "/workspace/src/agents/optimizer/main.py",
     "/workspace/src/docker/agent.Dockerfile",
     "/workspace/src/docker/document_qa.Dockerfile",
@@ -198,6 +206,43 @@ _KEYWORD_ROUTES: list[tuple[re.Pattern, str]] = [
         "research",
     ),
     (re.compile(r"\bwhat (is|are|was|were) .{3,60}\??\s*$", re.I), "research"),
+    # Developer — code writing, feature development, bug fixes, refactoring
+    (
+        re.compile(
+            r"\b(implement|develop|build|add|create)\b.{0,40}\b(feature|function|method|class|module|agent)\b",
+            re.I,
+        ),
+        "developer",
+    ),
+    (
+        re.compile(
+            r"\b(fix|patch|debug|resolve)\b.{0,40}\b(bug|error|issue|problem|crash|exception|fail)\b",
+            re.I,
+        ),
+        "developer",
+    ),
+    (
+        re.compile(
+            r"\b(refactor|rewrite|clean\s*up|restructure|improve)\b.{0,30}\b(code|function|class|module|agent|file)\b",
+            re.I,
+        ),
+        "developer",
+    ),
+    (
+        re.compile(
+            r"\b(write|add|create)\b.{0,20}\b(test|tests|unit\s+test|integration\s+test)\b",
+            re.I,
+        ),
+        "developer",
+    ),
+    (
+        re.compile(r"\b(scaffold|create)\b.{0,20}\bnew\s+(agent|module)\b", re.I),
+        "developer",
+    ),
+    (
+        re.compile(r"\b(review|audit)\b.{0,20}\bcode\b", re.I),
+        "developer",
+    ),
     # Optimizer — perf testing and improvement suggestions
     (
         re.compile(
@@ -442,10 +487,22 @@ Always resolve pronouns and references ("the tool", "it", "that") from conversat
                       Decomposes questions into sub-queries, searches, extracts facts, checks consensus
                       across independent sources, then synthesises a cited answer. Zero Claude API calls.
                       Use for: "what is X", "latest version of Y", "current status of Z", web lookups.
+- developer         : code developer — writes, edits, refactors, and fixes code in the agent stack
+                      (/workspace/src) and user projects (/workspace/projects).
+                      Capabilities: implement features, fix bugs, scaffold new agent modules,
+                      write tests, review code. Uses executor for file writes (approval-gated)
+                      and code_search for codebase navigation.
+                      Use for: "add X feature", "fix the Y bug", "refactor Z", "write tests for W",
+                      "create a new agent", "review this file".
 - claude_code_agent : full Anthropic Claude API agent with tool use — best for complex multi-step reasoning,
                       code generation, analysis, or tasks requiring very deep intelligence.
                       Do NOT use for simple web lookups — use research agent instead.
 - discord           : full Discord server management — channels, categories, topics, messages, pins.
+- optimizer         : runs the perf test suite (Redis throughput, LLM latency, memory ops, end-to-end
+                      latency) and produces structured improvement suggestions. Always-on agent —
+                      dispatched automatically when the stack has been idle for 15 min. Can be triggered
+                      manually: "run the optimizer", "check performance", "what's slow", "optimise the stack".
+                      Accepts optional focus parameter: redis | llm | memory | e2e.
 
 ## Stack architecture (for context)
 - Redis Streams     : event bus between agents (streams: agents:{role}, agents:broadcast)
@@ -622,6 +679,7 @@ Agents:
 - code_search  : search /workspace/repos for functions/classes/patterns
 - research     : internet research via SearXNG — "what is X", "latest Y", "current status of Z"
 - discord      : Discord server management (channels, categories, messages, topics, file uploads from /workspace)
+- optimizer    : run perf tests + get improvement suggestions — "optimise", "benchmark", "what's slow", "perf test"
 
 Return ONLY valid JSON, no markdown fences. Two possible responses:
 
@@ -703,6 +761,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             "Research factual questions across the internet — returns sourced, consensus-checked answers",
             "event:task.assigned:research",
             ["research", "web", "search", "lookup", "facts", "current", "latest"],
+        ),
+        (
+            "route-to-optimizer",
+            "Run the performance test suite and receive concrete improvement suggestions for the agent stack",
+            "event:task.assigned:optimizer",
+            ["optimizer", "perf", "performance", "benchmark", "bottleneck", "slow", "improve"],
         ),
     ]
 
@@ -1984,6 +2048,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         "executor",
         "claude_code_agent",
         "research",
+        "developer",
     }
 
     # Some agents listen on a different stream than their role name.
@@ -2583,6 +2648,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         "executor",
         "claude_code_agent",
         "research",
+        "developer",
     }
 
     # Maps agent role name → Docker container_name (for docker start/stop).
@@ -2854,6 +2920,22 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if changed:
             await self._dispatch_arch_review(changed)
 
+        # ── Idle-triggered optimizer run ──────────────────────────────────────
+        # Fire when: no active plans, no active tasks, idle ≥ 15 min,
+        # and optimizer has not run in the last 12 h.
+        if not self._plans and self._active_tasks == 0:
+            idle_s = time.monotonic() - self._last_event_time
+            if idle_s >= _OPT_IDLE_TRIGGER_S:
+                last_raw = await self.bus._client.get(_OPT_LAST_RUN_KEY)
+                last_run = float(last_raw) if last_raw else 0.0
+                if (now - last_run) >= _OPT_COOLDOWN_S:
+                    log.info(
+                        "orchestrator.optimizer_idle_trigger",
+                        idle_s=round(idle_s),
+                        last_run_ago_h=round((now - last_run) / 3600, 1),
+                    )
+                    await self._dispatch_optimizer_run(reason="idle_trigger")
+
         pending = await self.memory.get_pending_tasks(limit=1)
         if not pending:
             log.debug("orchestrator.think_idle")
@@ -3009,6 +3091,43 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             log.info("orchestrator.arch_changelog_appended", files=short_names)
         except Exception as exc:
             log.warning("orchestrator.arch_changelog_failed", error=str(exc))
+
+    async def _dispatch_optimizer_run(self, reason: str = "idle_trigger") -> None:
+        """
+        Dispatch a perf run to the optimizer agent and record the timestamp in Redis
+        so future idle checks respect the cooldown window.
+        """
+        await self.bus._client.set(_OPT_LAST_RUN_KEY, str(time.time()))
+
+        task_id = str(uuid.uuid4())
+        task_desc = (
+            "Run the full performance test suite and return structured improvement suggestions. "
+            f"Trigger reason: {reason}."
+        )
+        plan = ExecutionPlan(
+            plan_id=str(uuid.uuid4()),
+            task_id=task_id,
+            original_task=task_desc,
+            steps=[
+                PlanStep(
+                    step_id=str(uuid.uuid4()),
+                    phase=1,
+                    task=task_desc,
+                    agent="optimizer",
+                    expected="structured JSON report with perf metrics and improvement suggestions",
+                )
+            ],
+        )
+        self._plans[task_id] = plan
+        await self.memory.upsert_plan(
+            task_id, plan.plan_id, task_desc, "running", plan.to_dict()
+        )
+        await self._emit_plan_status(
+            plan,
+            f"⚡ Dispatching optimizer (reason: {reason})",
+        )
+        log.info("orchestrator.optimizer_dispatched", reason=reason, task_id=task_id)
+        await self._dispatch_phase(plan, 1)
 
     async def on_shutdown(self) -> None:
         log.info("orchestrator.shutdown", active_plans=len(self._plans))

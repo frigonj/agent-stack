@@ -305,6 +305,86 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # ─── Developer Agent (ephemeral — spun up by orchestrator on demand) ────────
+  developer:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: developer
+    container_name: agent_developer
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=developer
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
+      - SRC_PATH=/workspace/src
+      - PROJECTS_PATH=/workspace/projects
+    volumes:
+      - ./agents/developer:/app/agent
+      - ./core:/app/core
+      - ./workspace:/workspace
+      - model_cache:/root/.cache/torch
+      - .:/workspace/src                           # read-write: developer modifies agent source
+      - ./emrys-src:/workspace/emrys:ro
+      - /var/run/docker.sock:/var/run/docker.sock  # restart containers after edits
+      - //c/Users/frigo:/workspace/user             # user home directory
+      - //c/Users/frigo/Documents/Coding Projects:/workspace/projects  # coding projects (read-write)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ─── Optimizer Agent (always-on — runs perf suite periodically) ─────────────
+  optimizer:
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+      args:
+        AGENT_MODULE: optimizer
+    container_name: agent_optimizer
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
+      - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - AGENT_ROLE=optimizer
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
+      # How often to run the full perf suite (seconds). Default 6 h.
+      - OPTIMIZER_INTERVAL=${OPTIMIZER_INTERVAL:-21600}
+      # Path to the perf suite inside the container (matches volume mount below)
+      - PERF_DIR=/workspace/src/tests/perf
+    volumes:
+      - ./agents/optimizer:/app/agent
+      - ./core:/app/core
+      - ./workspace:/workspace
+      - model_cache:/root/.cache/torch
+      - .:/workspace/src:ro          # read-only source: optimizer reads tests + baselines
+      - ./emrys-src:/workspace/emrys:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   redis_data:
   postgres_data:

@@ -109,6 +109,12 @@ The research agent searches the internet via SearXNG (Google + Bing + DDG, no AP
 - Decomposes questions → multi-query search → fact extraction → cross-source consensus
 - Commits sourced facts to Postgres (table: research_sources)
 Route "what is X", "latest version of Y", "current news/status" queries to research.
+
+## developer agent (delegate via orchestrator)
+The developer agent writes, edits, refactors, and fixes code:
+- Implements features, fixes bugs, scaffolds new agents, writes tests, reviews code
+- Works across /workspace/src (agent stack) and /workspace/projects (user projects)
+Route tasks that require *writing or modifying* source code to developer.
 """
 
 

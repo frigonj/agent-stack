@@ -56,6 +56,13 @@ The research agent searches the internet via SearXNG (Google + Bing + DDG):
 - Commits confident, sourced facts to Postgres (table: research_sources)
 - Zero Claude API calls — uses local LLM (Qwen) throughout
 Route "what is X", "latest version of Y", "current status of Z" to research.
+
+## developer agent (delegate via orchestrator)
+The developer agent writes, edits, refactors, and fixes code:
+- Implements new features, fixes bugs, scaffolds new agent modules
+- Writes and runs tests, performs code reviews
+- Works across /workspace/src (agent stack) and /workspace/projects (user projects)
+Route tasks that require *writing or modifying* code to developer.
 """
 
 # File extensions to index

@@ -466,13 +466,15 @@ Example:
   CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
   <patched content>
   EOF
-  DONE: Patched executor/main.py. Restarting container now.
+  (receive OBSERVATION confirming write)
   CMD: docker restart agent_executor
+  DONE: Patched executor/main.py and restarted the container.
 
 When the task is fully complete, respond with:
   DONE: <summary of what was done>
 
-If only one command is needed, issue it and then immediately follow with DONE:.
+DONE: must always be the last line. Never put a CMD: after DONE:.
+If only one command is needed, issue it followed by DONE: on the same response.
 If no command is needed, respond directly — the loop treats any response without CMD: as done.
 
 ## Self-modification
@@ -486,7 +488,8 @@ Write a file: CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
 Restart:      CMD: docker restart agent_executor
 
 Container names: agent_orchestrator, agent_executor, agent_document_qa,
-                 agent_code_search, agent_discord_bridge, agent_claude_code
+                 agent_code_search, agent_discord_bridge, agent_claude_code,
+                 agent_developer
 
 ## Self-improvement workflow
 1. cat the file  2. propose change  3. tee (auto-approved)  4. docker restart (auto-approved)
@@ -506,6 +509,14 @@ The research agent searches the internet via SearXNG (Google + Bing + DDG, no AP
 - Zero Claude API calls — uses local LLM (Qwen) throughout
 Route "what is X", "latest version of Y", "current news/status" queries to research.
 Container name: agent_research
+
+## developer agent (delegate via orchestrator)
+The developer agent writes, edits, refactors, and fixes code:
+- Implements features, fixes bugs, scaffolds new agents, writes tests, reviews code
+- Works across /workspace/src (agent stack) and /workspace/projects (user projects)
+- Delegates file writes back to executor (approval-gated) and searches to code_search
+Route tasks that require *writing or modifying* source code to developer.
+Container name: agent_developer
 """
 
 # ── Three-tier command trust model ───────────────────────────────────────────
