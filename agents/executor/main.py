@@ -288,9 +288,10 @@ _CMD_PREFIXES = tuple(
     sorted(
         {"ls", "cat", "find", "grep", "echo", "pwd", "wc", "head", "tail", "diff",
          "sort", "uniq", "stat", "env", "which", "docker", "docker-compose",
-         "git", "pip", "pip3", "python", "python3", "npm", "yarn", "apt", "apt-get",
-         "tee", "cp", "mv", "rm", "chmod", "mkdir", "touch", "curl", "wget",
-         "patch", "chown"},
+         "git", "pip", "pip3", "python", "python3", "pytest", "npm", "yarn",
+         "apt", "apt-get", "tee", "cp", "mv", "rm", "chmod", "mkdir", "touch",
+         "curl", "wget", "patch", "chown",
+         "df", "du", "ps", "ss", "lsof", "netstat", "uname", "uptime", "free"},
         key=len, reverse=True,  # longer prefixes first to avoid shadowing
     )
 )
@@ -361,15 +362,18 @@ Name scripts clearly: list-docker-containers.sh, find-large-files.sh, check-agen
 Over time this toolset replaces LLM calls for routine operations.
 
 ## Command trust tiers
-SAFE (instant, no log):    ls, cat, grep, find, echo, stat, head, tail, diff, env, which
+SAFE (instant, no log):
+  ls, cat, grep, find, echo, stat, head, tail, diff, env, which
+  df, du, ps, ss, lsof, netstat, uname, uptime, free
+  pip list/show/freeze/check (read-only pip sub-commands)
 AUTO_APPROVED (instant, audit log to #agent-logs):
   docker start/restart/stop/logs/exec/inspect
   tee, mkdir, touch, chmod, cp  (within /workspace only)
-  python, python3, bash, sh
+  python, python3, pytest, bash, sh
   git log/diff/status/show/fetch/pull
 REQUIRES_APPROVAL (Discord gate):
   docker rm/rmi/prune  |  git push/commit/reset/rebase
-  pip/npm/yarn/apt      |  curl/wget
+  pip install/npm/yarn/apt  |  curl/wget
   rm, mv, patch, chown
 
 Prefer AUTO_APPROVED commands — operate autonomously. Only escalate for truly
@@ -424,6 +428,8 @@ SAFE_COMMANDS = {
     "ls", "cat", "find", "grep", "echo", "pwd", "wc",
     "head", "tail", "diff", "sort", "uniq", "stat",
     "env", "printenv", "which", "type", "id",
+    # Read-only system introspection
+    "df", "du", "ps", "ss", "lsof", "netstat", "uname", "uptime", "free",
 }
 
 # Run automatically; emits AUDIT event so every action is visible in #agent-logs
@@ -436,6 +442,7 @@ AUTO_APPROVED_COMMANDS = {
     "mkdir", "touch", "chmod", "cp",
     # In-container code execution
     "python", "python3",
+    "pytest",           # run test suite — bounded to container, no external effects
     # Non-destructive git operations
     "git",              # log/diff/status/show/fetch/pull — push/commit still blocked
     # Tool scripts
@@ -454,6 +461,9 @@ REQUIRES_APPROVAL = {
     # Privileged container operations (permanent removal)
     "chown",
 }
+
+# pip sub-commands that are read-only — skip the approval gate for these
+_PIP_SAFE_SUBCOMMANDS = {"list", "show", "freeze", "check", "inspect"}
 
 
 class ExecutorAgent(BaseAgent):
@@ -792,12 +802,22 @@ class ExecutorAgent(BaseAgent):
 
         base_cmd = parts[0] if parts else ""
 
-        if base_cmd in REQUIRES_APPROVAL or (base_cmd in AUTO_APPROVED_COMMANDS and self._needs_escalation(cmd)):
+        # pip list/show/freeze/check are read-only — treat as AUTO_APPROVED
+        pip_read_only = (
+            base_cmd in ("pip", "pip3")
+            and len(parts) >= 2
+            and parts[1] in _PIP_SAFE_SUBCOMMANDS
+        )
+
+        if not pip_read_only and (
+            base_cmd in REQUIRES_APPROVAL
+            or (base_cmd in AUTO_APPROVED_COMMANDS and self._needs_escalation(cmd))
+        ):
             approved = await self._request_approval(cmd, task, task_id)
             if not approved:
                 log.info("executor.command_denied", cmd=cmd)
                 return f"Command denied by user: `{cmd}`"
-        elif base_cmd in AUTO_APPROVED_COMMANDS:
+        elif pip_read_only or base_cmd in AUTO_APPROVED_COMMANDS:
             # Run immediately — emit audit event so the action is visible in #agent-logs
             await self._emit_audit(cmd, task_id)
         elif base_cmd not in SAFE_COMMANDS:

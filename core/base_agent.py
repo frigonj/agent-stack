@@ -377,13 +377,26 @@ class BaseAgent(ABC):
             # stop signal without being permanently stuck waiting for real events.
             if stream is None:
                 continue
-            self._last_event_time = time.monotonic()
+            # Only reset the idle clock for events targeted at this agent, not
+            # broadcast events.  Broadcast traffic (plan.status, plan.proposed,
+            # agent.vote, …) is informational and must not prevent an ephemeral
+            # agent from timing out after its own work is done.
+            if "broadcast" not in stream:
+                self._last_event_time = time.monotonic()
             # Fire-and-forget each event so the consumer loop stays unblocked.
             # Handlers that take a long time (LLM calls, docker spawning) won't
             # delay acknowledgement of subsequent events.
             asyncio.create_task(self._handle_and_ack(stream, entry_id, event))
 
     async def _handle_and_ack(self, stream: str, entry_id: str, event: Event) -> None:
+        # Orchestrator can send a targeted shutdown to any ephemeral agent.
+        # Handle it here so subclasses don't need to; ack before stopping.
+        if event.type == EventType.AGENT_SHUTDOWN:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            log.info("agent.shutdown_received", role=self.role)
+            await self.stop(summary="shutdown requested by orchestrator")
+            return
+
         self._active_tasks += 1
         await self._set_status("busy", task=event.payload.get("task", event.type.value)[:80])
         try:

@@ -1998,6 +1998,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             self._plans.pop(plan.task_id, None)
             await self._close_task_context(plan, success=False)
             await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict())
+            await self._shutdown_plan_agents(plan)
         else:
             # Phase succeeded
             next_phase = phase + 1
@@ -2023,6 +2024,26 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 self._plans.pop(plan.task_id, None)
                 await self._close_task_context(plan, success=True)
                 await self.memory.upsert_plan(plan.task_id, plan.plan_id, plan.original_task, "completed", plan.to_dict())
+                await self._shutdown_plan_agents(plan)
+
+    async def _shutdown_plan_agents(self, plan: "ExecutionPlan") -> None:
+        """
+        Send AGENT_SHUTDOWN to each ephemeral agent that participated in this
+        plan.  Each agent will ack the event and cleanly exit, releasing its
+        GPU memory and container resources immediately rather than waiting for
+        the idle timeout.
+        """
+        agents_used = {
+            s.agent for s in plan.steps
+            if s.agent in self._EPHEMERAL_AGENTS
+        }
+        for agent in agents_used:
+            await self.emit(
+                EventType.AGENT_SHUTDOWN,
+                payload={"plan_id": plan.plan_id, "reason": "plan_complete"},
+                target=agent,
+            )
+            log.info("orchestrator.agent_shutdown_sent", agent=agent, plan_id=plan.plan_id[:8])
 
     # ── Context lifecycle ────────────────────────────────────────────────────
 

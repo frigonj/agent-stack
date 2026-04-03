@@ -71,7 +71,7 @@ services:
     volumes:
       - ./agents/orchestrator:/app/agent
       - ./core:/app/core
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro                                              # read-only source visibility
       - ./emrys-src:/workspace/emrys:ro                                 # Emrys library source
@@ -103,6 +103,7 @@ services:
       - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}   # Optional — #claude channel
       - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-} # Optional — #control channel
       - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}         # Optional — #agent-logs channel
+      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}      # Optional — #agent-deliberation channel
       - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
       - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -140,7 +141,7 @@ services:
     volumes:
       - ./agents/document_qa:/app/agent
       - ./core:/app/core
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro                 # full agent-stack source for architecture review
       - ./emrys-src:/workspace/emrys:ro
@@ -176,7 +177,7 @@ services:
     volumes:
       - ./agents/code_search:/app/agent
       - ./core:/app/core
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro
       - ./emrys-src:/workspace/emrys:ro
@@ -202,7 +203,7 @@ services:
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
       - ./agents/claude_code_agent:/app/agent
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - .:/workspace/src                           # read-write: can modify agent source
       - ./emrys-src:/workspace/emrys:ro
       - /var/run/docker.sock:/var/run/docker.sock  # docker commands via run_shell
@@ -258,7 +259,7 @@ services:
     volumes:
       - ./agents/research:/app/agent
       - ./core:/app/core
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src:ro
       - ./emrys-src:/workspace/emrys:ro
@@ -290,7 +291,7 @@ services:
     volumes:
       - ./agents/executor:/app/agent
       - ./core:/app/core
-      - agent_workspace:/workspace
+      - ./workspace:/workspace
       - model_cache:/root/.cache/torch
       - .:/workspace/src                           # read-write: executor can modify agent source files
       - ./emrys-src:/workspace/emrys:ro
@@ -303,5 +304,4 @@ services:
 volumes:
   redis_data:
   postgres_data:
-  agent_workspace:
   model_cache:

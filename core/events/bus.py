@@ -133,6 +133,9 @@ class EventType(str, Enum):
     # Runtime configuration
     CONFIG_UPDATED       = "config.updated"         # agent/orchestrator updated a config value
 
+    # Lifecycle control
+    AGENT_SHUTDOWN    = "agent.shutdown"    # orchestrator tells an ephemeral agent to exit
+
     # System
     HEARTBEAT         = "system.heartbeat"
     ERROR             = "system.error"
