@@ -936,6 +936,19 @@ class BaseAgent(ABC):
         """
         return await self.memory.search_tools(query, limit)
 
+    async def recall_and_search_tools(
+        self, query: str, tools_limit: int = 5, memory_limit: int = 5
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Embed the query once and run memory + tool searches in parallel.
+        Returns (memory_results, tool_results). Prefer this over calling
+        recall() and search_tools() separately to avoid two embedding calls.
+        """
+        memory_results, tool_results = await self.memory.search_memory_and_tools(
+            query, tools_limit=tools_limit, memory_limit=memory_limit
+        )
+        return truncate_memory_entries(memory_results), tool_results
+
     def format_tools_context(self, tools: list[dict]) -> str:
         """
         Format tool search results as a compact prompt section.

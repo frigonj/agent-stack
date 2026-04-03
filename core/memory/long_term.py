@@ -465,6 +465,12 @@ class LongTermMemory:
         [embedding] = await asyncio.to_thread(_embed_texts, [query])
         if embedding is None:
             return await self.recall(query, limit)
+        return await self._vector_search_with_embedding(query, embedding, limit)
+
+    async def _vector_search_with_embedding(
+        self, query: str, embedding: list[float], limit: int = 5
+    ) -> list[dict]:
+        """Semantic search using a pre-computed embedding vector."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
@@ -491,6 +497,32 @@ class LongTermMemory:
             except Exception:
                 log.warning("memory.vector_search_failed", fallback="fts")
         return await self.recall(query, limit)
+
+    async def search_memory_and_tools(
+        self, query: str, tools_limit: int = 5, memory_limit: int = 5
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Embed the query once, then run knowledge search and tool search in
+        parallel. Returns (memory_results, tool_results).
+
+        Use this instead of calling recall() + search_tools() separately to
+        avoid paying the embedding cost twice.
+        """
+        [embedding] = await asyncio.to_thread(_embed_texts, [query])
+        if embedding is not None:
+            memory_task = asyncio.create_task(
+                self._vector_search_with_embedding(query, embedding, memory_limit)
+            )
+            tools_task = asyncio.create_task(
+                self._search_tools_with_embedding(query, embedding, tools_limit)
+            )
+        else:
+            memory_task = asyncio.create_task(self.recall(query, memory_limit))
+            tools_task = asyncio.create_task(
+                self._search_tools_with_embedding(query, None, tools_limit)
+            )
+        memory_results, tool_results = await asyncio.gather(memory_task, tools_task)
+        return memory_results, tool_results
 
     async def count(self) -> int:
         """Return total number of knowledge entries across all agents."""
@@ -773,6 +805,12 @@ class LongTermMemory:
         Returns rows ordered by relevance (most similar first).
         """
         [embedding] = await asyncio.to_thread(_embed_texts, [query])
+        return await self._search_tools_with_embedding(query, embedding, limit)
+
+    async def _search_tools_with_embedding(
+        self, query: str, embedding: list[float] | None, limit: int = 5
+    ) -> list[dict]:
+        """Search tools using a pre-computed embedding vector."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             if embedding is not None:

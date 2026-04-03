@@ -237,8 +237,8 @@ class DocumentQAAgent(BaseAgent):
     # ── Q&A handler (default) ─────────────────────────────────────────────────
 
     async def _handle_qa(self, task: str) -> str:
-        # Check long-term memory first
-        prior = await self.recall(task)
+        # Embed once — check memory and load tools in parallel
+        prior, tool_hits = await self.recall_and_search_tools(task)
         if prior:
             log.info("document_qa.cache_hit", count=len(prior))
             return prior[0]["content"]
@@ -248,7 +248,6 @@ class DocumentQAAgent(BaseAgent):
         if not doc_content:
             return "No documents found in /workspace/docs."
 
-        tool_hits = await self.search_tools(task)
         tools_ctx = self.format_tools_context(tool_hits)
         system_msg = SYSTEM_PROMPT + tools_ctx
         budget = await self._budget_content_chars(system_msg, task)
