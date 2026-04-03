@@ -58,7 +58,7 @@ _SRC_SKIP_DIRS = {
 # Hard cap on source-tree chars loaded for a single review.
 # The real cap is calculated dynamically from the model's context limit in
 # _budget_content_chars(); this is the fallback for very small context windows.
-_SRC_MAX_CHARS = 12_000
+_SRC_MAX_CHARS = 80_000
 
 SYSTEM_PROMPT = """You are a documentation and architecture specialist with LaTeX typesetting skills.
 
@@ -418,10 +418,24 @@ class DocumentQAAgent(BaseAgent):
         """
         Pull a LaTeX document out of *llm_output*, write it to the generated
         directory, and compile it with latexmk. Returns a status suffix.
+        Falls back to writing raw markdown when no LaTeX block is found.
         """
         tex_source = self._extract_latex_block(llm_output)
         if not tex_source:
-            return ""
+            log.warning(
+                "document_qa.no_latex_found",
+                basename=basename,
+                output_preview=llm_output[:200],
+            )
+            # Fallback: write the raw output as a markdown file
+            safe_name = re.sub(r"[^a-z0-9_\-]", "_", basename.lower())[:50]
+            md_path = self.generated_path / f"{safe_name}.md"
+            try:
+                md_path.write_text(llm_output, encoding="utf-8")
+                log.info("document_qa.md_written", path=str(md_path))
+            except Exception as exc:
+                log.warning("document_qa.md_write_error", path=str(md_path), error=str(exc))
+            return f"\n\n[No LaTeX block found — saved as {md_path}]"
 
         # Sanitise basename
         safe_name = re.sub(r"[^a-z0-9_\-]", "_", basename.lower())[:50]

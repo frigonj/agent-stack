@@ -944,7 +944,9 @@ class BaseAgent(ABC):
                 )
                 await self.emit(
                     EventType.ERROR,
-                    payload={"error": f"PostgreSQL unreachable during memory health check: {exc}"},
+                    payload={
+                        "error": f"PostgreSQL unreachable during memory health check: {exc}"
+                    },
                 )
             else:
                 log.warning("agent.memory_health_check_failed", error=str(exc))
