@@ -207,7 +207,7 @@ async def _run_shell(command: str, timeout_seconds: int = 30) -> str:
             return f"Error: command timed out after {timeout_seconds}s"
         output = stdout.decode("utf-8", errors="replace")
         if len(output) > _MAX_SHELL_CHARS:
-            output = output[:_MAX_SHELL_CHARS] + f"\n... (truncated — use tail/grep to see more)"
+            output = output[:_MAX_SHELL_CHARS] + "\n... (truncated — use tail/grep to see more)"
         return output or "(no output)"
     except Exception as e:
         return f"Error: {e}"

@@ -23,7 +23,6 @@ import asyncio
 import json
 import os
 import re
-import time
 import uuid
 from typing import Optional
 from urllib.parse import urlparse
@@ -35,7 +34,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
-from core.context import truncate_task
 
 log = structlog.get_logger()
 
@@ -472,4 +470,4 @@ if __name__ == "__main__":
     import asyncio
     from core.config import Settings
 
-    asyncio.run(run_agent(ResearchAgent, Settings()))
+    asyncio.run(run_agent(ResearchAgent(Settings())))

@@ -5,7 +5,6 @@ Integration tests for Redis Streams event bus.
 Requires Redis running at REDIS_URL (set in env or defaults to localhost:6379).
 """
 
-import asyncio
 import os
 import pytest
 import pytest_asyncio
@@ -68,7 +67,7 @@ async def test_event_serialization_roundtrip(bus):
         task_id="task-123",
     )
 
-    entry_id = await bus.publish(original, target="test_serialize")
+    await bus.publish(original, target="test_serialize")
 
     async for _, eid, evt in bus.consume(
         role="test_serialize",

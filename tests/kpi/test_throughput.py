@@ -26,8 +26,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -238,7 +237,6 @@ async def test_llm_lock_contention_overhead(update_kpi, baseline):
 
     This catches regressions in the lock acquire/release path.
     """
-    import asyncio as _asyncio
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(
@@ -289,8 +287,6 @@ async def test_mock_tps_metric_recorded():
     """
     MOCK_RESPONSE_TOKENS = 50
     MOCK_ELAPSED = 0.5
-    expected_tps = MOCK_RESPONSE_TOKENS / MOCK_ELAPSED   # 100.0
-
     # Build a 50-token string (approx chars//4)
     mock_text = "word " * MOCK_RESPONSE_TOKENS    # ~5 chars/word × 50 = 250 chars → ~62 tokens
     # Use exact count via our helper

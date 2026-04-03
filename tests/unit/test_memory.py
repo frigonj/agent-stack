@@ -5,10 +5,9 @@ Unit tests for LongTermMemory.
 Uses psycopg + psycopg_pool mocking — no live PostgreSQL required.
 """
 
-import json
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.memory.long_term import LongTermMemory
 

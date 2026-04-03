@@ -29,7 +29,7 @@ from langchain_core.messages import AIMessage, HumanMessage as _HumanMessage, Sy
 from langchain_openai import ChatOpenAI
 
 from core.events.bus import Event, EventBus, EventType
-from core.errors import AgentError, error_payload
+from core.errors import AgentError
 from core.memory.long_term import LongTermMemory
 from core.config import Settings
 from core.context import (
@@ -730,10 +730,18 @@ class BaseAgent(ABC):
                 pubsub = self.bus._client.pubsub()
                 await pubsub.subscribe(notify_chan)
                 try:
-                    await pubsub.get_message(
-                        ignore_subscribe_messages=True,
-                        timeout=float(self._LLM_LOCK_TTL),
+                    # get_message() is non-blocking on async redis-py and returns
+                    # None immediately, causing a busy-spin. Use listen() with
+                    # asyncio.wait_for() to actually block until a message arrives.
+                    async def _wait_for_release():
+                        async for msg in pubsub.listen():
+                            if msg["type"] == "message":
+                                return
+                    await asyncio.wait_for(
+                        _wait_for_release(), timeout=float(self._LLM_LOCK_TTL)
                     )
+                except asyncio.TimeoutError:
+                    pass  # Lock TTL expired; retry acquisition
                 finally:
                     await pubsub.unsubscribe(notify_chan)
                     await pubsub.aclose()

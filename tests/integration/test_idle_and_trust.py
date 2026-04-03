@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -95,7 +94,7 @@ async def test_idle_watchdog_fires(monkeypatch):
 
     start = time.monotonic()
     await asyncio.wait_for(agent.start(), timeout=5.0)
-    elapsed = time.monotonic() - start
+    time.monotonic() - start
 
     # Agent should have exited in roughly 1–3 seconds (watchdog checks every 60s
     # normally, but we reduce the check interval for the test by checking the flag)
@@ -234,7 +233,7 @@ async def test_auto_approved_commands_run_without_approval(monkeypatch):
         mock_p.communicate = AsyncMock(return_value=(b"Restarting container\n", b""))
         mock_proc.return_value = mock_p
 
-        result = await agent._run_command(
+        await agent._run_command(
             "docker restart agent_executor", "restart executor", "task-2"
         )
 

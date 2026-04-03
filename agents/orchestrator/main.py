@@ -38,7 +38,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
-from core.context import truncate_task, truncate_context, truncate_result
+from core.context import truncate_task, truncate_context
 
 log = structlog.get_logger()
 
@@ -1798,10 +1798,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # Build a concise, search-engine-friendly query from the error
         # Strip ANSI codes and long tracebacks; keep the last meaningful line
         clean_error = re.sub(r'\x1b\[[0-9;]*m', '', error)
-        error_lines = [l.strip() for l in clean_error.splitlines() if l.strip()]
+        error_lines = [line.strip() for line in clean_error.splitlines() if line.strip()]
         # Prefer lines that look like error messages (contain "Error", "error", "failed", etc.)
         error_hint = next(
-            (l for l in reversed(error_lines) if re.search(r'error|failed|exception|not found|cannot', l, re.I)),
+            (line for line in reversed(error_lines) if re.search(r'error|failed|exception|not found|cannot', line, re.I)),
             error_lines[-1] if error_lines else error[:120],
         )
         query = f"{error_hint[:100]} fix"

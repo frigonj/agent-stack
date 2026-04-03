@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -35,7 +34,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
-from core.context import truncate_task, truncate_file
+from core.context import truncate_task
 
 log = structlog.get_logger()
 

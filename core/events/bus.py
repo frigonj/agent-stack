@@ -29,12 +29,11 @@ update them.  Changes take effect on the next read — no restart needed.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator, Optional
 
@@ -135,6 +134,9 @@ class EventType(str, Enum):
 
     # Lifecycle control
     AGENT_SHUTDOWN    = "agent.shutdown"    # orchestrator tells an ephemeral agent to exit
+
+    # Checkpoint / fork
+    CHECKPOINT_REACHED = "checkpoint.reached"   # agent marks a named task boundary
 
     # System
     HEARTBEAT         = "system.heartbeat"
@@ -279,14 +281,35 @@ class EventBus:
 
         stream_ids = {k: ">" for k in keys}
 
+        _reconnect_delay = 1.0
         while True:
-            results = await self._client.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams=stream_ids,
-                count=count,
-                block=block_ms,
-            )
+            try:
+                results = await self._client.xreadgroup(
+                    groupname=group,
+                    consumername=consumer,
+                    streams=stream_ids,
+                    count=count,
+                    block=block_ms,
+                )
+                _reconnect_delay = 1.0  # reset on success
+            except (aioredis.ConnectionError, aioredis.TimeoutError) as exc:
+                log.warning(
+                    "event_bus.consume_reconnect",
+                    role=role,
+                    error=str(exc),
+                    retry_in=_reconnect_delay,
+                )
+                yield None, None, None  # let caller check _running
+                await asyncio.sleep(_reconnect_delay)
+                _reconnect_delay = min(_reconnect_delay * 2, 30.0)
+                # Re-ensure consumer groups after reconnect
+                for key in keys:
+                    try:
+                        await self._client.xgroup_create(key, group, id="0", mkstream=True)
+                    except aioredis.ResponseError as e:
+                        if "BUSYGROUP" not in str(e):
+                            raise
+                continue
             if not results:
                 # Yield a heartbeat sentinel so the caller can react to stop
                 # signals without waiting for a real event to unblock the loop.
@@ -530,6 +553,71 @@ class EventBus:
         await self._client.set(key, decision, ex=ex)
         await self._client.lpush(notify_key, decision)
         await self._client.expire(notify_key, ex)
+
+    # ── Checkpoint / fork helpers ─────────────────────────────────────────────
+
+    async def copy_context_stream_to(
+        self,
+        source_context_id: str,
+        dest_context_id: str,
+        cutoff_timestamp: float,
+    ) -> int:
+        """
+        Copy events from a source context stream into a destination context stream,
+        stopping at (and including) the last event at or before *cutoff_timestamp*.
+
+        Copied events are written verbatim with an extra payload field
+        ``_copied_from`` so the consuming agent knows they are immutable history
+        and must not be re-executed.
+
+        Returns the number of events copied.
+        """
+        src_meta = await self.get_context_metadata(source_context_id)
+        dst_meta = await self.get_context_metadata(dest_context_id)
+        if not src_meta or not dst_meta:
+            log.warning(
+                "event_bus.copy_stream_missing_context",
+                source=source_context_id,
+                dest=dest_context_id,
+            )
+            return 0
+
+        src_key = src_meta["stream"]
+        dst_key = dst_meta["stream"]
+
+        # Read all entries from the source stream (up to MAX_STREAM_LEN)
+        entries = await self._client.xrange(src_key, min="-", max="+")
+        copied = 0
+        for entry_id, data in entries:
+            event = Event.from_redis(data)
+            if event.timestamp > cutoff_timestamp:
+                break
+            # Mark as copied history so agents skip re-execution
+            payload_with_marker = {**event.payload, "_copied_from": source_context_id}
+            copied_event = Event(
+                type=event.type,
+                source=event.source,
+                payload=payload_with_marker,
+                task_id=event.task_id,
+                event_id=event.event_id,
+                timestamp=event.timestamp,
+            )
+            await self._client.xadd(
+                dst_key,
+                copied_event.to_redis(),
+                maxlen=self.MAX_STREAM_LEN,
+                approximate=True,
+            )
+            copied += 1
+
+        log.info(
+            "event_bus.stream_copied",
+            source=source_context_id,
+            dest=dest_context_id,
+            events_copied=copied,
+            cutoff=cutoff_timestamp,
+        )
+        return copied
 
     # ── Misc helpers ──────────────────────────────────────────────────────────
 

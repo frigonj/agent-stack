@@ -6,7 +6,6 @@ No Redis required — pure logic tests.
 """
 
 import json
-import pytest
 from core.events.bus import Event, EventType
 
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 
 def _make_stub(name: str) -> types.ModuleType:

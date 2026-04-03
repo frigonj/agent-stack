@@ -4,8 +4,6 @@ tests/unit/test_config.py
 Unit tests for Settings — env var loading and defaults.
 """
 
-import os
-import pytest
 from core.config import Settings
 
 
