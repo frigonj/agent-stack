@@ -113,6 +113,7 @@ class BaseAgent(ABC):
         # context_id → asyncio.Task for multi-context consumer pool
         self._context_tasks: dict[str, asyncio.Task] = {}
         self._model_context_limit: Optional[int] = None  # cached from LM Studio
+        self._model_context_limit_ts: float = 0.0  # monotonic time of last fetch
         self._last_event_time: float = time.monotonic()
         # Counts concurrently running event-handler tasks.
         # Status is only set to "idle" when this reaches zero.
@@ -492,6 +493,7 @@ class BaseAgent(ABC):
     _LLM_LOCK_KEY = "llm:lock"
     _LLM_LOCK_TTL = 120  # seconds — auto-releases if agent crashes mid-call
     _LLM_LOCK_POLL = 1.5  # seconds between acquire attempts
+    _MODEL_CTX_CACHE_TTL = 300  # re-fetch context limit after 5 min (model may reload)
 
     async def _get_model_context_limit(self) -> int:
         """
@@ -505,7 +507,10 @@ class BaseAgent(ABC):
 
         Cached after the first successful call.
         """
-        if self._model_context_limit is not None:
+        if (
+            self._model_context_limit is not None
+            and time.monotonic() - self._model_context_limit_ts < self._MODEL_CTX_CACHE_TTL
+        ):
             return self._model_context_limit
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -519,6 +524,7 @@ class BaseAgent(ABC):
                         ctx = m.get("context_window") or m.get("context_length")
                         if ctx:
                             self._model_context_limit = int(ctx)
+                            self._model_context_limit_ts = time.monotonic()
                             log.info(
                                 "agent.model_context_limit",
                                 role=self.role,
@@ -539,6 +545,7 @@ class BaseAgent(ABC):
                     ctx = m.get("context_length") or m.get("max_context_length")
                     if ctx:
                         self._model_context_limit = int(ctx)
+                        self._model_context_limit_ts = time.monotonic()
                         log.info(
                             "agent.model_context_limit",
                             role=self.role,
@@ -550,6 +557,7 @@ class BaseAgent(ABC):
             log.warning("agent.context_limit_fetch_failed", error=str(exc))
         # Conservative fallback: 4096 tokens
         self._model_context_limit = 4096
+        self._model_context_limit_ts = time.monotonic()
         return self._model_context_limit
 
     # ── Circuit breaker constants ────────────────────────────────────────────
@@ -836,6 +844,21 @@ class BaseAgent(ABC):
             self._circuit_open = False
             return result
         except Exception as exc:
+            # If LM Studio reports a context overflow, extract the actual n_ctx
+            # and update our cached limit so the next call truncates correctly.
+            err_str = str(exc)
+            _ctx_match = re.search(r"n_ctx:\s*(\d+)", err_str)
+            if _ctx_match:
+                actual_ctx = int(_ctx_match.group(1))
+                if actual_ctx != self._model_context_limit:
+                    log.warning(
+                        "agent.context_limit_corrected",
+                        role=self.role,
+                        was=self._model_context_limit,
+                        now=actual_ctx,
+                    )
+                    self._model_context_limit = actual_ctx
+                    self._model_context_limit_ts = time.monotonic()
             # Track failures for circuit breaker
             self._circuit_failures += 1
             if self._circuit_failures >= self.CIRCUIT_THRESHOLD:
