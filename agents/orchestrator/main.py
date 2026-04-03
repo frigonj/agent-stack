@@ -69,6 +69,7 @@ WATCHED_PATHS: list[str] = [
     "/workspace/src/agents/research/main.py",
     "/workspace/src/agents/discord_bridge/main.py",
     "/workspace/src/agents/claude_code_agent/main.py",
+    "/workspace/src/agents/optimizer/main.py",
     "/workspace/src/docker/agent.Dockerfile",
     "/workspace/src/docker/document_qa.Dockerfile",
     "/workspace/src/docker/claude_code.Dockerfile",
@@ -197,6 +198,16 @@ _KEYWORD_ROUTES: list[tuple[re.Pattern, str]] = [
         "research",
     ),
     (re.compile(r"\bwhat (is|are|was|were) .{3,60}\??\s*$", re.I), "research"),
+    # Optimizer — perf testing and improvement suggestions
+    (
+        re.compile(
+            r"\b(optimi[sz]e|optimis|perf(ormance)?[\s-]test|benchmark|profil[ei]|"
+            r"run perf|perf suite|suggesti?on.{0,20}(improv|faster|slow)|"
+            r"what.{0,20}slow|why.{0,20}slow|speed up|bottleneck)\b",
+            re.I,
+        ),
+        "optimizer",
+    ),
     # Direct — never reached; kept as fallback sentinel only
     # Conversational classification is handled by _classify_intent() before routing.
 ]
@@ -706,20 +717,29 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await self._seed_intent_examples()
         await self._check_version_reset()
         # Warn about any plans that were in-flight when the process last exited
-        interrupted = await self.memory.load_active_plans()
-        if interrupted:
-            log.warning(
-                "orchestrator.interrupted_plans_found",
-                count=len(interrupted),
-                tasks=[r["original_task"][:60] for r in interrupted],
-            )
-            for row in interrupted:
-                await self.memory.upsert_plan(
-                    row["task_id"],
-                    row["plan_id"],
-                    row["original_task"],
-                    "interrupted",
-                    row["plan_json"],
+        loaded_plans = await self.memory.load_active_plans()
+        if loaded_plans:
+            interrupted = [r for r in loaded_plans if r["status"] != "paused"]
+            paused = [r for r in loaded_plans if r["status"] == "paused"]
+            if interrupted:
+                log.warning(
+                    "orchestrator.interrupted_plans_found",
+                    count=len(interrupted),
+                    tasks=[r["original_task"][:60] for r in interrupted],
+                )
+                for row in interrupted:
+                    await self.memory.upsert_plan(
+                        row["task_id"],
+                        row["plan_id"],
+                        row["original_task"],
+                        "interrupted",
+                        row["plan_json"],
+                    )
+            if paused:
+                log.info(
+                    "orchestrator.paused_plans_found",
+                    count=len(paused),
+                    tasks=[r["original_task"][:60] for r in paused],
                 )
 
     # ── Event dispatch ───────────────────────────────────────────────────────
@@ -729,6 +749,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_task(event)
         elif event.type == EventType.TASK_COMPLETED:
             await self._handle_result(event)
+        elif event.type == EventType.TASK_PAUSED:
+            await self._handle_task_paused(event)
+        elif event.type == EventType.TASK_RESUMED:
+            await self._handle_task_resumed(event)
         elif event.type == EventType.DISCORD_ACTION_DONE:
             await self._handle_discord_done(event)
         elif event.type == EventType.AGENT_VOTE:
@@ -980,6 +1004,114 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             response.content, task_id, discord_message_id, original_task=task
         )
         log.info("orchestrator.clarify_asked", task=task[:60])
+
+    # ── Pause / resume ────────────────────────────────────────────────────────
+
+    async def _handle_task_paused(self, event: Event) -> None:
+        """
+        Research agent finished its current iteration and stopped the loop.
+        Freeze the plan in DB and remove it from the in-memory dispatch table
+        so no new phases are started.
+        """
+        task_id = event.payload.get("task_id") or event.task_id
+        plan = self._plans.pop(task_id, None)
+        if plan is None:
+            log.warning("orchestrator.pause_unknown_plan", task_id=task_id)
+            return
+
+        current_phase = plan.current_phase()
+        plan_dict = plan.to_dict()
+        plan_dict["paused_at_phase"] = current_phase
+
+        await self.memory.upsert_plan(
+            task_id, plan.plan_id, plan.original_task, "paused", plan_dict
+        )
+        await self._emit_plan_status(
+            plan,
+            f"⏸ Research paused after iteration "
+            f"{event.payload.get('paused_at_iteration', '?')} "
+            f"({event.payload.get('facts_staged', 0)} facts staged). "
+            f"Use `/resume {task_id}` to continue.",
+        )
+        log.info(
+            "orchestrator.plan_paused",
+            task_id=task_id,
+            phase=current_phase,
+            facts=event.payload.get("facts_staged", 0),
+        )
+
+    async def _handle_task_resumed(self, event: Event) -> None:
+        """
+        User requested continuation of a paused plan.
+        Reload plan from DB and re-dispatch the current phase.
+        """
+        task_id = event.payload.get("task_id") or event.task_id
+        if not task_id:
+            log.warning("orchestrator.resume_missing_task_id")
+            return
+
+        # Load from DB
+        pool = await self.memory._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT task_id, plan_id, original_task, status, plan_json "
+                "FROM active_plans WHERE task_id = %s AND status = 'paused'",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+
+        if not row:
+            log.warning("orchestrator.resume_plan_not_found", task_id=task_id)
+            return
+
+        _tid, plan_id, original_task, _status, plan_json = row
+        if isinstance(plan_json, str):
+            plan_json = json.loads(plan_json)
+
+        paused_at_phase = plan_json.get("paused_at_phase", 1)
+
+        # Rebuild ExecutionPlan in memory
+        steps = [
+            PlanStep(
+                step_id=s["step_id"],
+                phase=s["phase"],
+                task=s["task"],
+                agent=s["agent"],
+                expected=s.get("expected", ""),
+                status=s.get("status", "pending"),
+                result=s.get("result", ""),
+            )
+            for s in plan_json.get("steps", [])
+        ]
+        plan = ExecutionPlan(
+            plan_id=plan_id,
+            task_id=task_id,
+            original_task=original_task,
+            steps=steps,
+            discord_message_id=plan_json.get("discord_message_id"),
+            context=plan_json.get("context", ""),
+            context_id=task_id,
+        )
+        plan.current_phase = paused_at_phase
+
+        # Reset steps in the paused phase back to pending so _dispatch_phase
+        # picks them up again (they were left as "running" when the agent stopped).
+        for s in plan.steps:
+            if s.phase == paused_at_phase and s.status == "running":
+                s.status = "pending"
+
+        self._plans[task_id] = plan
+        await self.memory.upsert_plan(
+            task_id, plan_id, original_task, "running", plan.to_dict()
+        )
+        await self._emit_plan_status(
+            plan,
+            f"▶ Resuming from phase {paused_at_phase}…",
+        )
+        log.info(
+            "orchestrator.plan_resumed", task_id=task_id, phase=paused_at_phase
+        )
+        await self._dispatch_phase(plan, paused_at_phase)
 
     # ── Session reset ─────────────────────────────────────────────────────────
 

@@ -228,12 +228,32 @@ class ResearchAgent(BaseAgent):
 
     async def _research(self, question: str, task_id: str) -> str:
         """
-        Full staged evidence loop.
-        Returns the synthesised answer as a string.
+        Full staged evidence loop with Postgres checkpointing.
+
+        On first run: decomposes question, iterates, saves facts to Postgres
+        after each iteration, snapshots checkpoint, checks for pause signal.
+        On resume: reloads staged facts from Postgres, continues from iteration N+1.
+        Returns the synthesised answer as a string, or a pause notice if paused.
         """
         query_id = task_id
 
-        # Create a context stream for this research session
+        # ── Resume check: reload any previously staged facts ──────────────────
+        prior_facts = await self.memory.load_research_staging(task_id)
+        if prior_facts:
+            resume_iter = max(f.get("_iteration", 1) for f in prior_facts)
+            all_facts: list[dict] = [{k: v for k, v in f.items() if k != "_iteration"} for f in prior_facts]
+            start_iteration = resume_iter + 1
+            log.info(
+                "research.resuming",
+                task_id=task_id,
+                facts_loaded=len(all_facts),
+                resuming_from_iteration=start_iteration,
+            )
+        else:
+            all_facts = []
+            start_iteration = 1
+
+        # Create (or rejoin) context stream for this research session
         await self.bus.create_context_stream(
             "research",
             query_id,
@@ -241,15 +261,19 @@ class ResearchAgent(BaseAgent):
             metadata={"status": "active", "question": question},
         )
 
-        staging_key = f"research:staging:{query_id}"
-        all_facts: list[dict] = []  # {fact, domain, url, confidence}
-
         async with httpx.AsyncClient() as http:
-            # ── Step 1: initial sub-query decomposition ────────────────────────
-            sub_queries = await self._decompose(question)
-            log.info("research.sub_queries", queries=sub_queries)
+            # ── Step 1: initial sub-query decomposition (skip on resume) ──────
+            if start_iteration == 1:
+                sub_queries = await self._decompose(question)
+                log.info("research.sub_queries", queries=sub_queries)
+            else:
+                # Re-derive follow-up queries from what we already know
+                confident_so_far = _compute_confidence(all_facts)
+                sub_queries = await self._find_gaps(question, confident_so_far, start_iteration - 1)
+                if not sub_queries:
+                    sub_queries = [question]
 
-            for iteration in range(1, MAX_SEARCH_ITERATIONS + 1):
+            for iteration in range(start_iteration, MAX_SEARCH_ITERATIONS + 1):
                 log.info(
                     "research.iteration_start",
                     iteration=iteration,
@@ -301,15 +325,6 @@ class ResearchAgent(BaseAgent):
                             }
                         )
 
-                # Store new facts in Redis staging hash
-                if new_facts:
-                    pipe = self.bus._client.pipeline()
-                    for i, f in enumerate(new_facts):
-                        key = f"{len(all_facts) + i}"
-                        pipe.hset(staging_key, key, json.dumps(f))
-                    pipe.expire(staging_key, 3600)  # TTL 1 h
-                    await pipe.execute()
-
                 all_facts.extend(new_facts)
                 log.info(
                     "research.facts_accumulated",
@@ -317,6 +332,47 @@ class ResearchAgent(BaseAgent):
                     new=len(new_facts),
                     iteration=iteration,
                 )
+
+                # ── Checkpoint: persist to Postgres after each iteration ───────
+                if new_facts:
+                    stamped = [{**f, "_iteration": iteration} for f in new_facts]
+                    await self.memory.save_research_staging(task_id, iteration, stamped)
+
+                await self.memory.save_context_snapshot(
+                    task_id,
+                    "research",
+                    question[:60],
+                    checkpoint_label=f"iteration_{iteration}",
+                    snapshot_seq=iteration,
+                    snapshot_json={
+                        "iteration": iteration,
+                        "total_facts": len(all_facts),
+                        "question": question[:200],
+                    },
+                )
+
+                # ── Pause signal check ─────────────────────────────────────────
+                pause_key = f"research:pause:{task_id}"
+                if await self.bus._client.getdel(pause_key):
+                    log.info("research.paused", task_id=task_id, iteration=iteration)
+                    await self.bus.publish(
+                        Event(
+                            type=EventType.TASK_PAUSED,
+                            source=self.role,
+                            payload={
+                                "task_id": task_id,
+                                "paused_at_iteration": iteration,
+                                "facts_staged": len(all_facts),
+                            },
+                            task_id=task_id,
+                        ),
+                        target="orchestrator",
+                    )
+                    return (
+                        f"Research paused after iteration {iteration} "
+                        f"({len(all_facts)} facts staged). "
+                        f"Use /resume {task_id} to continue."
+                    )
 
                 # ── Consensus check ────────────────────────────────────────────
                 confident = _compute_confidence(all_facts)
@@ -331,11 +387,9 @@ class ResearchAgent(BaseAgent):
         confident_facts = _compute_confidence(all_facts)
         answer = await self._synthesise(question, confident_facts)
 
-        # ── Commit to Postgres ────────────────────────────────────────────────
+        # ── Commit to Postgres + clean up staging ─────────────────────────────
         await self._commit_sources(query_id, question, confident_facts)
-
-        # Clean up staging hash
-        await self.bus._client.delete(staging_key)
+        await self.memory.delete_research_staging(task_id)
 
         return answer
 

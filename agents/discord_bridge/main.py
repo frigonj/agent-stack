@@ -137,7 +137,9 @@ _CONTROL_HELP = (
     "`build docs` — force a full architecture document rebuild now\n"
     "`verbose on` — forward all Redis events to #agent-logs\n"
     "`verbose off` — return to normal (only high-level events)\n"
-    "`reset session` — clear orchestrator conversation history and reload intents\n\n"
+    "`reset session` — clear orchestrator conversation history and reload intents\n"
+    "`pause <task_id>` — pause a running research task after its current iteration\n"
+    "`resume <task_id>` — resume a paused research task from its last checkpoint\n\n"
     f"Services: {', '.join(sorted(_KNOWN_SERVICES))}"
 )
 
@@ -716,6 +718,50 @@ class DiscordBridgeClient(discord.Client):
                 "and reload intent examples."
             )
             log.info("discord_bridge.session_reset_sent")
+            return
+
+        # pause <task_id>
+        if len(parts) == 2 and parts[0] == "pause":
+            task_id = parts[1]
+            pause_key = f"research:pause:{task_id}"
+            await self.redis.set(pause_key, "1", ex=3600)
+            await self.redis.xadd(
+                "agents:broadcast",
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "type": "task.paused",
+                    "source": "discord_control",
+                    "task_id": task_id,
+                    "timestamp": str(time.time()),
+                    "payload": json.dumps({"task_id": task_id}),
+                },
+            )
+            await message.reply(
+                f"⏸ Pause signal sent for task `{task_id}`. "
+                "The research agent will stop after the current iteration completes."
+            )
+            log.info("discord_bridge.task_pause_requested", task_id=task_id)
+            return
+
+        # resume <task_id>
+        if len(parts) == 2 and parts[0] == "resume":
+            task_id = parts[1]
+            await self.redis.xadd(
+                "agents:orchestrator",
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "type": "task.resumed",
+                    "source": "discord_control",
+                    "task_id": task_id,
+                    "timestamp": str(time.time()),
+                    "payload": json.dumps({"task_id": task_id}),
+                },
+            )
+            await message.reply(
+                f"▶ Resume signal sent for task `{task_id}`. "
+                "The orchestrator will reload the plan and continue from the last checkpoint."
+            )
+            log.info("discord_bridge.task_resume_requested", task_id=task_id)
             return
 
         # unrecognised

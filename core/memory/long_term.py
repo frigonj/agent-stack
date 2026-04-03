@@ -259,6 +259,23 @@ _SCHEMA = [
     CREATE INDEX IF NOT EXISTS idx_research_sources_fts ON research_sources
         USING GIN(to_tsvector('english', query_text || ' ' || fact || ' ' || snippet))
     """,
+    # ── Research staging ──────────────────────────────────────────────────
+    # Intermediate facts accumulated during a pauseable research loop.
+    # Survives process restarts and explicit pauses; deleted on final commit.
+    """
+    CREATE TABLE IF NOT EXISTS research_staging (
+        task_id    TEXT NOT NULL,
+        iteration  INT  NOT NULL,
+        fact_json  JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (task_id, iteration, (fact_json->>'url'), (fact_json->>'fact'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_research_staging_task ON research_staging(task_id, iteration)",
+    # ── active_plans additions ─────────────────────────────────────────────
+    # paused status is enforced at application level; column additions are
+    # safe to re-run (IF NOT EXISTS / IF NOT EXISTS equivalent via ADD COLUMN IF NOT EXISTS).
+    "ALTER TABLE active_plans ADD COLUMN IF NOT EXISTS paused_at_phase INT DEFAULT NULL",
 ]
 
 
@@ -589,13 +606,15 @@ class LongTermMemory:
         log.debug("memory.plan_upserted", task_id=task_id, status=status)
 
     async def load_active_plans(self) -> list[dict]:
-        """Return all plans that were still running when the process last exited."""
+        """Return all plans that were still running when the process last exited.
+        Paused plans are included so they survive restarts, but the orchestrator
+        will NOT auto-resume them — the user must send /resume explicitly."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute("""
                 SELECT task_id, plan_id, original_task, status, plan_json, created_at, updated_at
                 FROM active_plans
-                WHERE status IN ('planning', 'running')
+                WHERE status IN ('planning', 'running', 'paused')
                 ORDER BY created_at ASC
             """)
             rows = await cur.fetchall()
@@ -615,6 +634,53 @@ class LongTermMemory:
         if deleted:
             log.info("memory.plans_expired", deleted=deleted)
         return deleted
+
+    # ── Research staging helpers ──────────────────────────────────────────────
+
+    async def save_research_staging(
+        self, task_id: str, iteration: int, facts: list[dict]
+    ) -> None:
+        """Persist a batch of staging facts for a pauseable research task."""
+        if not facts:
+            return
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            for f in facts:
+                await conn.execute(
+                    """
+                    INSERT INTO research_staging (task_id, iteration, fact_json)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (task_id, iteration, json.dumps(f)),
+                )
+            await conn.commit()
+        log.debug("memory.research_staging_saved", task_id=task_id, iteration=iteration, count=len(facts))
+
+    async def load_research_staging(self, task_id: str) -> list[dict]:
+        """Return all staged facts for a task, ordered by iteration."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT fact_json FROM research_staging
+                WHERE task_id = %s
+                ORDER BY iteration ASC, created_at ASC
+                """,
+                (task_id,),
+            )
+            rows = await cur.fetchall()
+        return [r[0] if isinstance(r[0], dict) else json.loads(r[0]) for r in rows]
+
+    async def delete_research_staging(self, task_id: str) -> None:
+        """Remove all staging rows for a task (called after final commit)."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "DELETE FROM research_staging WHERE task_id = %s", (task_id,)
+            )
+            await conn.commit()
+        log.debug("memory.research_staging_deleted", task_id=task_id)
 
     async def cleanup_stale(self, max_age_hours: int = 24) -> dict:
         """

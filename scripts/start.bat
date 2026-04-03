@@ -2,9 +2,11 @@
 :: scripts/start.bat
 :: ─────────────────
 :: Usage:
-::   start.bat          — start the full agent stack
-::   start.bat status   — show running containers + agent task/queue status
-::   start.bat stop     — stop all containers (docker compose down)
+::   start.bat                      — start the full agent stack
+::   start.bat status               — show running containers + agent task/queue status
+::   start.bat stop                 — stop all containers (docker compose down)
+::   start.bat pause  <task_id>     — pause a running research task after its current iteration
+::   start.bat resume <task_id>     — resume a paused research task from its last checkpoint
 ::
 :: Ephemeral agents (executor, code_search, document_qa, claude_code_agent,
 :: research) are started automatically by the orchestrator when a task needs
@@ -18,6 +20,8 @@ set "REPO_ROOT=%SCRIPT_DIR%.."
 :: ── Subcommand dispatch ───────────────────────────────────────────────────────
 if /i "%~1"=="status" goto :status
 if /i "%~1"=="stop"   goto :stop
+if /i "%~1"=="pause"  goto :pause
+if /i "%~1"=="resume" goto :resume
 
 :: ── START ─────────────────────────────────────────────────────────────────────
 
@@ -103,6 +107,49 @@ goto :eof
 :status_unavail
 echo   (Redis not reachable — is the stack running? Run: start.bat)
 echo.
+goto :eof
+
+:: ── PAUSE ─────────────────────────────────────────────────────────────────────
+:pause
+if "%~2"=="" (
+    echo Usage: start.bat pause ^<task_id^>
+    goto :eof
+)
+set "TASK_ID=%~2"
+cd /d "%REPO_ROOT%"
+echo Sending pause signal for task %TASK_ID%...
+docker compose exec -T redis redis-cli --no-auth-warning SET "research:pause:%TASK_ID%" 1 EX 3600 >nul
+if %ERRORLEVEL%==0 (
+    echo   Pause signal set. The research agent will stop after its current iteration.
+    echo   Use:  start.bat resume %TASK_ID%
+) else (
+    echo   Failed to reach Redis. Is the stack running?
+)
+goto :eof
+
+:: ── RESUME ────────────────────────────────────────────────────────────────────
+:resume
+if "%~2"=="" (
+    echo Usage: start.bat resume ^<task_id^>
+    goto :eof
+)
+set "TASK_ID=%~2"
+cd /d "%REPO_ROOT%"
+echo Sending resume signal for task %TASK_ID%...
+for /f "delims=" %%E in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString()"') do set "EVT_ID=%%E"
+for /f "delims=" %%T in ('powershell -NoProfile -Command "[Math]::Round((Get-Date -UFormat %%s))"') do set "NOW=%%T"
+docker compose exec -T redis redis-cli --no-auth-warning XADD agents:orchestrator "*" ^
+    event_id "%EVT_ID%" ^
+    type "task.resumed" ^
+    source "control_script" ^
+    task_id "%TASK_ID%" ^
+    timestamp "%NOW%" ^
+    payload "{\"task_id\":\"%TASK_ID%\"}" >nul
+if %ERRORLEVEL%==0 (
+    echo   Resume event published. The orchestrator will reload and continue the plan.
+) else (
+    echo   Failed to reach Redis. Is the stack running?
+)
 goto :eof
 
 :: ── STOP ──────────────────────────────────────────────────────────────────────

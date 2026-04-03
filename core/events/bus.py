@@ -122,6 +122,10 @@ class EventType(str, Enum):
         "vote.extension_requested"  # agent needs more deliberation time
     )
 
+    # Pause / resume lifecycle
+    TASK_PAUSED = "task.paused"    # research agent finished current iteration, loop stopped
+    TASK_RESUMED = "task.resumed"  # user requested continuation from last checkpoint
+
     # Context stream lifecycle
     CONTEXT_CREATED = (
         "context.created"  # orchestrator announces new named context stream
