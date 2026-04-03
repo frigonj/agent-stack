@@ -135,6 +135,7 @@ services:
       - DOCS_PATH=/workspace/docs
       - REPO_PATH=/workspace/src            # agent-stack source (read-only)
       - GENERATED_PATH=/workspace/docs/generated
+      - HF_TOKEN=${HF_TOKEN:-}
       # Google Drive sync (optional) — leave blank to disable
       - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID:-}
       - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/google_sa.json
@@ -172,6 +173,7 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=code_search
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
       - REPO_PATH=/workspace/repos
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
@@ -254,6 +256,7 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=research
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
       - SEARXNG_URL=http://searxng:8080
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
@@ -287,6 +290,7 @@ services:
       - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
       - AGENT_ROLE=executor
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_TOKEN=${HF_TOKEN:-}
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
       - ./agents/executor:/app/agent

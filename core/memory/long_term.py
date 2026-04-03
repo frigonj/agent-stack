@@ -210,6 +210,9 @@ _SCHEMA = [
     CREATE INDEX IF NOT EXISTS idx_ctx_snapshots_fts ON context_snapshots
         USING GIN(to_tsvector('english', name || ' ' || COALESCE(summary, '') || ' ' || COALESCE(topic_category, '')))
     """,
+    # checkpoint_label column — added after initial schema; safe to re-run
+    "ALTER TABLE context_snapshots ADD COLUMN IF NOT EXISTS checkpoint_label TEXT DEFAULT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_ctx_snapshots_checkpoint ON context_snapshots(context_id, checkpoint_label) WHERE checkpoint_label IS NOT NULL",
     # ── Topic patterns ────────────────────────────────────────────────────
     # Agent-learned keyword→category mappings that grow over sessions.
     # Confidence rises as more sessions confirm the pattern.
@@ -393,20 +396,21 @@ class LongTermMemory:
         embeddings = await asyncio.to_thread(_embed_texts, texts)
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            await conn.executemany("""
-                INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, [
-                (
-                    self._agent,
-                    e.get("topic", "general"),
-                    e.get("topic", "general"),
-                    e.get("content", ""),
-                    json.dumps(e.get("tags") or []),
-                    embeddings[i],
-                )
-                for i, e in enumerate(entries)
-            ])
+            async with conn.cursor() as cur:
+                await cur.executemany("""
+                    INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, [
+                    (
+                        self._agent,
+                        e.get("topic", "general"),
+                        e.get("topic", "general"),
+                        e.get("content", ""),
+                        json.dumps(e.get("tags") or []),
+                        embeddings[i],
+                    )
+                    for i, e in enumerate(entries)
+                ])
         log.info("memory.batch_promoted", count=len(entries))
         return {"status": "stored", "count": len(entries)}
 
@@ -848,10 +852,14 @@ class LongTermMemory:
         message_count: int = 0,
         status: str = "active",
         snapshot_seq: int = 0,
+        checkpoint_label: Optional[str] = None,
     ) -> None:
         """
         Create or update a context snapshot.  snapshot_seq=0 is the live row;
         call with a higher seq to save a rolling checkpoint.
+
+        Pass *checkpoint_label* to mark this snapshot as a named task boundary
+        that can later be used as a fork / step-off point.
         """
         embed_text = f"{name} {summary or ''} {topic_category or ''}"
         [embedding] = await asyncio.to_thread(_embed_texts, [embed_text])
@@ -862,28 +870,34 @@ class LongTermMemory:
                 INSERT INTO context_snapshots
                     (context_id, snapshot_seq, context_type, name, status,
                      topic_category, keywords, summary, snapshot_json,
-                     value_score, message_count, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     value_score, message_count, embedding, checkpoint_label)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (context_id, snapshot_seq) DO UPDATE SET
-                    name           = EXCLUDED.name,
-                    status         = EXCLUDED.status,
-                    topic_category = EXCLUDED.topic_category,
-                    keywords       = EXCLUDED.keywords,
-                    summary        = EXCLUDED.summary,
-                    snapshot_json  = EXCLUDED.snapshot_json,
-                    value_score    = EXCLUDED.value_score,
-                    message_count  = EXCLUDED.message_count,
-                    embedding      = EXCLUDED.embedding,
-                    updated_at     = NOW()
+                    name             = EXCLUDED.name,
+                    status           = EXCLUDED.status,
+                    topic_category   = EXCLUDED.topic_category,
+                    keywords         = EXCLUDED.keywords,
+                    summary          = EXCLUDED.summary,
+                    snapshot_json    = EXCLUDED.snapshot_json,
+                    value_score      = EXCLUDED.value_score,
+                    message_count    = EXCLUDED.message_count,
+                    embedding        = EXCLUDED.embedding,
+                    checkpoint_label = EXCLUDED.checkpoint_label,
+                    updated_at       = NOW()
                 """,
                 (
                     context_id, snapshot_seq, context_type, name, status,
                     topic_category, json.dumps(keywords or []),
                     summary, json.dumps(snapshot_json or {}),
-                    value_score, message_count, embedding,
+                    value_score, message_count, embedding, checkpoint_label,
                 ),
             )
-        log.debug("memory.context_snapshot_saved", context_id=context_id, seq=snapshot_seq)
+        log.debug(
+            "memory.context_snapshot_saved",
+            context_id=context_id,
+            seq=snapshot_seq,
+            checkpoint_label=checkpoint_label,
+        )
 
     async def close_context_snapshot(
         self,
@@ -1028,6 +1042,180 @@ class LongTermMemory:
                 )
             rows = await cur.fetchall()
         return list(rows)
+
+    async def save_named_checkpoint(
+        self,
+        context_id: str,
+        label: str,
+        snapshot_json: dict,
+        *,
+        summary: Optional[str] = None,
+        message_count: int = 0,
+    ) -> int:
+        """
+        Write a named checkpoint snapshot for *context_id*.
+
+        Reads the live row (seq=0) for metadata, allocates the next seq, and
+        writes a new snapshot row tagged with *label*.  The label is the
+        agent-meaningful task-boundary name (e.g. ``"plan_approved"``,
+        ``"step_2_complete"``).
+
+        Returns the snapshot_seq that was assigned.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT MAX(snapshot_seq) AS mx FROM context_snapshots WHERE context_id = %s",
+                (context_id,),
+            )
+            row = await cur.fetchone()
+            next_seq = (row["mx"] or 0) + 1
+
+            cur = await conn.execute(
+                "SELECT context_type, name, topic_category, keywords, embedding "
+                "FROM context_snapshots WHERE context_id = %s AND snapshot_seq = 0",
+                (context_id,),
+            )
+            live = await cur.fetchone()
+            if not live:
+                log.warning("memory.checkpoint_no_live_row", context_id=context_id, label=label)
+                return 0
+
+            await conn.execute(
+                """
+                INSERT INTO context_snapshots
+                    (context_id, snapshot_seq, context_type, name, status,
+                     topic_category, keywords, summary, snapshot_json,
+                     message_count, embedding, checkpoint_label)
+                VALUES (%s, %s, %s, %s, 'checkpoint', %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    context_id, next_seq,
+                    live["context_type"], live["name"],
+                    live["topic_category"], live["keywords"],
+                    summary, json.dumps(snapshot_json),
+                    message_count, live["embedding"], label,
+                ),
+            )
+        log.info(
+            "memory.named_checkpoint_saved",
+            context_id=context_id,
+            seq=next_seq,
+            label=label,
+        )
+        return next_seq
+
+    async def get_latest_named_checkpoint(
+        self,
+        context_id: str,
+        label: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Return the most recent named checkpoint for *context_id*.
+
+        If *label* is provided, return the latest checkpoint with that exact label.
+        Otherwise return the latest checkpoint regardless of label.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            if label:
+                cur = await conn.execute(
+                    """
+                    SELECT context_id, snapshot_seq, context_type, name, summary,
+                           snapshot_json, message_count, checkpoint_label, updated_at
+                    FROM context_snapshots
+                    WHERE context_id = %s AND checkpoint_label = %s
+                    ORDER BY snapshot_seq DESC
+                    LIMIT 1
+                    """,
+                    (context_id, label),
+                )
+            else:
+                cur = await conn.execute(
+                    """
+                    SELECT context_id, snapshot_seq, context_type, name, summary,
+                           snapshot_json, message_count, checkpoint_label, updated_at
+                    FROM context_snapshots
+                    WHERE context_id = %s AND checkpoint_label IS NOT NULL
+                    ORDER BY snapshot_seq DESC
+                    LIMIT 1
+                    """,
+                    (context_id,),
+                )
+            return await cur.fetchone()
+
+    async def fork_from_checkpoint(
+        self,
+        source_context_id: str,
+        new_context_id: str,
+        new_context_name: str,
+        *,
+        label: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Create a new context snapshot row pre-populated from the latest named
+        checkpoint of *source_context_id*.
+
+        The new row (seq=0) carries:
+        - ``forked_from_context_id`` and ``forked_from_seq`` in snapshot_json
+          so the agent knows its provenance
+        - ``checkpoint_label`` cleared (the fork is a fresh live row)
+
+        Returns the checkpoint row that was used as the step-off point,
+        or None if no matching checkpoint exists.
+        """
+        checkpoint = await self.get_latest_named_checkpoint(source_context_id, label=label)
+        if not checkpoint:
+            log.warning(
+                "memory.fork_no_checkpoint",
+                source=source_context_id,
+                label=label,
+            )
+            return None
+
+        fork_json = {
+            **(json.loads(checkpoint["snapshot_json"]) if isinstance(checkpoint["snapshot_json"], str)
+               else (checkpoint["snapshot_json"] or {})),
+            "forked_from_context_id": source_context_id,
+            "forked_from_seq":        checkpoint["snapshot_seq"],
+            "forked_from_label":      checkpoint["checkpoint_label"],
+        }
+
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO context_snapshots
+                    (context_id, snapshot_seq, context_type, name, status,
+                     summary, snapshot_json, message_count, checkpoint_label)
+                VALUES (%s, 0, %s, %s, 'active', %s, %s, %s, NULL)
+                ON CONFLICT (context_id, snapshot_seq) DO UPDATE SET
+                    context_type  = EXCLUDED.context_type,
+                    name          = EXCLUDED.name,
+                    status        = 'active',
+                    summary       = EXCLUDED.summary,
+                    snapshot_json = EXCLUDED.snapshot_json,
+                    message_count = EXCLUDED.message_count,
+                    checkpoint_label = NULL,
+                    updated_at    = NOW()
+                """,
+                (
+                    new_context_id,
+                    checkpoint["context_type"],
+                    new_context_name,
+                    checkpoint["summary"],
+                    json.dumps(fork_json),
+                    checkpoint["message_count"],
+                ),
+            )
+        log.info(
+            "memory.context_forked",
+            source=source_context_id,
+            dest=new_context_id,
+            step_off_seq=checkpoint["snapshot_seq"],
+            step_off_label=checkpoint["checkpoint_label"],
+        )
+        return dict(checkpoint)
 
     async def get_closed_session_count(self) -> int:
         """Total number of closed contexts — used to decide when to start asking users for topic labels."""

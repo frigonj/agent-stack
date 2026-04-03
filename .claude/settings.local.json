@@ -7,7 +7,29 @@
       "Bash(docker --version)",
       "Bash(wsl -- which docker)",
       "Bash(wsl -- docker --version)",
-      "Bash(wsl -- docker ps)"
+      "Bash(wsl -- docker ps)",
+      "WebFetch(domain:lmstudio.ai)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(find 'c:\\\\Users\\\\frigo\\\\Documents\\\\Coding Projects\\\\agent-stack\\\\agents\\\\claude_code_agent' -type f -name *.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''agents/orchestrator/main.py''\\).read\\(\\)\\); print\\(''orchestrator OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''core/events/bus.py''\\).read\\(\\)\\); print\\(''bus OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''core/base_agent.py''\\).read\\(\\)\\); print\\(''base_agent OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''core/memory/long_term.py''\\).read\\(\\)\\); print\\(''long_term OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''agents/discord_bridge/main.py''\\).read\\(\\)\\); print\\(''discord_bridge OK''\\)\")",
+      "Bash(where py:*)",
+      "Bash(where python3.exe)",
+      "Bash(py -3 -c \"import ast; files = [''agents/orchestrator/main.py'',''core/events/bus.py'',''core/base_agent.py'',''core/memory/long_term.py'',''agents/discord_bridge/main.py'']; [print\\(f+'' OK''\\) or ast.parse\\(open\\(f\\).read\\(\\)\\) for f in files]\")",
+      "Bash(python -m pytest tests/unit/ tests/integration/test_full_pipeline.py tests/integration/test_idle_and_trust.py tests/kpi/test_throughput.py --collect-only -q)",
+      "Bash(py -m pytest tests/unit/ tests/integration/test_full_pipeline.py tests/integration/test_idle_and_trust.py tests/kpi/test_throughput.py --collect-only -q)",
+      "Read(//usr/local/**)",
+      "Read(//c/Users/frigo/.pyenv/**)",
+      "Bash(find /usr -name python* -type f)",
+      "Bash(/c/Users/frigo/AppData/Local/Microsoft/WindowsApps/python3 -m pytest tests/unit/ tests/integration/test_full_pipeline.py tests/integration/test_idle_and_trust.py tests/kpi/test_throughput.py --collect-only -q)",
+      "Bash(docker run:*)",
+      "Read(//mnt/c/Users/frigo/**)",
+      "Bash(ls /mnt/)",
+      "Bash(wsl -e bash -c \"cd ''/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack'' && python3 --version && ls .venv/bin/activate 2>/dev/null && echo ''venv ok'' || echo ''no venv''\")"
     ]
   }
 }

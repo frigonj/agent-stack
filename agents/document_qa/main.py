@@ -34,7 +34,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
-from core.context import truncate_task
+from core.context import truncate_file, truncate_task
 
 log = structlog.get_logger()
 

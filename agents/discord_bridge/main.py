@@ -993,7 +993,6 @@ class DiscordBridgeClient(discord.Client):
                 #   file_path    — absolute path inside the container (required)
                 #   channel_id / channel_name — destination (defaults to task channel)
                 #   content      — optional caption text
-                import os as _os
                 from pathlib import Path as _Path
                 file_path = payload.get("file_path", "")
                 if not file_path:
