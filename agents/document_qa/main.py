@@ -80,6 +80,19 @@ Extract and analyse content from existing PDF files in /workspace/docs.
 All generated .tex and compiled .pdf files go to /workspace/docs/generated/.
 Reference them in your response with the full path.
 
+## Multi-step document retrieval (ReAct loop)
+If the initially provided content is insufficient, request additional files:
+  READ: /workspace/docs/<filename>
+
+After each read you will receive:
+  OBSERVATION: <file content>
+
+Read as many files as needed. When you have a complete answer:
+  DONE: <your answer>
+
+Only read files under /workspace/docs. If initial content is sufficient, respond
+with DONE: directly.
+
 ## Tool-building
 If you develop a reusable extraction or generation pattern, request executor to
 save it as a named script in /workspace/tools/ for future reuse.
@@ -210,25 +223,46 @@ class DocumentQAAgent(BaseAgent):
             log.info("document_qa.cache_hit", count=len(prior))
             return prior[0]["content"]
 
-        # Try PDFs first, then text/markdown docs
+        # Try PDFs first, then text/markdown docs as initial context seed
         doc_content = self._load_pdfs_as_text() or self._load_text_docs()
         if not doc_content:
             return "No documents found in /workspace/docs."
 
         tool_hits = await self.search_tools(task)
         tools_ctx = self.format_tools_context(tool_hits)
-        # Use lean system prompt — self_modify/task_queue context is irrelevant for doc QA
         system_msg = SYSTEM_PROMPT + tools_ctx
         budget = await self._budget_content_chars(system_msg, task)
-        # Respect both the dynamic budget and the static truncate_file ceiling
         capped_content = doc_content[:budget]
 
         messages = [
             SystemMessage(content=system_msg),
-            HumanMessage(content=f"Document content:\n{capped_content}\n\nQuestion: {task}"),
+            HumanMessage(content=(
+                f"Documents loaded:\n{capped_content}\n\n"
+                f"Question: {task}\n\n"
+                f"Answer from the documents. Use READ: /workspace/docs/<file> to load "
+                f"additional files if needed. When done, respond with DONE: <answer>."
+            )),
         ]
-        response = await self.llm_invoke(messages)
-        answer = response.content
+
+        async def _read_action(action_type: str, payload: str) -> str:
+            if action_type == "READ":
+                path = Path(payload.strip())
+                if not str(path).startswith("/workspace/docs"):
+                    return "Access denied: can only read files under /workspace/docs."
+                try:
+                    text = path.read_text(errors="ignore")
+                    return truncate_file(text)
+                except FileNotFoundError:
+                    return f"File not found: {path}"
+                except Exception as exc:
+                    return f"Error reading {path}: {exc}"
+            return f"Unknown action: {action_type}"
+
+        answer = await self.agent_loop(
+            messages,
+            action_handler=_read_action,
+            max_steps=3,
+        )
 
         self.stage_finding(
             content=f"Q: {task}\nA: {answer}",

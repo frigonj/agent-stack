@@ -379,6 +379,25 @@ REQUIRES_APPROVAL (Discord gate):
 Prefer AUTO_APPROVED commands — operate autonomously. Only escalate for truly
 destructive or external operations.
 
+## Multi-step execution (ReAct loop)
+You may issue multiple commands to complete a task. After each CMD: line you will
+receive an OBSERVATION: with the output. Use the observation to decide your next step.
+
+Example:
+  CMD: cat /workspace/src/agents/executor/main.py
+  (receive OBSERVATION with file content)
+  CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
+  <patched content>
+  EOF
+  DONE: Patched executor/main.py. Restarting container now.
+  CMD: docker restart agent_executor
+
+When the task is fully complete, respond with:
+  DONE: <summary of what was done>
+
+If only one command is needed, issue it and then immediately follow with DONE:.
+If no command is needed, respond directly — the loop treats any response without CMD: as done.
+
 ## Self-modification
 The agent stack source is at /workspace/src/. Read, write, and restart autonomously.
 
@@ -620,60 +639,35 @@ class ExecutorAgent(BaseAgent):
                         log.info("executor.capability_hit", task=task[:80], cmd=cached_cmd[:80])
                         result = await self._run_command(cached_cmd, task, task_id, timeout=timeout)
                     else:
-                        # ── 5. Fall back to LLM ───────────────────────────────
+                        # ── 5. Fall back to LLM with multi-step ReAct loop ────
                         tools_ctx = self.format_tools_context(tool_hits)
                         messages = [
                             SystemMessage(content=SYSTEM_PROMPT + tools_ctx),
                             HumanMessage(content=f"Task: {task}"),
                         ]
-                        response = await self.llm_invoke(messages)
-                        content = response.content
 
-                        cmd_line = _extract_cmd(content)
+                        async def _exec_action(action_type: str, payload: str) -> str:
+                            if action_type == "CMD":
+                                return await self._run_command(payload, task, task_id, timeout=timeout)
+                            return f"Unknown action: {action_type}"
 
-                        # ── 5a. Retry with a strict format prompt if no CMD: found ──
-                        if not cmd_line:
-                            log.warning(
-                                "executor.no_cmd_in_response",
-                                task=task[:80],
-                                preview=content[:120].replace("\n", " "),
-                            )
-                            retry_messages = [
-                                SystemMessage(content=(
-                                    "You are a shell command executor. "
-                                    "Respond with EXACTLY one line in this format:\n"
-                                    "CMD: <shell command>\n\n"
-                                    "No explanation. No markdown. Just CMD: followed by the command."
-                                )),
-                                HumanMessage(content=f"Task: {task}"),
-                            ]
-                            try:
-                                retry_resp = await self.llm_invoke(retry_messages)
-                                cmd_line = _extract_cmd(retry_resp.content)
-                            except Exception as exc:
-                                log.warning("executor.cmd_retry_failed", error=str(exc))
+                        result = await self.agent_loop(
+                            messages,
+                            action_handler=_exec_action,
+                            max_steps=5,
+                        )
 
-                        result = content if not cmd_line else ""
-                        if cmd_line:
-                            result = await self._run_command(cmd_line, task, task_id, timeout=timeout)
-                            # Store successful command for future reuse
-                            if not result.startswith("Command denied") and not result.startswith("Error"):
-                                tool_tags = _command_tags(cmd_line)
-                                await self.memory.store_capability(task, cmd_line, tool_tags)
-                                # Also register as a named tool for cross-agent visibility
-                                words = [w for w in re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 2][:4]
-                                tool_name = "-".join(words)[:50]
-                                if tool_name:
-                                    await self.memory.register_tool(
-                                        tool_name, task[:120], "executor",
-                                        f"shell:{cmd_line}", tool_tags, self.role,
-                                    )
-                                # Promote complex commands to named tool scripts
-                                self._maybe_save_tool(task, cmd_line)
-                        else:
-                            # No command could be extracted — mark the result so the
-                            # orchestrator's validator can detect it as incomplete.
-                            result = f"[EXECUTOR_NO_CMD] {content}"
+                        # Store successful result in capability cache for future reuse
+                        if result and not result.startswith("Command denied") and not result.startswith("Error"):
+                            tool_tags = ["executor", "multi-step"]
+                            await self.memory.store_capability(task, result[:200], tool_tags)
+                            words = [w for w in re.sub(r"[^a-z0-9\s]", "", task.lower()).split() if len(w) > 2][:4]
+                            tool_name = "-".join(words)[:50]
+                            if tool_name:
+                                await self.memory.register_tool(
+                                    tool_name, task[:120], "executor",
+                                    f"shell:{result[:200]}", tool_tags, self.role,
+                                )
 
         await self.emit(
             EventType.AGENT_TOOL_RESULT,

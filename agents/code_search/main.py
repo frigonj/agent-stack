@@ -25,6 +25,18 @@ You search codebases for patterns, bugs, and architectural decisions.
 Be precise about file paths and line references when possible.
 When you find a bug or important pattern, flag it clearly so it can be stored in long-term memory.
 
+## Multi-step search (ReAct loop)
+If the initial search results are insufficient, issue additional searches:
+  SEARCH: <keyword or class name or pattern>
+
+After each search you will receive:
+  OBSERVATION: <matching code snippets>
+
+Issue as many SEARCH: lines as needed to build a complete picture. When done:
+  DONE: <your full analysis>
+
+If the initial results already answer the question, respond with DONE: immediately.
+
 ## Tool-building
 After performing a search that produces a reusable grep/find pattern, save it to
 /workspace/tools/ (e.g. find-all-event-handlers.sh) so future tasks skip the LLM.
@@ -140,17 +152,31 @@ class CodeSearchAgent(BaseAgent):
         tools_ctx = self.format_tools_context(tool_hits)
         system_msg = SYSTEM_PROMPT + tools_ctx
 
-        # Cap snippet size to what actually fits in the model's context window
+        # Cap initial snippet size to half the budget — the loop may load more
         budget = await self._budget_content_chars(system_msg, f"Code snippets:\n\n\nTask: {task}")
-        fitted_snippets = snippets[:budget]
+        fitted_snippets = snippets[:budget // 2]
 
-        # Analyze via LLM
         messages = [
             SystemMessage(content=system_msg),
-            HumanMessage(content=f"Code snippets:\n{fitted_snippets}\n\nTask: {task}"),
+            HumanMessage(content=(
+                f"Task: {task}\n\n"
+                f"Initial search results:\n{fitted_snippets}\n\n"
+                f"Analyse the code. Issue SEARCH: <query> to look for more if needed. "
+                f"When done, respond with DONE: <your analysis>."
+            )),
         ]
-        response = await self.llm_invoke(messages)
-        analysis = response.content
+
+        async def _search_action(action_type: str, payload: str) -> str:
+            if action_type == "SEARCH":
+                result = self._search_code(payload, max_chars=6_000)
+                return result or "No results found for that query."
+            return f"Unknown action: {action_type}"
+
+        analysis = await self.agent_loop(
+            messages,
+            action_handler=_search_action,
+            max_steps=4,
+        )
 
         # Stage findings for long-term promotion
         self.stage_finding(

@@ -20,11 +20,12 @@ import os
 import signal
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+import re
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 import structlog
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage as _HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from core.events.bus import Event, EventBus, EventType
@@ -51,6 +52,12 @@ except ImportError:
         return len(text) // 4
 
 log = structlog.get_logger()
+
+# ── Agent loop action parsing ─────────────────────────────────────────────────
+# Matches lines like "CMD: docker ps" or "SEARCH: EventType" or "READ: /workspace/docs/x.pdf"
+_ACTION_RE = re.compile(r'^(?P<prefix>CMD|SEARCH|READ):\s*(?P<payload>.+)$', re.MULTILINE)
+# Matches "DONE: <answer>" — the LLM signals it is finished
+_DONE_RE   = re.compile(r'^DONE:\s*(?P<answer>.+)', re.MULTILINE | re.DOTALL)
 
 
 class BaseAgent(ABC):
@@ -517,6 +524,110 @@ class BaseAgent(ABC):
             available_chars=available,
         )
         return available
+
+    # ── Agent action loop (ReAct) ─────────────────────────────────────────────
+
+    async def agent_loop(
+        self,
+        messages: list,
+        action_handler: Callable[[str, str], Awaitable[str]],
+        max_steps: int = 5,
+    ) -> str:
+        """
+        ReAct-style multi-step loop: Reason → Act → Observe → repeat.
+
+        The LLM response is parsed for action lines:
+          CMD: <shell command>
+          SEARCH: <query>
+          READ: <filepath>
+
+        Each action is executed via ``action_handler(action_type, payload) → str``
+        and the result appended as an OBSERVATION back into the conversation.
+
+        The loop ends when the LLM emits ``DONE: <answer>`` (preferred),
+        produces a response with no action lines (implicit done), or
+        exhausts ``max_steps`` (triggers a forced final synthesis).
+        """
+        msgs = list(messages)
+
+        for step in range(max_steps):
+            response = await self.llm_invoke(msgs)
+            content: str = response.content
+
+            # ── Explicit DONE termination ──────────────────────────────────
+            done_m = _DONE_RE.search(content)
+            if done_m:
+                log.debug("agent_loop.done", role=self.role, step=step)
+                return done_m.group("answer").strip()
+
+            # ── Parse action lines ─────────────────────────────────────────
+            actions = _ACTION_RE.findall(content)
+            if not actions:
+                # No action lines → treat full response as the final answer
+                log.debug("agent_loop.implicit_done", role=self.role, step=step)
+                return content.strip()
+
+            # Append the assistant turn
+            msgs = msgs + [AIMessage(content=content)]
+
+            # Execute actions sequentially, collect observations
+            obs_parts: list[str] = []
+            for prefix, payload in actions:
+                payload = payload.strip()
+                log.info(
+                    "agent_loop.action",
+                    role=self.role,
+                    step=step,
+                    action=prefix,
+                    payload=payload[:80],
+                )
+                try:
+                    obs = await action_handler(prefix, payload)
+                except Exception as exc:
+                    obs = f"Error executing {prefix}: {exc}"
+                obs_parts.append(f"{prefix}: {payload}\nOBSERVATION: {obs}")
+
+            obs_content = "\n\n".join(obs_parts)
+
+            # Prune old observations if needed to stay within context
+            msgs = await self._prune_loop_observations(msgs, obs_content)
+            msgs = msgs + [_HumanMessage(content=obs_content)]
+
+        # Exhausted max_steps — force a final synthesis
+        log.warning("agent_loop.max_steps_reached", role=self.role, max_steps=max_steps)
+        msgs = msgs + [_HumanMessage(
+            content="You have reached the step limit. Summarise what you found and provide your best answer now. Start your response with DONE: "
+        )]
+        final = await self.llm_invoke(msgs)
+        done_m = _DONE_RE.search(final.content)
+        return done_m.group("answer").strip() if done_m else final.content.strip()
+
+    async def _prune_loop_observations(
+        self, messages: list, incoming_obs: str
+    ) -> list:
+        """
+        Drop the oldest OBSERVATION HumanMessages (index ≥ 2) when the
+        conversation is approaching the model's context limit, so the loop
+        can keep running without hitting a hard truncation.
+        """
+        limit  = await self._get_model_context_limit()
+        budget = int(limit * 0.70)
+        candidate = messages + [_HumanMessage(content=incoming_obs)]
+
+        while len(messages) > 2 and self._estimate_tokens(candidate) > budget:
+            pruned = False
+            for i in range(2, len(messages)):
+                msg = messages[i]
+                if isinstance(msg, _HumanMessage) and "OBSERVATION:" in (msg.content or ""):
+                    log.debug("agent_loop.obs_pruned", role=self.role, index=i)
+                    messages = messages[:i] + messages[i + 1:]
+                    candidate = messages + [_HumanMessage(content=incoming_obs)]
+                    pruned = True
+                    break
+            if not pruned:
+                break  # nothing left to prune
+
+        return messages
 
     def _circuit_check(self) -> bool:
         """
