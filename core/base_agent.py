@@ -123,6 +123,12 @@ class BaseAgent(ABC):
         env_idle = os.environ.get("IDLE_TIMEOUT", "")
         self._idle_timeout = int(env_idle) if env_idle.isdigit() else self.idle_timeout
 
+        # ── Pending vote clarification requests ───────────────────────────────
+        # plan_id → asyncio.Event (set when response arrives)
+        self._clarification_events: dict[str, asyncio.Event] = {}
+        # plan_id → answer string
+        self._clarification_answers: dict[str, str] = {}
+
         # ── Circuit breaker state ─────────────────────────────────────────────
         # Tracks consecutive LM Studio failures. After CIRCUIT_THRESHOLD failures
         # the circuit opens and llm_invoke() fails fast (or uses Claude fallback).
@@ -437,6 +443,11 @@ class BaseAgent(ABC):
         if event.type == EventType.PLAN_PROPOSED:
             await self.bus.ack(stream, self.group_name, entry_id)
             asyncio.create_task(self._handle_plan_proposed(event))
+            return
+
+        if event.type == EventType.VOTE_CLARIFICATION_RESPONSE:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            self._handle_clarification_response(event)
             return
 
         self._active_tasks += 1
@@ -1158,18 +1169,66 @@ class BaseAgent(ABC):
 
     # ── Voting ───────────────────────────────────────────────────────────────
 
+    def _handle_clarification_response(self, event: "Event") -> None:
+        """Unblock any coroutine waiting on a vote clarification for this plan."""
+        plan_id = event.payload.get("plan_id", "")
+        answer = event.payload.get("answer", "")
+        ev = self._clarification_events.get(plan_id)
+        if ev is not None:
+            self._clarification_answers[plan_id] = answer
+            ev.set()
+
     async def _handle_plan_proposed(self, event: "Event") -> None:
         """
         Called when a PLAN_PROPOSED broadcast is received.
         Delegates to on_plan_proposed() so subclasses can inspect the plan
-        and cast a vote.  The base implementation auto-approves silently,
-        which preserves the existing "silence = approval" behaviour for
-        agents that don't override this method.
+        and cast a vote.  Passes a request_clarification() coroutine the
+        subclass can await to ask the orchestrator for more context before voting.
         """
         plan_id = event.payload.get("plan_id", "")
         steps = event.payload.get("steps", [])
+        original_task = event.payload.get("original_task", "")
+        steps_summary = "\n".join(
+            f"  Phase {s.get('phase', 1)}: [{s.get('agent', '?')}] {s.get('task', '')}"
+            for s in steps
+        )
+
+        async def request_clarification(question: str, timeout: float = 8.0) -> str:
+            """
+            Ask the orchestrator to clarify something about this plan.
+            Returns the orchestrator's answer, or an empty string on timeout.
+            """
+            ev = asyncio.Event()
+            self._clarification_events[plan_id] = ev
+            self._clarification_answers.pop(plan_id, None)
+            await self.emit(
+                EventType.VOTE_CLARIFICATION_REQUEST,
+                payload={
+                    "plan_id": plan_id,
+                    "question": question[:300],
+                    "original_task": original_task,
+                    "steps_summary": steps_summary,
+                },
+                target="orchestrator",
+            )
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=timeout)
+                return self._clarification_answers.get(plan_id, "")
+            except asyncio.TimeoutError:
+                log.warning(
+                    "agent.vote_clarification_timeout",
+                    role=self.role,
+                    plan_id=plan_id[:8],
+                )
+                return ""
+            finally:
+                self._clarification_events.pop(plan_id, None)
+                self._clarification_answers.pop(plan_id, None)
+
         try:
-            approve, reason, confidence = await self.on_plan_proposed(plan_id, steps, event.payload)
+            approve, reason, confidence = await self.on_plan_proposed(
+                plan_id, steps, event.payload, request_clarification
+            )
         except Exception as exc:
             log.warning("agent.plan_proposed_handler_error", role=self.role, error=str(exc))
             return
@@ -1182,6 +1241,7 @@ class BaseAgent(ABC):
         plan_id: str,
         steps: list[dict],
         payload: dict,
+        request_clarification=None,
     ) -> tuple[bool | None, str, float]:
         """
         Override in subclasses to inspect a proposed plan and return a vote.
@@ -1190,6 +1250,10 @@ class BaseAgent(ABC):
           approve:    True to support, False to object, None to abstain (no vote emitted)
           reason:     brief human-readable explanation
           confidence: 0.0–1.0; only rejections with confidence ≥ 0.7 trigger plan revision
+
+        request_clarification(question) — await this coroutine to ask the orchestrator
+        to explain something about the plan before you vote. It returns the answer as a
+        string, or "" on timeout.
 
         The default implementation abstains so agents that don't override this
         method don't pollute the vote tally with unconsidered approvals.

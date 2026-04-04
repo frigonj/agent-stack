@@ -47,8 +47,8 @@ log = structlog.get_logger()
 # ── Defaults for runtime-configurable values ──────────────────────────────────
 
 CONFIG_DEFAULTS: dict[str, Any] = {
-    "vote_timeout_ms": 3_000,  # ms agents have to vote on a plan
-    "vote_max_extension_ms": 10_000,  # max extra ms one agent can request
+    "vote_timeout_ms": 20_000,  # ms agents have to vote on a plan (allows LLM evaluation)
+    "vote_max_extension_ms": 15_000,  # max extra ms one agent can request (allows clarification round-trip)
     "chat_idle_gap_secs": 1_800,  # 30 min idle → new chat session
     "chat_keyword_overlap": 0.4,  # Jaccard threshold for same session
     "max_concurrent_contexts": 5,  # per-agent context stream pool size
@@ -122,6 +122,8 @@ class EventType(str, Enum):
         "vote.extension_requested"  # agent needs more deliberation time
     )
     VOTE_RESULT = "vote.result"  # orchestrator posts tally after voting closes
+    VOTE_CLARIFICATION_REQUEST = "vote.clarification_request"  # agent asks orchestrator to explain a plan step
+    VOTE_CLARIFICATION_RESPONSE = "vote.clarification_response"  # orchestrator answers the clarification
 
     # Pause / resume lifecycle
     TASK_PAUSED = "task.paused"    # research agent finished current iteration, loop stopped

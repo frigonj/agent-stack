@@ -720,20 +720,94 @@ class ExecutorAgent(BaseAgent):
         return count
 
     async def on_plan_proposed(
-        self, plan_id: str, steps: list[dict], payload: dict
+        self, plan_id: str, steps: list[dict], payload: dict, request_clarification=None
     ) -> tuple[bool | None, str, float]:
-        """Vote on steps assigned to executor. Reject if any step looks unsafe."""
+        """
+        Use the LLM to evaluate executor steps. Ask for clarification if any
+        step is ambiguous before casting a vote.
+        """
         my_steps = [s for s in steps if s.get("agent") == "executor"]
         if not my_steps:
             return None, "", 0.0  # abstain — not involved in this plan
-        # Reject plans that ask executor to run obviously destructive commands
+
+        # Hard safety check first (no LLM needed).
         _DANGEROUS = ("rm -rf /", "mkfs", "dd if=", ":(){:|:&};:", "chmod 777 /")
         for step in my_steps:
             task_text = step.get("task", "").lower()
             for pattern in _DANGEROUS:
                 if pattern in task_text:
                     return False, f"step contains potentially destructive command: {pattern!r}", 0.9
-        return True, f"executor steps look safe ({len(my_steps)} step(s))", 0.8
+
+        steps_txt = "\n".join(
+            f"  Phase {s.get('phase', 1)}: {s.get('task', '')}" for s in my_steps
+        )
+        original_task = payload.get("original_task", "")
+
+        try:
+            response = await self.llm_invoke([
+                SystemMessage(content=(
+                    "You are the executor agent. You run shell commands and manage files. "
+                    "You are reviewing steps assigned to you in a proposed execution plan. "
+                    "Decide if you can execute them safely and whether you understand them fully.\n\n"
+                    "Reply in exactly this format:\n"
+                    "UNDERSTOOD: yes/no\n"
+                    "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
+                    "APPROVE: yes/no\n"
+                    "REASON: <one sentence>"
+                )),
+                HumanMessage(content=(
+                    f"Overall task: {original_task}\n"
+                    f"My steps:\n{steps_txt}"
+                )),
+            ])
+            lines = {
+                k.strip(): v.strip()
+                for line in response.content.splitlines()
+                if ":" in line
+                for k, v in [line.split(":", 1)]
+            }
+        except Exception as exc:
+            log.warning("executor.vote_llm_error", error=str(exc))
+            return True, "could not evaluate — defaulting to approve", 0.5
+
+        understood = lines.get("UNDERSTOOD", "yes").lower() == "yes"
+        clarification_q = lines.get("CLARIFICATION_NEEDED", "none")
+        approve_str = lines.get("APPROVE", "yes").lower()
+        reason = lines.get("REASON", "")
+
+        # Ask for clarification if the LLM flagged something as unclear.
+        if not understood and clarification_q and clarification_q.lower() != "none" and request_clarification:
+            answer = await request_clarification(clarification_q)
+            if answer:
+                # Re-evaluate with the clarification folded in.
+                try:
+                    response2 = await self.llm_invoke([
+                        SystemMessage(content=(
+                            "You are the executor agent re-evaluating a plan step after receiving clarification."
+                            " Reply in exactly this format:\n"
+                            "APPROVE: yes/no\n"
+                            "REASON: <one sentence>"
+                        )),
+                        HumanMessage(content=(
+                            f"Overall task: {original_task}\n"
+                            f"My steps:\n{steps_txt}\n\n"
+                            f"Clarification received: {answer}"
+                        )),
+                    ])
+                    lines2 = {
+                        k.strip(): v.strip()
+                        for line in response2.content.splitlines()
+                        if ":" in line
+                        for k, v in [line.split(":", 1)]
+                    }
+                    approve_str = lines2.get("APPROVE", approve_str).lower()
+                    reason = lines2.get("REASON", reason)
+                except Exception:
+                    pass  # keep original decision
+
+        approve = approve_str == "yes"
+        confidence = 0.85 if approve else 0.8
+        return approve, reason[:200], confidence
 
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:

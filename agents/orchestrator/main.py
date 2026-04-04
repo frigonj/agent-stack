@@ -655,6 +655,10 @@ class VoteState:
     extended_until: float = 0.0  # extended deadline if any agent requested more time
     votes: list = field(default_factory=list)  # list of vote payload dicts
     resolved: bool = False
+    # Pending clarification requests: agent_role → asyncio.Event (set when response arrives)
+    clarification_events: dict = field(default_factory=dict)
+    # Clarification answers: agent_role → answer string
+    clarification_answers: dict = field(default_factory=dict)
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -823,6 +827,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_agent_vote(event)
         elif event.type == EventType.VOTE_EXTENSION_REQUESTED:
             await self._handle_vote_extension(event)
+        elif event.type == EventType.VOTE_CLARIFICATION_REQUEST:
+            await self._handle_vote_clarification_request(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -1577,6 +1583,82 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             plan_id=plan_id[:8],
             granted_ms=granted,
         )
+
+    async def _handle_vote_clarification_request(self, event: Event) -> None:
+        """
+        An agent asked for clarification about a plan step before voting.
+        Formulate an answer from the plan context (via LLM) and emit it back
+        as a VOTE_CLARIFICATION_RESPONSE targeted at the requesting agent.
+        Also grant a time extension so the agent has time to re-evaluate.
+        """
+        plan_id = event.payload.get("plan_id", "")
+        asking_agent = event.source
+        question = event.payload.get("question", "")
+        vs = self._active_votes.get(plan_id)
+        if not vs or vs.resolved:
+            log.warning(
+                "orchestrator.clarification_late",
+                plan_id=plan_id[:8],
+                agent=asking_agent,
+            )
+            return
+
+        # Grant a short extension so the agent has time to receive and act on the answer.
+        max_ext = int(await self.bus.get_config("vote_max_extension_ms", 10_000))
+        extension_s = min(max_ext, 8_000) / 1000
+        new_ext = time.monotonic() + extension_s
+        if new_ext > vs.extended_until:
+            vs.extended_until = new_ext
+
+        log.info(
+            "orchestrator.vote_clarification_requested",
+            plan_id=plan_id[:8],
+            agent=asking_agent,
+            question=question[:100],
+        )
+
+        # Build an answer using the plan steps as context.
+        original_task = event.payload.get("original_task", "")
+        steps_txt = event.payload.get("steps_summary", "")
+        try:
+            messages = [
+                SystemMessage(
+                    content=(
+                        "You are the orchestrator. An agent is about to vote on a proposed execution plan "
+                        "and has asked a clarification question. Answer concisely (1-3 sentences) "
+                        "using only information present in the plan."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Task: {original_task}\n"
+                        f"Plan steps:\n{steps_txt}\n\n"
+                        f"Agent '{asking_agent}' asks: {question}"
+                    )
+                ),
+            ]
+            response = await self.llm_invoke(messages)
+            answer = response.content.strip()
+        except Exception as exc:
+            answer = f"Unable to clarify at this time: {exc}"
+            log.warning("orchestrator.clarification_llm_error", error=str(exc))
+
+        await self.emit(
+            EventType.VOTE_CLARIFICATION_RESPONSE,
+            payload={
+                "plan_id": plan_id,
+                "agent": asking_agent,
+                "question": question,
+                "answer": answer,
+            },
+            target=asking_agent,
+        )
+
+        # Signal the asyncio.Event so the waiting agent is unblocked.
+        ev = vs.clarification_events.get(asking_agent)
+        if ev is not None:
+            vs.clarification_answers[asking_agent] = answer
+            ev.set()
 
     async def _propose_plan_and_vote(
         self, plan: ExecutionPlan
