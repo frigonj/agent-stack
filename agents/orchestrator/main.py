@@ -2663,17 +2663,46 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         "research": ["agent_searxng"],
     }
 
+    # Health-check URLs for dependency containers. Polled after `docker start`
+    # until a 200 is returned (or the timeout expires).
+    _DEP_HEALTH_URLS: dict[str, str] = {
+        "agent_searxng": f"{_SEARXNG_URL}/",
+    }
+    _DEP_HEALTH_TIMEOUT = 30  # seconds to wait for readiness
+    _DEP_HEALTH_INTERVAL = 1.5  # seconds between poll attempts
+
+    async def _wait_for_dep_ready(self, dep: str) -> bool:
+        """Poll dep's health URL until it returns 200 or the timeout expires.
+        Returns True if ready, False on timeout."""
+        url = self._DEP_HEALTH_URLS.get(dep)
+        if not url:
+            return True  # no health check configured — assume ready
+        deadline = asyncio.get_event_loop().time() + self._DEP_HEALTH_TIMEOUT
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        log.info("orchestrator.dep_ready", dep=dep, url=url)
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(self._DEP_HEALTH_INTERVAL)
+        log.warning("orchestrator.dep_not_ready", dep=dep, url=url, timeout=self._DEP_HEALTH_TIMEOUT)
+        return False
+
     async def _ensure_agent_running(
         self, agent: str, plan: "ExecutionPlan | None" = None
     ) -> bool:
         """Start an ephemeral agent container if it isn't already running.
-        Also starts any declared dependency containers (e.g. searxng for research).
+        Also starts any declared dependency containers (e.g. searxng for research)
+        and waits for them to become healthy before returning.
         Uses `docker start` — no compose plugin required.
         Returns True on success, False if the container could not be started."""
         if agent not in self._EPHEMERAL_AGENTS:
             return True
 
-        # Start dependency containers first (fire-and-forget errors are logged but don't block).
+        # Start dependency containers first, then wait for readiness.
         for dep in self._AGENT_DEPS.get(agent, []):
             try:
                 dep_proc = await asyncio.create_subprocess_exec(
@@ -2690,6 +2719,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     )
                 else:
                     log.info("orchestrator.dep_started", agent=agent, dep=dep)
+                    await self._wait_for_dep_ready(dep)
             except Exception as exc:
                 log.warning("orchestrator.dep_start_error", agent=agent, dep=dep, error=str(exc))
 

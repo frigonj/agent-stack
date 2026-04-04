@@ -692,14 +692,53 @@ class BaseAgent(ABC):
 
     async def _prune_loop_observations(self, messages: list, incoming_obs: str) -> list:
         """
-        Drop the oldest OBSERVATION HumanMessages (index ≥ 2) when the
-        conversation is approaching the model's context limit, so the loop
-        can keep running without hitting a hard truncation.
+        Compress then drop old OBSERVATION HumanMessages (index ≥ 2) when the
+        conversation is approaching the model's context limit.
+
+        First pass: replace the oldest full observation with a one-line summary
+        (first non-empty line of the OBSERVATION body, capped to 200 chars).
+        This preserves the signal that a tool ran and what it returned without
+        keeping the full output in context.
+
+        Second pass: if still over budget after all observations are compressed,
+        drop them oldest-first.
         """
         limit = await self._get_model_context_limit()
         budget = int(limit * 0.70)
         candidate = messages + [_HumanMessage(content=incoming_obs)]
 
+        def _compress_obs(content: str) -> str:
+            """Return a one-line compressed form of an observation message."""
+            if "OBSERVATION:" not in content:
+                return content
+            prefix, _, body = content.partition("OBSERVATION:")
+            first_line = next(
+                (ln.strip() for ln in body.splitlines() if ln.strip()), body.strip()
+            )
+            summary = first_line[:200] + ("…" if len(first_line) > 200 else "")
+            return f"{prefix}OBSERVATION: [compressed] {summary}"
+
+        # Pass 1: compress oldest full observations.
+        while len(messages) > 2 and self._estimate_tokens(candidate) > budget:
+            compressed = False
+            for i in range(2, len(messages)):
+                msg = messages[i]
+                content = msg.content or ""
+                if (
+                    isinstance(msg, _HumanMessage)
+                    and "OBSERVATION:" in content
+                    and "[compressed]" not in content
+                ):
+                    new_content = _compress_obs(content)
+                    log.debug("agent_loop.obs_compressed", role=self.role, index=i)
+                    messages = messages[:i] + [_HumanMessage(content=new_content)] + messages[i + 1 :]
+                    candidate = messages + [_HumanMessage(content=incoming_obs)]
+                    compressed = True
+                    break
+            if not compressed:
+                break
+
+        # Pass 2: drop compressed (or any remaining) observations if still over budget.
         while len(messages) > 2 and self._estimate_tokens(candidate) > budget:
             pruned = False
             for i in range(2, len(messages)):
@@ -707,13 +746,13 @@ class BaseAgent(ABC):
                 if isinstance(msg, _HumanMessage) and "OBSERVATION:" in (
                     msg.content or ""
                 ):
-                    log.debug("agent_loop.obs_pruned", role=self.role, index=i)
+                    log.debug("agent_loop.obs_dropped", role=self.role, index=i)
                     messages = messages[:i] + messages[i + 1 :]
                     candidate = messages + [_HumanMessage(content=incoming_obs)]
                     pruned = True
                     break
             if not pruned:
-                break  # nothing left to prune
+                break
 
         return messages
 
