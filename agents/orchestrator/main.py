@@ -648,13 +648,14 @@ class ChatSession:
 
 @dataclass
 class VoteState:
-    """Tracks votes cast on a PLAN_PROPOSED event."""
+    """Tracks votes cast on a PLAN_PROPOSED or VOTE_INITIATED event."""
 
     plan_id: str
     deadline: float  # monotonic time when voting closes
     extended_until: float = 0.0  # extended deadline if any agent requested more time
     votes: list = field(default_factory=list)  # list of vote payload dicts
     resolved: bool = False
+    attempt: int = 1  # current attempt number (retried when quorum not met)
     # Pending clarification requests: agent_role → asyncio.Event (set when response arrives)
     clarification_events: dict = field(default_factory=dict)
     # Clarification answers: agent_role → answer string
@@ -728,6 +729,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._chat_sessions: dict[str, ChatSession] = {}
         # Active vote rounds: plan_id → VoteState
         self._active_votes: dict[str, VoteState] = {}
+        # Pending user-escalated votes: vote_id → Future[bool]
+        self._pending_user_votes: dict[str, asyncio.Future] = {}
 
     _OWN_TOOLS = [
         (
@@ -831,6 +834,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_vote_clarification_request(event)
         elif event.type == EventType.PEER_VOTE_REQUESTED:
             asyncio.create_task(self._run_peer_vote(event))
+        elif event.type == EventType.VOTE_USER_RESULT:
+            await self._handle_vote_user_result(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -1662,6 +1667,20 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             vs.clarification_answers[asking_agent] = answer
             ev.set()
 
+    async def _handle_vote_user_result(self, event: Event) -> None:
+        """Resolve a pending user-escalated vote future."""
+        vote_id = event.payload.get("vote_id", "")
+        approved = bool(event.payload.get("approved", False))
+        future = self._pending_user_votes.get(vote_id)
+        if future and not future.done():
+            future.set_result(approved)
+            log.info(
+                "orchestrator.user_vote_resolved",
+                vote_id=vote_id[:8],
+                approved=approved,
+                decided_by=event.payload.get("decided_by", "unknown"),
+            )
+
     async def _run_peer_vote(self, event: Event) -> None:
         """
         Handle a PEER_VOTE_REQUESTED event from any agent.
@@ -1670,9 +1689,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
            which ones were woken up solely for this vote.
         2. Broadcast VOTE_INITIATED to all agents.
         3. Collect votes for vote_timeout_ms (+ extensions).
-        4. Tally and emit VOTE_RESULT.
-        5. Shut down any agent that was started only for this vote and is
-           not currently executing a task.
+        4. If fewer than vote_min_quorum votes arrive, retry up to
+           vote_max_retries times; if still short, escalate to user (48 h,
+           auto-rejects on timeout).
+        5. Tally with orchestrator tie-break (+1 yay when yay == nay).
+        6. Emit VOTE_RESULT and shut down vote-only agents.
         """
         vote_id = event.payload.get("vote_id", "")
         question = event.payload.get("question", "")
@@ -1713,60 +1734,143 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await asyncio.gather(*start_tasks, return_exceptions=True)
 
         vote_ms = int(await self.bus.get_config("vote_timeout_ms", 20_000))
-        deadline = time.monotonic() + vote_ms / 1000
-        vs = VoteState(plan_id=vote_id, deadline=deadline)
-        self._active_votes[vote_id] = vs
+        min_quorum = int(await self.bus.get_config("vote_min_quorum", 3))
+        max_retries = int(await self.bus.get_config("vote_max_retries", 3))
 
-        await self.emit(
-            EventType.VOTE_INITIATED,
-            payload={
-                "vote_id": vote_id,
-                "question": question,
-                "context": context,
-                "initiator": initiator,
-            },
-            target="broadcast",
-        )
+        vote_initiated_payload = {
+            "vote_id": vote_id,
+            "question": question,
+            "context": context,
+            "initiator": initiator,
+        }
 
-        # Wait for votes with possible extension.
-        while True:
-            effective = max(vs.deadline, vs.extended_until)
-            remaining = effective - time.monotonic()
-            if remaining <= 0:
+        outcome = "rejected"
+        yay: list = []
+        nay: list = []
+        all_votes: list = []
+        tie_broken = False
+
+        for attempt in range(1, max_retries + 2):  # +2: attempts 1..max_retries+1
+            deadline = time.monotonic() + vote_ms / 1000
+            vs = VoteState(plan_id=vote_id, deadline=deadline, attempt=attempt)
+            self._active_votes[vote_id] = vs
+
+            await self.emit(EventType.VOTE_INITIATED, payload=vote_initiated_payload, target="broadcast")
+
+            # Wait for votes with possible extension.
+            while True:
+                effective = max(vs.deadline, vs.extended_until)
+                remaining = effective - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.2, remaining))
+
+            vs.resolved = True
+            self._active_votes.pop(vote_id, None)
+
+            total_votes = len(vs.votes)
+
+            # ── Quorum check ──────────────────────────────────────────────────
+            if total_votes < min_quorum:
+                if attempt <= max_retries:
+                    log.warning(
+                        "orchestrator.peer_vote_quorum_missed",
+                        vote_id=vote_id[:8],
+                        attempt=attempt,
+                        votes=total_votes,
+                        required=min_quorum,
+                    )
+                    await self.emit(
+                        EventType.VOTE_RESULT,
+                        payload={
+                            "plan_id": vote_id,
+                            "task": question,
+                            "outcome": "no_quorum",
+                            "yay": 0, "nay": 0,
+                            "total": total_votes,
+                            "votes": vs.votes,
+                            "reasons": [f"Quorum not met (attempt {attempt}/{max_retries}), retrying…"],
+                            "vote_type": "peer",
+                            "initiator": initiator,
+                        },
+                        target="broadcast",
+                    )
+                    continue  # retry
+
+                # All retries exhausted — escalate to user.
+                log.warning(
+                    "orchestrator.peer_vote_escalating_to_user",
+                    vote_id=vote_id[:8],
+                    attempts=attempt,
+                )
+                user_timeout_h = int(await self.bus.get_config("vote_user_timeout_hours", 48))
+                user_approved = await self._escalate_vote_to_user(
+                    vote_id=vote_id,
+                    question=question,
+                    context=context,
+                    timeout_hours=user_timeout_h,
+                    vote_type="peer",
+                )
+                outcome = "approved" if user_approved else "rejected"
+                await self.emit(
+                    EventType.VOTE_RESULT,
+                    payload={
+                        "plan_id": vote_id,
+                        "task": question,
+                        "outcome": outcome,
+                        "yay": 1 if user_approved else 0,
+                        "nay": 0 if user_approved else 1,
+                        "total": 1,
+                        "votes": [{"agent": "user", "approve": user_approved, "confidence": 1.0, "reason": "user decision after quorum failure"}],
+                        "reasons": [] if user_approved else ["User rejected after quorum was not reached."],
+                        "vote_type": "peer",
+                        "initiator": initiator,
+                    },
+                    target="broadcast",
+                )
+                log.info("orchestrator.peer_vote_result", vote_id=vote_id[:8], outcome=outcome, via="user_escalation")
                 break
-            await asyncio.sleep(min(0.2, remaining))
 
-        vs.resolved = True
-        self._active_votes.pop(vote_id, None)
+            else:
+                # ── Quorum met — tally ────────────────────────────────────────
+                yay = [v for v in vs.votes if v.get("approve", True)]
+                nay = [v for v in vs.votes if not v.get("approve", True)]
+                all_votes = vs.votes
 
-        yay = [v for v in vs.votes if v.get("approve", True)]
-        nay = [v for v in vs.votes if not v.get("approve", True)]
-        outcome = "approved" if len(yay) >= len(nay) else "rejected"
+                # Tie-breaking: orchestrator casts the deciding +1 yay.
+                if len(yay) == len(nay):
+                    yay = list(yay) + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
+                    all_votes = all_votes + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
+                    tie_broken = True
+                    log.info("orchestrator.peer_vote_tiebreak", vote_id=vote_id[:8])
 
-        await self.emit(
-            EventType.VOTE_RESULT,
-            payload={
-                "plan_id": vote_id,
-                "task": question,
-                "outcome": outcome,
-                "yay": len(yay),
-                "nay": len(nay),
-                "total": len(vs.votes),
-                "votes": vs.votes,
-                "reasons": [v.get("reason", "") for v in nay],
-                "vote_type": "peer",
-                "initiator": initiator,
-            },
-            target="broadcast",
-        )
-
-        log.info(
-            "orchestrator.peer_vote_result",
-            vote_id=vote_id[:8],
-            outcome=outcome,
-            yay=len(yay),
-            nay=len(nay),
-        )
+                outcome = "approved" if len(yay) > len(nay) else "rejected"
+                await self.emit(
+                    EventType.VOTE_RESULT,
+                    payload={
+                        "plan_id": vote_id,
+                        "task": question,
+                        "outcome": outcome,
+                        "yay": len(yay),
+                        "nay": len(nay),
+                        "total": len(all_votes),
+                        "votes": all_votes,
+                        "reasons": [v.get("reason", "") for v in nay],
+                        "vote_type": "peer",
+                        "initiator": initiator,
+                        "tie_broken": tie_broken,
+                    },
+                    target="broadcast",
+                )
+                log.info(
+                    "orchestrator.peer_vote_result",
+                    vote_id=vote_id[:8],
+                    outcome=outcome,
+                    yay=len(yay),
+                    nay=len(nay),
+                    tie_broken=tie_broken,
+                )
+                break
 
         # Shut down agents that were woken solely for this vote and are
         # not currently assigned to an active plan.
@@ -1791,100 +1895,209 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         Broadcast a proposed plan, collect agent votes for vote_timeout_ms
         (plus any granted extensions), then decide whether to proceed.
 
+        If fewer than vote_min_quorum votes arrive, the vote is retried up to
+        vote_max_retries times.  If quorum is still not met after all retries,
+        the question is escalated to the user via Discord with a 48 h window
+        (auto-rejects on timeout).
+
+        Tie-breaking: when yay == nay the orchestrator casts the deciding +1 yay.
+
         Returns (proceed, rejection_reasons).
         proceed=False means the plan should be revised before execution.
         """
-        vote_ms = int(await self.bus.get_config("vote_timeout_ms", 3_000))
-        deadline = time.monotonic() + vote_ms / 1000
+        vote_ms = int(await self.bus.get_config("vote_timeout_ms", 20_000))
+        min_quorum = int(await self.bus.get_config("vote_min_quorum", 3))
+        max_retries = int(await self.bus.get_config("vote_max_retries", 3))
 
-        vs = VoteState(plan_id=plan.plan_id, deadline=deadline)
-        self._active_votes[plan.plan_id] = vs
+        plan_payload = {
+            "plan_id": plan.plan_id,
+            "task_id": plan.task_id,
+            "original_task": plan.original_task[:200],
+            "steps": [
+                {"phase": s.phase, "agent": s.agent, "task": s.task[:80]}
+                for s in plan.steps
+            ],
+        }
 
-        await self.emit(
-            EventType.PLAN_PROPOSED,
-            payload={
-                "plan_id": plan.plan_id,
-                "task_id": plan.task_id,
-                "original_task": plan.original_task[:200],
-                "steps": [
-                    {"phase": s.phase, "agent": s.agent, "task": s.task[:80]}
-                    for s in plan.steps
-                ],
-            },
-            target="broadcast",
-        )
+        for attempt in range(1, max_retries + 2):  # +2: attempts 1..max_retries+1
+            deadline = time.monotonic() + vote_ms / 1000
+            vs = VoteState(plan_id=plan.plan_id, deadline=deadline, attempt=attempt)
+            self._active_votes[plan.plan_id] = vs
 
-        # Wait for votes with possible extension
-        while True:
-            effective = max(vs.deadline, vs.extended_until)
-            remaining = effective - time.monotonic()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(0.2, remaining))
-            if time.monotonic() >= effective:
-                break
+            await self.emit(EventType.PLAN_PROPOSED, payload=plan_payload, target="broadcast")
 
-        vs.resolved = True
-        self._active_votes.pop(plan.plan_id, None)
+            # Wait for votes with possible extension.
+            while True:
+                effective = max(vs.deadline, vs.extended_until)
+                remaining = effective - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.2, remaining))
 
-        if not vs.votes:
+            vs.resolved = True
+            self._active_votes.pop(plan.plan_id, None)
+
+            total_votes = len(vs.votes)
+
+            # ── Quorum check ──────────────────────────────────────────────────
+            if total_votes < min_quorum:
+                if attempt <= max_retries:
+                    log.warning(
+                        "orchestrator.plan_vote_quorum_missed",
+                        plan_id=plan.plan_id[:8],
+                        attempt=attempt,
+                        votes=total_votes,
+                        required=min_quorum,
+                    )
+                    await self._emit_plan_status(
+                        plan,
+                        f"🗳️ Vote attempt {attempt}: only {total_votes}/{min_quorum} votes received. Retrying…",
+                    )
+                    continue  # retry
+
+                # All retries exhausted — escalate to user.
+                log.warning(
+                    "orchestrator.plan_vote_escalating_to_user",
+                    plan_id=plan.plan_id[:8],
+                    attempts=attempt,
+                )
+                await self._emit_plan_status(
+                    plan,
+                    f"🗳️ Quorum not reached after {max_retries} retries — escalating to user.",
+                )
+                user_timeout_h = int(await self.bus.get_config("vote_user_timeout_hours", 48))
+                approved = await self._escalate_vote_to_user(
+                    vote_id=plan.plan_id,
+                    question=plan.original_task[:400],
+                    context="\n".join(
+                        f"Phase {s.phase} [{s.agent}]: {s.task[:80]}" for s in plan.steps
+                    ),
+                    timeout_hours=user_timeout_h,
+                    vote_type="plan",
+                )
+                if approved:
+                    log.info("orchestrator.plan_user_approved", plan_id=plan.plan_id[:8])
+                    return True, []
+                log.info("orchestrator.plan_user_rejected", plan_id=plan.plan_id[:8])
+                return False, ["User rejected the plan after quorum was not reached."]
+
+            # ── Quorum met — tally ────────────────────────────────────────────
+            if not vs.votes:
+                # Quorum is 0 edge-case guard (shouldn't happen given check above).
+                await self.emit(
+                    EventType.VOTE_RESULT,
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "task": plan.original_task[:200],
+                        "outcome": "approved",
+                        "yay": 0, "nay": 0, "total": 0,
+                        "votes": [], "reasons": [],
+                    },
+                    target="broadcast",
+                )
+                return True, []
+
+            yay = [v for v in vs.votes if v.get("approve", True)]
+            nay = [v for v in vs.votes if not v.get("approve", True)]
+            rejections = [v for v in nay if float(v.get("confidence", 0)) >= 0.7]
+
+            # Tie-breaking: orchestrator casts the deciding +1 yay.
+            tie_broken = False
+            if len(yay) == len(nay):
+                yay = list(yay) + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
+                tie_broken = True
+                log.info("orchestrator.plan_vote_tiebreak", plan_id=plan.plan_id[:8])
+
+            outcome = "rejected" if rejections else "approved"
             await self.emit(
                 EventType.VOTE_RESULT,
                 payload={
                     "plan_id": plan.plan_id,
                     "task": plan.original_task[:200],
-                    "outcome": "approved",
-                    "yay": 0,
-                    "nay": 0,
-                    "total": 0,
-                    "votes": [],
-                    "reasons": [],
+                    "outcome": outcome,
+                    "yay": len(yay),
+                    "nay": len(nay),
+                    "total": len(vs.votes),
+                    "votes": vs.votes,
+                    "reasons": [v.get("reason", "") for v in rejections],
+                    "tie_broken": tie_broken,
                 },
                 target="broadcast",
             )
-            return True, []  # silence = unanimous approval
 
-        yay = [v for v in vs.votes if v.get("approve", True)]
-        nay = [v for v in vs.votes if not v.get("approve", True)]
-        rejections = [v for v in nay if float(v.get("confidence", 0)) >= 0.7]
+            if rejections:
+                reasons = [v.get("reason", "no reason") for v in rejections]
+                reason_str = "; ".join(reasons)
+                await self._emit_plan_status(
+                    plan,
+                    f"🗳️ Plan contested by {len(rejections)} agent(s): {reason_str[:200]}. Revising…",
+                )
+                log.info(
+                    "orchestrator.plan_contested",
+                    plan_id=plan.plan_id[:8],
+                    rejections=len(rejections),
+                    reasons=reason_str[:120],
+                )
+                return False, reasons
 
-        outcome = "rejected" if rejections else "approved"
+            log.info(
+                "orchestrator.plan_approved",
+                plan_id=plan.plan_id[:8],
+                approvals=len(yay),
+                tie_broken=tie_broken,
+            )
+            return True, []
+
+        # Should be unreachable.
+        return True, []
+
+    async def _escalate_vote_to_user(
+        self,
+        *,
+        vote_id: str,
+        question: str,
+        context: str,
+        timeout_hours: int,
+        vote_type: str,
+    ) -> bool:
+        """
+        Emit VOTE_ESCALATED_TO_USER and wait for a VOTE_USER_RESULT event.
+
+        The Discord bridge posts an interactive embed with ✅/❌ buttons.
+        If the user does not respond within timeout_hours, the vote auto-rejects.
+
+        Returns True if the user approved, False otherwise.
+        """
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_user_votes[vote_id] = future
+
         await self.emit(
-            EventType.VOTE_RESULT,
+            EventType.VOTE_ESCALATED_TO_USER,
             payload={
-                "plan_id": plan.plan_id,
-                "task": plan.original_task[:200],
-                "outcome": outcome,
-                "yay": len(yay),
-                "nay": len(nay),
-                "total": len(vs.votes),
-                "votes": vs.votes,
-                "reasons": [v.get("reason", "") for v in rejections],
+                "vote_id": vote_id,
+                "question": question,
+                "context": context,
+                "vote_type": vote_type,
+                "timeout_hours": timeout_hours,
             },
             target="broadcast",
         )
 
-        if rejections:
-            reasons = [v.get("reason", "no reason") for v in rejections]
-            reason_str = "; ".join(reasons)
-            await self._emit_plan_status(
-                plan,
-                f"🗳️ Plan contested by {len(rejections)} agent(s): {reason_str[:200]}. Revising…",
+        timeout_secs = timeout_hours * 3600
+        approved = False
+        try:
+            approved = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_secs)
+        except asyncio.TimeoutError:
+            log.warning(
+                "orchestrator.user_vote_timeout",
+                vote_id=vote_id[:8],
+                timeout_hours=timeout_hours,
             )
-            log.info(
-                "orchestrator.plan_contested",
-                plan_id=plan.plan_id[:8],
-                rejections=len(rejections),
-                reasons=reason_str[:120],
-            )
-            return False, reasons
+            # approved stays False — auto-reject
+        finally:
+            self._pending_user_votes.pop(vote_id, None)
 
-        log.info(
-            "orchestrator.plan_approved",
-            plan_id=plan.plan_id[:8],
-            approvals=len(yay),
-        )
-        return True, []
+        return approved
 
     # ── Planning ─────────────────────────────────────────────────────────────
 

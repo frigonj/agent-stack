@@ -134,6 +134,11 @@ _CONTROL_HELP = (
     "`restart <service>` — restart a Docker container\n"
     "`restart all` — restart all agent containers\n"
     "`status` — show running containers\n"
+    "`relaunch code` — restart always-on services, no rebuild\n"
+    "`relaunch rebuild` — rebuild all images, restart always-on services\n"
+    "`relaunch rebuild <svc>` — rebuild and restart a single service\n"
+    "`relaunch flush` — rebuild + clear Redis streams (Postgres preserved)\n"
+    "`relaunch reset` — **destructive** full reset, destroys all data\n"
     "`build docs` — force a full architecture document rebuild now\n"
     "`verbose on` — forward all Redis events to #agent-logs\n"
     "`verbose off` — return to normal (only high-level events)\n"
@@ -378,6 +383,112 @@ class ClaudeEscalationView(discord.ui.View):
             )
 
 
+# ── User vote gate UI ─────────────────────────────────────────────────────────
+
+
+class UserVoteView(discord.ui.View):
+    """
+    Approve / Reject buttons for votes escalated to the user when agent quorum
+    was not met.  Auto-rejects on timeout (default 48 h).
+
+    On resolution the view emits vote.user_result to agents:orchestrator so the
+    waiting _escalate_vote_to_user coroutine can resolve its Future.
+    """
+
+    def __init__(
+        self,
+        vote_id: str,
+        vote_type: str,
+        redis_client: aioredis.Redis,
+        timeout_seconds: float,
+    ):
+        super().__init__(timeout=timeout_seconds)
+        self.vote_id = vote_id
+        self.vote_type = vote_type
+        self.redis = redis_client
+        self._decided = False
+
+    async def _resolve(self, interaction: discord.Interaction, approved: bool) -> None:
+        if self._decided:
+            await interaction.response.send_message("Already decided.", ephemeral=True)
+            return
+        self._decided = True
+
+        color = discord.Color.green() if approved else discord.Color.red()
+        label = "✅ Approved" if approved else "❌ Rejected"
+
+        embed = interaction.message.embeds[0]
+        embed.color = color
+        embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+        await self.redis.xadd(
+            "agents:orchestrator",
+            {
+                "event_id": str(uuid.uuid4()),
+                "type": "vote.user_result",
+                "source": "discord_bridge",
+                "task_id": str(uuid.uuid4()),
+                "timestamp": str(time.time()),
+                "payload": json.dumps(
+                    {
+                        "vote_id": self.vote_id,
+                        "approved": approved,
+                        "decided_by": interaction.user.display_name,
+                        "vote_type": self.vote_type,
+                    }
+                ),
+            },
+        )
+        log.info(
+            "discord_bridge.user_vote_resolved",
+            vote_id=self.vote_id,
+            approved=approved,
+            decided_by=interaction.user.display_name,
+        )
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, approved=True)
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="❌")
+    async def reject(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, approved=False)
+
+    async def on_timeout(self) -> None:
+        if not self._decided:
+            self._decided = True
+            await self.redis.xadd(
+                "agents:orchestrator",
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "type": "vote.user_result",
+                    "source": "discord_bridge",
+                    "task_id": str(uuid.uuid4()),
+                    "timestamp": str(time.time()),
+                    "payload": json.dumps(
+                        {
+                            "vote_id": self.vote_id,
+                            "approved": False,
+                            "decided_by": "timeout",
+                            "vote_type": self.vote_type,
+                        }
+                    ),
+                },
+            )
+            log.info(
+                "discord_bridge.user_vote_timeout",
+                vote_id=self.vote_id,
+            )
+
+
 # ── Bridge client ─────────────────────────────────────────────────────────────
 
 
@@ -419,6 +530,8 @@ class DiscordBridgeClient(discord.Client):
         self._PENDING_TTL_SECS = 1800  # 30 minutes — generous for slow tasks
         # log channel object — cached after first fetch
         self._log_channel = None
+        # Pending relaunch confirmations: message_id → (mode, svc, expires_at)
+        self._relaunch_pending: dict[int, tuple[str, str | None, float]] = {}
 
     async def setup_hook(self) -> None:
         self.redis = await aioredis.from_url(
@@ -764,8 +877,79 @@ class DiscordBridgeClient(discord.Client):
             log.info("discord_bridge.task_resume_requested", task_id=task_id)
             return
 
+        # relaunch [mode] [svc]
+        # Modes: code, rebuild, rebuild <svc>, flush, reset
+        # flush and reset are destructive — require a confirm reply before executing.
+        if parts and parts[0] == "relaunch":
+            mode = parts[1] if len(parts) >= 2 else "rebuild"
+            svc = parts[2] if len(parts) >= 3 else None
+
+            valid_modes = {"code", "rebuild", "flush", "reset"}
+            if mode not in valid_modes:
+                await message.reply(
+                    f"❓ Unknown relaunch mode `{mode}`. "
+                    f"Valid modes: {', '.join(sorted(valid_modes))}"
+                )
+                return
+
+            # Destructive modes require explicit confirmation.
+            if mode in ("flush", "reset"):
+                expires_at = time.time() + 120  # 2-minute window
+                self._relaunch_pending[message.id] = (mode, svc, expires_at)
+                warnings = {
+                    "flush": "⚠️ This will **clear all Redis streams** (pending events lost). Postgres data is preserved.",
+                    "reset": "🔴 **DESTRUCTIVE** — this will delete ALL data (Redis + Postgres volumes). All agent knowledge and task history will be lost.",
+                }
+                await message.reply(
+                    f"{warnings[mode]}\n\n"
+                    f"Reply `confirm` (within 2 minutes) to proceed with `relaunch {mode}`."
+                )
+                return
+
+            # Non-destructive modes run immediately.
+            await self._run_relaunch(message, mode, svc)
+            return
+
+        # confirm — resolve a pending relaunch
+        if lower == "confirm" and message.reference:
+            ref_id = message.reference.message_id
+            entry = self._relaunch_pending.pop(ref_id, None)
+            if entry is None:
+                await message.reply("❓ No pending relaunch to confirm.")
+                return
+            mode, svc, expires_at = entry
+            if time.time() > expires_at:
+                await message.reply("⏰ Confirmation window expired. Re-issue the relaunch command.")
+                return
+            await self._run_relaunch(message, mode, svc)
+            return
+
         # unrecognised
         await message.reply(f"❓ Unknown command. {_CONTROL_HELP}")
+
+    async def _run_relaunch(
+        self, message: discord.Message, mode: str, svc: str | None
+    ) -> None:
+        """Call /relaunch/<mode>[/<svc>] on the host helper and post the result."""
+        path = f"/relaunch/{mode}" + (f"/{svc}" if svc else "")
+        await message.add_reaction("⏳")
+        result = await self._call_helper("POST", path)
+        await message.remove_reaction("⏳", self.user)
+        ok = result.get("ok", False)
+        icon = "✅" if ok else "❌"
+        msg = result.get("message", str(result))
+        output = result.get("output", "").strip()
+        # Trim output to fit Discord's 2000-char limit alongside the header line.
+        if output:
+            header = f"{icon} {msg}\n```\n"
+            footer = "\n```"
+            max_out = 2000 - len(header) - len(footer)
+            if len(output) > max_out:
+                output = "..." + output[-max_out + 3:]
+            await message.reply(f"{header}{output}{footer}")
+        else:
+            await message.reply(f"{icon} {msg}")
+        log.info("discord_bridge.relaunch", mode=mode, svc=svc, ok=ok)
 
     async def _call_helper(self, method: str, path: str) -> dict:
         """Call the host restart helper over HTTP using async httpx."""
@@ -1030,6 +1214,9 @@ class DiscordBridgeClient(discord.Client):
 
         elif event_type == "vote.result":
             await self._post_vote_result(payload)
+
+        elif event_type == "vote.escalated_to_user":
+            await self._post_vote_escalated(payload)
 
         elif event_type == "context.closed":
             await self._post_context_closed(payload, channel)
@@ -1326,9 +1513,13 @@ class DiscordBridgeClient(discord.Client):
         vote_type = payload.get("vote_type", "plan")
         initiator = payload.get("initiator", "")
 
+        tie_broken = payload.get("tie_broken", False)
         if outcome == "approved":
             color = discord.Color.green()
-            title = "✅ Vote passed"
+            title = "✅ Vote passed" + (" (tie-broken by orchestrator)" if tie_broken else "")
+        elif outcome == "no_quorum":
+            color = discord.Color.yellow()
+            title = "⏳ Quorum not met — retrying vote…"
         else:
             color = discord.Color.red()
             title = "❌ Vote failed" + (" — plan will be revised" if vote_type == "plan" else "")
@@ -1364,6 +1555,39 @@ class DiscordBridgeClient(discord.Client):
         )
         embed.set_footer(text=f"{'Vote' if vote_type == 'peer' else 'Plan'} {plan_id}")
         await ch.send(embed=embed)
+
+    async def _post_vote_escalated(self, payload: dict) -> None:
+        """Post an interactive user-vote embed when agent quorum was not met."""
+        ch = await self._get_vote_channel()
+        if not ch:
+            return
+        vote_id = payload.get("vote_id", "")
+        question = payload.get("question", "")
+        context = payload.get("context", "")
+        vote_type = payload.get("vote_type", "peer")
+        timeout_hours = int(payload.get("timeout_hours", 48))
+
+        label = "Plan" if vote_type == "plan" else "Question"
+        desc = f"**{label}:** {question[:400]}"
+        if context:
+            desc += f"\n\n**Context:**\n{context[:800]}"
+        desc += f"\n\n⏳ Auto-rejects in **{timeout_hours} hours** if no response."
+
+        embed = discord.Embed(
+            title="🧑‍⚖️ Vote escalated — agent quorum not reached",
+            description=desc,
+            color=discord.Color.yellow(),
+        )
+        embed.set_footer(text=f"Vote {vote_id[:8]}")
+
+        view = UserVoteView(
+            vote_id=vote_id,
+            vote_type=vote_type,
+            redis_client=self.redis,
+            timeout_seconds=timeout_hours * 3600,
+        )
+        await ch.send(embed=embed, view=view)
+        log.info("discord_bridge.vote_escalated_posted", vote_id=vote_id[:8], timeout_hours=timeout_hours)
 
     async def _post_agent_vote(self, payload: dict) -> None:
         """Append a vote line to the existing plan-proposed embed (or post standalone)."""

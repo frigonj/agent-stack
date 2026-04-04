@@ -49,6 +49,9 @@ log = structlog.get_logger()
 CONFIG_DEFAULTS: dict[str, Any] = {
     "vote_timeout_ms": 20_000,  # ms agents have to vote on a plan (allows LLM evaluation)
     "vote_max_extension_ms": 15_000,  # max extra ms one agent can request (allows clarification round-trip)
+    "vote_min_quorum": 3,           # minimum votes required; if not met, retry the vote
+    "vote_max_retries": 3,          # retry attempts before escalating to the user
+    "vote_user_timeout_hours": 48,  # hours before a user-escalated vote auto-rejects
     "chat_idle_gap_secs": 1_800,  # 30 min idle → new chat session
     "chat_keyword_overlap": 0.4,  # Jaccard threshold for same session
     "max_concurrent_contexts": 5,  # per-agent context stream pool size
@@ -126,6 +129,8 @@ class EventType(str, Enum):
     VOTE_CLARIFICATION_RESPONSE = "vote.clarification_response"  # orchestrator answers the clarification
     PEER_VOTE_REQUESTED = "peer.vote_requested"  # any agent requests a general peer vote
     VOTE_INITIATED = "vote.initiated"  # orchestrator broadcasts a peer vote to all agents
+    VOTE_ESCALATED_TO_USER = "vote.escalated_to_user"  # quorum not met after retries → user decides
+    VOTE_USER_RESULT = "vote.user_result"  # user cast their vote via Discord
 
     # Pause / resume lifecycle
     TASK_PAUSED = "task.paused"    # research agent finished current iteration, loop stopped
