@@ -121,6 +121,7 @@ class EventType(str, Enum):
     VOTE_EXTENSION_REQUESTED = (
         "vote.extension_requested"  # agent needs more deliberation time
     )
+    VOTE_RESULT = "vote.result"  # orchestrator posts tally after voting closes
 
     # Pause / resume lifecycle
     TASK_PAUSED = "task.paused"    # research agent finished current iteration, loop stopped

@@ -719,6 +719,22 @@ class ExecutorAgent(BaseAgent):
 
         return count
 
+    async def on_plan_proposed(
+        self, plan_id: str, steps: list[dict], payload: dict
+    ) -> tuple[bool | None, str, float]:
+        """Vote on steps assigned to executor. Reject if any step looks unsafe."""
+        my_steps = [s for s in steps if s.get("agent") == "executor"]
+        if not my_steps:
+            return None, "", 0.0  # abstain — not involved in this plan
+        # Reject plans that ask executor to run obviously destructive commands
+        _DANGEROUS = ("rm -rf /", "mkfs", "dd if=", ":(){:|:&};:", "chmod 777 /")
+        for step in my_steps:
+            task_text = step.get("task", "").lower()
+            for pattern in _DANGEROUS:
+                if pattern in task_text:
+                    return False, f"step contains potentially destructive command: {pattern!r}", 0.9
+        return True, f"executor steps look safe ({len(my_steps)} step(s))", 0.8
+
     async def handle_event(self, event: Event) -> None:
         if event.type == EventType.TASK_ASSIGNED:
             if event.payload.get("assigned_to") == "executor":

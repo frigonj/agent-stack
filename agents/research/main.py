@@ -42,7 +42,7 @@ log = structlog.get_logger()
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
 MAX_SEARCH_ITERATIONS = int(os.getenv("MAX_SEARCH_ITERATIONS", "3"))
 MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "8"))
-MIN_SOURCES_FOR_CONSENSUS = 2  # ≥2 independent domains → fact is reliable
+MIN_SOURCES_FOR_CONSENSUS = 3  # ≥3 independent domains → fact is reliable
 CONFIDENCE_COMMIT_THRESHOLD = 0.75  # facts above this go to Postgres
 
 SYSTEM_PROMPT = """You are a research specialist. You receive internet search results and
@@ -124,7 +124,7 @@ def _decompose_prompt(question: str) -> str:
 def _extract_fact_prompt(query: str, snippet: str) -> str:
     return (
         "Extract ONE concise factual sentence (≤40 words) relevant to the query, or "
-        "return null if the snippet is not relevant.\n"
+        "return null if the snippet is not relevant, promotional, SEO filler, or lacks a verifiable claim.\n"
         "Return ONLY a JSON string or JSON null, nothing else.\n\n"
         f"Query: {query}\n"
         f"Snippet: {snippet[:800]}"
@@ -191,6 +191,15 @@ class ResearchAgent(BaseAgent):
             ["research", "current", "lookup", "news"],
         ),
     ]
+
+    async def on_plan_proposed(
+        self, plan_id: str, steps: list[dict], payload: dict
+    ) -> tuple[bool | None, str, float]:
+        """Vote on steps assigned to research. Abstain if not involved."""
+        my_steps = [s for s in steps if s.get("agent") == "research"]
+        if not my_steps:
+            return None, "", 0.0
+        return True, f"research steps look feasible ({len(my_steps)} step(s))", 0.8
 
     async def handle_event(self, event: Event) -> None:
         if event.type not in (EventType.TASK_ASSIGNED, EventType.TASK_CREATED):

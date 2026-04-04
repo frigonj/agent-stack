@@ -434,6 +434,11 @@ class BaseAgent(ABC):
             await self.stop(summary="shutdown requested by orchestrator")
             return
 
+        if event.type == EventType.PLAN_PROPOSED:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            asyncio.create_task(self._handle_plan_proposed(event))
+            return
+
         self._active_tasks += 1
         await self._set_status(
             "busy", task=event.payload.get("task", event.type.value)[:80]
@@ -1152,6 +1157,44 @@ class BaseAgent(ABC):
         )
 
     # ── Voting ───────────────────────────────────────────────────────────────
+
+    async def _handle_plan_proposed(self, event: "Event") -> None:
+        """
+        Called when a PLAN_PROPOSED broadcast is received.
+        Delegates to on_plan_proposed() so subclasses can inspect the plan
+        and cast a vote.  The base implementation auto-approves silently,
+        which preserves the existing "silence = approval" behaviour for
+        agents that don't override this method.
+        """
+        plan_id = event.payload.get("plan_id", "")
+        steps = event.payload.get("steps", [])
+        try:
+            approve, reason, confidence = await self.on_plan_proposed(plan_id, steps, event.payload)
+        except Exception as exc:
+            log.warning("agent.plan_proposed_handler_error", role=self.role, error=str(exc))
+            return
+        if approve is None:
+            return  # explicit opt-out — don't vote
+        await self.emit_vote(plan_id, approve=approve, reason=reason, confidence=confidence)
+
+    async def on_plan_proposed(
+        self,
+        plan_id: str,
+        steps: list[dict],
+        payload: dict,
+    ) -> tuple[bool | None, str, float]:
+        """
+        Override in subclasses to inspect a proposed plan and return a vote.
+
+        Return a 3-tuple: (approve, reason, confidence)
+          approve:    True to support, False to object, None to abstain (no vote emitted)
+          reason:     brief human-readable explanation
+          confidence: 0.0–1.0; only rejections with confidence ≥ 0.7 trigger plan revision
+
+        The default implementation abstains so agents that don't override this
+        method don't pollute the vote tally with unconsidered approvals.
+        """
+        return None, "", 0.0
 
     async def emit_vote(
         self,

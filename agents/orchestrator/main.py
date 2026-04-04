@@ -1622,13 +1622,42 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._active_votes.pop(plan.plan_id, None)
 
         if not vs.votes:
+            await self.emit(
+                EventType.VOTE_RESULT,
+                payload={
+                    "plan_id": plan.plan_id,
+                    "task": plan.original_task[:200],
+                    "outcome": "approved",
+                    "yay": 0,
+                    "nay": 0,
+                    "total": 0,
+                    "votes": [],
+                    "reasons": [],
+                },
+                target="broadcast",
+            )
             return True, []  # silence = unanimous approval
 
-        rejections = [
-            v
-            for v in vs.votes
-            if not v.get("approve", True) and float(v.get("confidence", 0)) >= 0.7
-        ]
+        yay = [v for v in vs.votes if v.get("approve", True)]
+        nay = [v for v in vs.votes if not v.get("approve", True)]
+        rejections = [v for v in nay if float(v.get("confidence", 0)) >= 0.7]
+
+        outcome = "rejected" if rejections else "approved"
+        await self.emit(
+            EventType.VOTE_RESULT,
+            payload={
+                "plan_id": plan.plan_id,
+                "task": plan.original_task[:200],
+                "outcome": outcome,
+                "yay": len(yay),
+                "nay": len(nay),
+                "total": len(vs.votes),
+                "votes": vs.votes,
+                "reasons": [v.get("reason", "") for v in rejections],
+            },
+            target="broadcast",
+        )
+
         if rejections:
             reasons = [v.get("reason", "no reason") for v in rejections]
             reason_str = "; ".join(reasons)
@@ -1644,11 +1673,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             )
             return False, reasons
 
-        approvals = [v for v in vs.votes if v.get("approve", True)]
         log.info(
             "orchestrator.plan_approved",
             plan_id=plan.plan_id[:8],
-            approvals=len(approvals),
+            approvals=len(yay),
         )
         return True, []
 

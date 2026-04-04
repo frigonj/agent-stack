@@ -1025,6 +1025,9 @@ class DiscordBridgeClient(discord.Client):
         elif event_type == "agent.vote":
             await self._post_agent_vote(payload)
 
+        elif event_type == "vote.result":
+            await self._post_vote_result(payload)
+
         elif event_type == "context.closed":
             await self._post_context_closed(payload, channel)
 
@@ -1272,33 +1275,67 @@ class DiscordBridgeClient(discord.Client):
             return None
 
     async def _post_plan_proposed(self, payload: dict) -> None:
-        """
-        Post a plan-proposed embed to #agent-deliberation so users can see
-        what the orchestrator is about to execute before agents vote.
-        """
+        """Post a brief vote-initiated notice to the votes channel."""
         ch = await self._get_vote_channel()
         if not ch:
             return
         plan_id = payload.get("plan_id", "")[:8]
         task = payload.get("original_task", "")
-        steps = payload.get("steps", [])
-        step_txt = (
-            "\n".join(
-                f"  Phase {s.get('phase', 1)}: [{s.get('agent', '?')}] {s.get('task', '')[:80]}"
-                for s in steps
-            )
-            or "(no steps)"
-        )
         embed = discord.Embed(
-            title="🗳️ Plan Proposed — Awaiting Agent Votes",
-            description=f"**Task:** {task[:300]}\n\n**Steps:**\n```{step_txt[:1500]}```",
+            title="🗳️ Vote initiated",
+            description=f"**Task:** {task[:300]}",
             color=discord.Color.og_blurple(),
         )
-        embed.set_footer(
-            text=f"Plan {plan_id} | Agents may vote within the timeout window"
-        )
+        embed.set_footer(text=f"Plan {plan_id} | awaiting agent votes…")
         msg = await ch.send(embed=embed)
         self._vote_messages[payload.get("plan_id", "")] = msg
+
+    async def _post_vote_result(self, payload: dict) -> None:
+        """Post vote tally to the votes channel after voting closes."""
+        ch = await self._get_vote_channel()
+        if not ch:
+            return
+        plan_id = payload.get("plan_id", "")[:8]
+        task = payload.get("task", "")
+        outcome = payload.get("outcome", "approved")
+        yay = payload.get("yay", 0)
+        nay = payload.get("nay", 0)
+        total = payload.get("total", 0)
+        votes: list[dict] = payload.get("votes", [])
+
+        if outcome == "approved":
+            color = discord.Color.green()
+            title = "✅ Vote passed"
+        else:
+            color = discord.Color.red()
+            title = "❌ Vote failed — plan will be revised"
+
+        if total == 0:
+            distribution = "No agents voted (silent approval)."
+        else:
+            yay_pct = int(yay / total * 100)
+            nay_pct = int(nay / total * 100)
+            distribution = f"**Yay:** {yay} ({yay_pct}%)  |  **Nay:** {nay} ({nay_pct}%)"
+
+        lines = []
+        for v in votes:
+            icon = "✅" if v.get("approve", True) else "❌"
+            agent = v.get("agent", "?")
+            conf = float(v.get("confidence", 1.0))
+            reason = v.get("reason", "") or "no reason"
+            lines.append(f"{icon} **{agent}** (conf={conf:.2f}): {reason[:120]}")
+
+        body = distribution
+        if lines:
+            body += "\n\n" + "\n".join(lines)
+
+        embed = discord.Embed(
+            title=title,
+            description=f"**Task:** {task[:200]}\n\n{body[:3800]}",
+            color=color,
+        )
+        embed.set_footer(text=f"Plan {plan_id}")
+        await ch.send(embed=embed)
 
     async def _post_agent_vote(self, payload: dict) -> None:
         """Append a vote line to the existing plan-proposed embed (or post standalone)."""
