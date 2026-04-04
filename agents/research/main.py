@@ -299,7 +299,7 @@ class ResearchAgent(BaseAgent):
                         title = hit.get("title", "")
                         domain = _domain(url)
 
-                        if not snippet or not url:
+                        if not snippet or not url or len(snippet) < 40:
                             continue
 
                         # Store raw snippet in context stream
@@ -523,10 +523,11 @@ class ResearchAgent(BaseAgent):
 
 def _compute_confidence(facts: list[dict]) -> list[dict]:
     """
-    Group facts by semantic similarity (simple: same sub_q bucket).
-    A fact earns confidence proportional to how many independent domains confirm it.
+    A fact earns confidence proportional to how many independent domains extracted
+    the same fact (matched by 60-char prefix), regardless of which sub-query found it.
     Returns only facts meeting CONFIDENCE_COMMIT_THRESHOLD, de-duplicated by domain+fact.
     """
+    # Deduplicate: one entry per (domain, fact-prefix) pair
     seen: set[tuple[str, str]] = set()
     deduped: list[dict] = []
     for f in facts:
@@ -535,16 +536,16 @@ def _compute_confidence(facts: list[dict]) -> list[dict]:
             seen.add(key)
             deduped.append(f)
 
-    # For each fact, count distinct domains that share the same sub_q
-    sub_q_domains: dict[str, set[str]] = {}
+    # Count distinct domains that extracted the same fact prefix (cross-sub-query)
+    fact_domains: dict[str, set[str]] = {}
     for f in deduped:
-        sq = f.get("sub_q", "")
-        sub_q_domains.setdefault(sq, set()).add(f.get("domain", ""))
+        fp = f.get("fact", "")[:60]
+        fact_domains.setdefault(fp, set()).add(f.get("domain", ""))
 
     result = []
     for f in deduped:
-        sq = f.get("sub_q", "")
-        n_agree = len(sub_q_domains.get(sq, set()))
+        fp = f.get("fact", "")[:60]
+        n_agree = len(fact_domains.get(fp, set()))
         conf = min(1.0, n_agree / MIN_SOURCES_FOR_CONSENSUS)
         if conf >= CONFIDENCE_COMMIT_THRESHOLD:
             result.append({**f, "confidence": round(conf, 2)})
