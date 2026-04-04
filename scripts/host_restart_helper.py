@@ -12,6 +12,7 @@ Endpoints:
   GET  /health              — liveness check
   GET  /status              — docker ps output
   POST /restart/<service>   — restart a service
+  POST /relaunch/<mode>     — run scripts/relaunch.sh <mode> (non-interactive)
 
 Services:
   lm-studio        — kill LM Studio.exe and relaunch
@@ -24,6 +25,13 @@ Services:
   redis            — docker restart agent_redis
   postgres         — docker restart agent_postgres
   all              — restart all agent containers (not infra)
+
+Relaunch modes (maps to scripts/relaunch.sh):
+  code             — restart always-on services, no rebuild
+  rebuild          — rebuild all images, restart always-on services
+  rebuild/<svc>    — rebuild and restart a single service
+  flush            — rebuild + clear Redis streams (no Postgres wipe)
+  reset            — full hard reset, destroys all volumes (DESTRUCTIVE)
 
 To start on Windows login: add to Task Scheduler or drop a .bat in
   shell:startup  →  python "C:\\path\\to\\scripts\\host_restart_helper.py"
@@ -230,6 +238,61 @@ def _do_restart(service: str) -> dict:
     return _restart_container(service)
 
 
+# Relaunch modes that run non-interactively (no confirmation prompts).
+# "reset" is intentionally excluded — it requires explicit Discord confirmation
+# before the bridge calls /relaunch/reset.
+_SAFE_RELAUNCH_MODES = {"code", "rebuild", "flush", "reset"}
+
+# Resolve script path relative to this file (both live in scripts/)
+_RELAUNCH_SCRIPT = Path(__file__).parent / "relaunch.sh"
+
+
+def _do_relaunch(mode: str, svc: str | None = None) -> dict:
+    """
+    Run scripts/relaunch.sh <mode> [svc] non-interactively via WSL bash.
+
+    The relaunch script contains interactive confirmation prompts for the
+    "flush" and "reset" modes.  We bypass those here by piping "yes\n" (flush)
+    or "yes\n" (reset typed as literal 'yes') into stdin so the script proceeds
+    automatically.  The Discord bridge is responsible for obtaining human
+    confirmation before calling this endpoint.
+    """
+    if mode not in _SAFE_RELAUNCH_MODES:
+        return {"ok": False, "message": f"Unknown relaunch mode: {mode!r}"}
+
+    if not _RELAUNCH_SCRIPT.exists():
+        return {"ok": False, "message": f"relaunch.sh not found at {_RELAUNCH_SCRIPT}"}
+
+    # Build args: optional single-service suffix for rebuild mode
+    args = [mode]
+    if svc:
+        args.append(svc)
+
+    # Pipe automatic confirmation for interactive prompts (flush → 'y', reset → 'yes')
+    stdin_input = "yes\n" if mode in ("flush", "reset") else None
+
+    # Run via WSL bash so the shell script and docker CLI work correctly on Windows
+    cmd = ["wsl", "bash", str(_RELAUNCH_SCRIPT).replace("\\", "/"), *args]
+
+    log.info("relaunch %s args=%s", mode, args)
+    try:
+        r = subprocess.run(
+            cmd,
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            timeout=300,  # rebuild can take several minutes
+        )
+        output = (r.stdout + r.stderr).strip()
+        if r.returncode == 0:
+            return {"ok": True, "message": f"Relaunch ({mode}) complete", "output": output}
+        return {"ok": False, "message": f"Relaunch ({mode}) failed (exit {r.returncode})", "output": output}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "message": f"Relaunch ({mode}) timed out after 5 minutes"}
+    except FileNotFoundError:
+        return {"ok": False, "message": "wsl not found — is WSL installed?"}
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 
@@ -260,10 +323,16 @@ class RestartHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
-        if len(parts) == 2 and parts[0] == "restart":
+        if len(parts) >= 2 and parts[0] == "restart":
             service = parts[1].lower()
             log.info("restart request: %s", service)
             result = _do_restart(service)
+            self._send_json(200, result)
+        elif len(parts) >= 2 and parts[0] == "relaunch":
+            mode = parts[1].lower()
+            svc = parts[2] if len(parts) >= 3 else None
+            log.info("relaunch request: mode=%s svc=%s", mode, svc)
+            result = _do_relaunch(mode, svc)
             self._send_json(200, result)
         else:
             self._send_json(404, {"error": "not found"})
