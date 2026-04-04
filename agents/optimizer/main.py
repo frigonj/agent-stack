@@ -59,7 +59,7 @@ _MAX_HISTORY = 20
 _REGRESSION_WARN = 0.20
 
 # Path to the perf suite inside the container.
-_PERF_DIR = Path(os.getenv("PERF_DIR", "/workspace/src/tests/perf"))
+_PERF_DIR = Path(os.getenv("PERF_DIR", "/workspace/tests/perf"))
 _BASELINE_FILE = _PERF_DIR / "perf_baseline.json"
 
 # Redis / Postgres / LM Studio URLs passed through from env.
