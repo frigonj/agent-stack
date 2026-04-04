@@ -631,16 +631,19 @@ class BaseAgent(ABC):
             response = await self.llm_invoke(msgs)
             content: str = response.content
 
+            # ── Parse action lines ─────────────────────────────────────────
+            actions = _ACTION_RE.findall(content)
+
             # ── Explicit DONE termination ──────────────────────────────────
+            # Check DONE *after* actions so that a response with both
+            # "CMD: ..." and "DONE: ..." executes the command first.
             done_m = _DONE_RE.search(content)
-            if done_m:
+            if done_m and not actions:
                 log.debug("agent_loop.done", role=self.role, step=step)
                 return done_m.group("answer").strip()
 
-            # ── Parse action lines ─────────────────────────────────────────
-            actions = _ACTION_RE.findall(content)
             if not actions:
-                # No action lines → treat full response as the final answer
+                # No action lines and no DONE → treat full response as the final answer
                 log.debug("agent_loop.implicit_done", role=self.role, step=step)
                 return content.strip()
 
@@ -665,6 +668,12 @@ class BaseAgent(ABC):
                 obs_parts.append(f"{prefix}: {payload}\nOBSERVATION: {obs}")
 
             obs_content = "\n\n".join(obs_parts)
+
+            # If DONE was present alongside actions, return now with the
+            # last observation as the result rather than looping again.
+            if done_m:
+                log.debug("agent_loop.done_after_actions", role=self.role, step=step)
+                return obs_parts[-1].split("OBSERVATION:", 1)[-1].strip()
 
             # Prune old observations if needed to stay within context
             msgs = await self._prune_loop_observations(msgs, obs_content)

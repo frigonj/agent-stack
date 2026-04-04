@@ -638,4 +638,6 @@ def _fallback_analysis(metrics: dict, regressions: list[dict]) -> dict:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    run_agent(OptimizerAgent)
+    settings = Settings()
+    agent = OptimizerAgent(settings)
+    run_agent(agent)

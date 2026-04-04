@@ -2657,14 +2657,42 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         "claude_code_agent": "agent_claude_code",
     }
 
+    # Extra containers that must be running before an agent can do its work.
+    # Keyed by agent role name → list of container names to start first.
+    _AGENT_DEPS = {
+        "research": ["agent_searxng"],
+    }
+
     async def _ensure_agent_running(
         self, agent: str, plan: "ExecutionPlan | None" = None
     ) -> bool:
         """Start an ephemeral agent container if it isn't already running.
+        Also starts any declared dependency containers (e.g. searxng for research).
         Uses `docker start` — no compose plugin required.
         Returns True on success, False if the container could not be started."""
         if agent not in self._EPHEMERAL_AGENTS:
             return True
+
+        # Start dependency containers first (fire-and-forget errors are logged but don't block).
+        for dep in self._AGENT_DEPS.get(agent, []):
+            try:
+                dep_proc = await asyncio.create_subprocess_exec(
+                    "docker", "start", dep,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, dep_err = await asyncio.wait_for(dep_proc.communicate(), timeout=60)
+                if dep_proc.returncode != 0:
+                    log.warning(
+                        "orchestrator.dep_start_failed",
+                        agent=agent, dep=dep,
+                        error=dep_err.decode().strip()[:200],
+                    )
+                else:
+                    log.info("orchestrator.dep_started", agent=agent, dep=dep)
+            except Exception as exc:
+                log.warning("orchestrator.dep_start_error", agent=agent, dep=dep, error=str(exc))
+
         container = self._CONTAINER_NAME.get(agent, f"agent_{agent}")
         if plan:
             await self._emit_plan_status(plan, f"🚀 Starting `{container}`…")

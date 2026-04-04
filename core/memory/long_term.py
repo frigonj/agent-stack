@@ -264,14 +264,18 @@ _SCHEMA = [
     # Survives process restarts and explicit pauses; deleted on final commit.
     """
     CREATE TABLE IF NOT EXISTS research_staging (
+        id         BIGSERIAL PRIMARY KEY,
         task_id    TEXT NOT NULL,
         iteration  INT  NOT NULL,
         fact_json  JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (task_id, iteration, (fact_json->>'url'), (fact_json->>'fact'))
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_research_staging_task ON research_staging(task_id, iteration)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_research_staging_dedup
+        ON research_staging(task_id, iteration, (fact_json->>'url'), (fact_json->>'fact'))
+    """,
     # ── active_plans additions ─────────────────────────────────────────────
     # paused status is enforced at application level; column additions are
     # safe to re-run (IF NOT EXISTS / IF NOT EXISTS equivalent via ADD COLUMN IF NOT EXISTS).
