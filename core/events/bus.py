@@ -124,6 +124,8 @@ class EventType(str, Enum):
     VOTE_RESULT = "vote.result"  # orchestrator posts tally after voting closes
     VOTE_CLARIFICATION_REQUEST = "vote.clarification_request"  # agent asks orchestrator to explain a plan step
     VOTE_CLARIFICATION_RESPONSE = "vote.clarification_response"  # orchestrator answers the clarification
+    PEER_VOTE_REQUESTED = "peer.vote_requested"  # any agent requests a general peer vote
+    VOTE_INITIATED = "vote.initiated"  # orchestrator broadcasts a peer vote to all agents
 
     # Pause / resume lifecycle
     TASK_PAUSED = "task.paused"    # research agent finished current iteration, loop stopped

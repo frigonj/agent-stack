@@ -1025,6 +1025,9 @@ class DiscordBridgeClient(discord.Client):
         elif event_type == "agent.vote":
             await self._post_agent_vote(payload)
 
+        elif event_type == "vote.initiated":
+            await self._post_vote_initiated(payload)
+
         elif event_type == "vote.result":
             await self._post_vote_result(payload)
 
@@ -1290,6 +1293,23 @@ class DiscordBridgeClient(discord.Client):
         msg = await ch.send(embed=embed)
         self._vote_messages[payload.get("plan_id", "")] = msg
 
+    async def _post_vote_initiated(self, payload: dict) -> None:
+        """Post a brief notice when a peer vote is opened by an agent."""
+        ch = await self._get_vote_channel()
+        if not ch:
+            return
+        vote_id = payload.get("vote_id", "")[:8]
+        question = payload.get("question", "")
+        initiator = payload.get("initiator", "unknown")
+        embed = discord.Embed(
+            title="🗳️ Peer vote opened",
+            description=f"**{initiator}** has called a vote.\n\n**Question:** {question[:400]}",
+            color=discord.Color.og_blurple(),
+        )
+        embed.set_footer(text=f"Vote {vote_id} | awaiting agent responses…")
+        msg = await ch.send(embed=embed)
+        self._vote_messages[payload.get("vote_id", "")] = msg
+
     async def _post_vote_result(self, payload: dict) -> None:
         """Post vote tally to the votes channel after voting closes."""
         ch = await self._get_vote_channel()
@@ -1303,12 +1323,15 @@ class DiscordBridgeClient(discord.Client):
         total = payload.get("total", 0)
         votes: list[dict] = payload.get("votes", [])
 
+        vote_type = payload.get("vote_type", "plan")
+        initiator = payload.get("initiator", "")
+
         if outcome == "approved":
             color = discord.Color.green()
             title = "✅ Vote passed"
         else:
             color = discord.Color.red()
-            title = "❌ Vote failed — plan will be revised"
+            title = "❌ Vote failed" + (" — plan will be revised" if vote_type == "plan" else "")
 
         if total == 0:
             distribution = "No agents voted (silent approval)."
@@ -1329,12 +1352,17 @@ class DiscordBridgeClient(discord.Client):
         if lines:
             body += "\n\n" + "\n".join(lines)
 
+        label = "Question" if vote_type == "peer" else "Task"
+        header = f"**{label}:** {task[:200]}"
+        if vote_type == "peer" and initiator:
+            header += f"\n**Initiated by:** {initiator}"
+
         embed = discord.Embed(
             title=title,
-            description=f"**Task:** {task[:200]}\n\n{body[:3800]}",
+            description=f"{header}\n\n{body[:3800]}",
             color=color,
         )
-        embed.set_footer(text=f"Plan {plan_id}")
+        embed.set_footer(text=f"{'Vote' if vote_type == 'peer' else 'Plan'} {plan_id}")
         await ch.send(embed=embed)
 
     async def _post_agent_vote(self, payload: dict) -> None:

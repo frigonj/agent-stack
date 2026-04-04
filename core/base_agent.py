@@ -445,6 +445,11 @@ class BaseAgent(ABC):
             asyncio.create_task(self._handle_plan_proposed(event))
             return
 
+        if event.type == EventType.VOTE_INITIATED:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            asyncio.create_task(self._handle_vote_initiated(event))
+            return
+
         if event.type == EventType.VOTE_CLARIFICATION_RESPONSE:
             await self.bus.ack(stream, self.group_name, entry_id)
             self._handle_clarification_response(event)
@@ -1311,6 +1316,169 @@ class BaseAgent(ABC):
             },
             target="broadcast",
         )
+
+    async def initiate_peer_vote(
+        self,
+        question: str,
+        context: str = "",
+        vote_id: str | None = None,
+    ) -> str:
+        """
+        Request a general peer vote from all agents on any question.
+        The orchestrator will start all ephemeral agents, broadcast the vote,
+        collect responses, tally results, and shut down vote-only agents.
+
+        Returns the vote_id so the caller can correlate the VOTE_RESULT event.
+        """
+        import uuid as _uuid
+        vid = vote_id or _uuid.uuid4().hex
+        await self.emit(
+            EventType.PEER_VOTE_REQUESTED,
+            payload={
+                "vote_id": vid,
+                "question": question[:400],
+                "context": context[:800],
+                "initiator": self.role,
+            },
+            target="orchestrator",
+        )
+        log.info(
+            "agent.peer_vote_requested",
+            role=self.role,
+            vote_id=vid[:8],
+            question=question[:80],
+        )
+        return vid
+
+    async def _handle_vote_initiated(self, event: "Event") -> None:
+        """
+        Called when a VOTE_INITIATED broadcast is received (peer vote in progress).
+        Delegates to on_vote_initiated() so subclasses can reason and cast a vote.
+        Uses the same clarification mechanism as plan votes.
+        """
+        vote_id = event.payload.get("vote_id", "")
+        question = event.payload.get("question", "")
+        context = event.payload.get("context", "")
+        initiator = event.payload.get("initiator", "orchestrator")
+
+        async def request_clarification(q: str, timeout: float = 8.0) -> str:
+            ev = asyncio.Event()
+            self._clarification_events[vote_id] = ev
+            self._clarification_answers.pop(vote_id, None)
+            await self.emit(
+                EventType.VOTE_CLARIFICATION_REQUEST,
+                payload={
+                    "plan_id": vote_id,  # reuse plan_id field for routing
+                    "question": q[:300],
+                    "original_task": question,
+                    "steps_summary": context,
+                },
+                target="orchestrator",
+            )
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=timeout)
+                return self._clarification_answers.get(vote_id, "")
+            except asyncio.TimeoutError:
+                log.warning(
+                    "agent.vote_clarification_timeout",
+                    role=self.role,
+                    vote_id=vote_id[:8],
+                )
+                return ""
+            finally:
+                self._clarification_events.pop(vote_id, None)
+                self._clarification_answers.pop(vote_id, None)
+
+        try:
+            approve, reason, confidence = await self.on_vote_initiated(
+                vote_id, question, context, initiator, request_clarification
+            )
+        except Exception as exc:
+            log.warning("agent.vote_initiated_handler_error", role=self.role, error=str(exc))
+            return
+        if approve is None:
+            return
+        await self.emit_vote(vote_id, approve=approve, reason=reason, confidence=confidence)
+
+    async def on_vote_initiated(
+        self,
+        vote_id: str,
+        question: str,
+        context: str,
+        initiator: str,
+        request_clarification=None,
+    ) -> tuple[bool | None, str, float]:
+        """
+        Called for every peer vote broadcast.  The base implementation uses
+        the LLM to reason about the question from this agent's perspective,
+        asks for clarification if needed, then votes.
+
+        Subclasses can override for specialised behaviour or to abstain.
+        """
+        from langchain_core.messages import HumanMessage as _HM, SystemMessage as _SM
+
+        try:
+            response = await self.llm_invoke([
+                _SM(content=(
+                    f"You are the {self.role} agent participating in a peer vote. "
+                    "Read the question and any context, then decide whether to vote yay or nay "
+                    "based on your role's domain knowledge and concerns.\n\n"
+                    "Reply in exactly this format:\n"
+                    "UNDERSTOOD: yes/no\n"
+                    "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
+                    "VOTE: yay/nay\n"
+                    "REASON: <one sentence>"
+                )),
+                _HM(content=(
+                    f"Question: {question}\n"
+                    + (f"Context: {context}" if context else "")
+                )),
+            ])
+            lines = {
+                k.strip(): v.strip()
+                for line in response.content.splitlines()
+                if ":" in line
+                for k, v in [line.split(":", 1)]
+            }
+        except Exception as exc:
+            log.warning("agent.peer_vote_llm_error", role=self.role, error=str(exc))
+            return None, "", 0.0  # abstain on LLM failure
+
+        understood = lines.get("UNDERSTOOD", "yes").lower() == "yes"
+        clarification_q = lines.get("CLARIFICATION_NEEDED", "none")
+        vote_str = lines.get("VOTE", "yay").lower()
+        reason = lines.get("REASON", "")
+
+        if not understood and clarification_q and clarification_q.lower() != "none" and request_clarification:
+            answer = await request_clarification(clarification_q)
+            if answer:
+                try:
+                    r2 = await self.llm_invoke([
+                        _SM(content=(
+                            f"You are the {self.role} agent re-evaluating a peer vote after clarification. "
+                            "Reply in exactly this format:\n"
+                            "VOTE: yay/nay\n"
+                            "REASON: <one sentence>"
+                        )),
+                        _HM(content=(
+                            f"Question: {question}\n"
+                            + (f"Context: {context}\n" if context else "")
+                            + f"Clarification: {answer}"
+                        )),
+                    ])
+                    lines2 = {
+                        k.strip(): v.strip()
+                        for line in r2.content.splitlines()
+                        if ":" in line
+                        for k, v in [line.split(":", 1)]
+                    }
+                    vote_str = lines2.get("VOTE", vote_str).lower()
+                    reason = lines2.get("REASON", reason)
+                except Exception:
+                    pass
+
+        approve = vote_str == "yay"
+        return approve, reason[:200], 0.8
 
     # ── Topic classification ──────────────────────────────────────────────────
 

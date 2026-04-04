@@ -829,6 +829,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_vote_extension(event)
         elif event.type == EventType.VOTE_CLARIFICATION_REQUEST:
             await self._handle_vote_clarification_request(event)
+        elif event.type == EventType.PEER_VOTE_REQUESTED:
+            asyncio.create_task(self._run_peer_vote(event))
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -1659,6 +1661,128 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         if ev is not None:
             vs.clarification_answers[asking_agent] = answer
             ev.set()
+
+    async def _run_peer_vote(self, event: Event) -> None:
+        """
+        Handle a PEER_VOTE_REQUESTED event from any agent.
+
+        1. Start all ephemeral agents that aren't already running, tracking
+           which ones were woken up solely for this vote.
+        2. Broadcast VOTE_INITIATED to all agents.
+        3. Collect votes for vote_timeout_ms (+ extensions).
+        4. Tally and emit VOTE_RESULT.
+        5. Shut down any agent that was started only for this vote and is
+           not currently executing a task.
+        """
+        vote_id = event.payload.get("vote_id", "")
+        question = event.payload.get("question", "")
+        context = event.payload.get("context", "")
+        initiator = event.payload.get("initiator", "unknown")
+
+        log.info(
+            "orchestrator.peer_vote_requested",
+            vote_id=vote_id[:8],
+            initiator=initiator,
+            question=question[:80],
+        )
+
+        # Track which agents we started solely for this vote.
+        woken_for_vote: set[str] = set()
+
+        # Start all ephemeral agents; record which were already running by
+        # checking if their container is in a running state before we start them.
+        start_tasks = []
+        for agent in self._EPHEMERAL_AGENTS:
+            container = self._CONTAINER_NAME.get(agent, f"agent_{agent}")
+            try:
+                inspect = await asyncio.create_subprocess_exec(
+                    "docker", "inspect", "--format", "{{.State.Running}}", container,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await asyncio.wait_for(inspect.communicate(), timeout=10)
+                already_running = out.decode().strip() == "true"
+            except Exception:
+                already_running = False
+
+            if not already_running:
+                woken_for_vote.add(agent)
+
+            start_tasks.append(self._ensure_agent_running(agent))
+
+        await asyncio.gather(*start_tasks, return_exceptions=True)
+
+        vote_ms = int(await self.bus.get_config("vote_timeout_ms", 20_000))
+        deadline = time.monotonic() + vote_ms / 1000
+        vs = VoteState(plan_id=vote_id, deadline=deadline)
+        self._active_votes[vote_id] = vs
+
+        await self.emit(
+            EventType.VOTE_INITIATED,
+            payload={
+                "vote_id": vote_id,
+                "question": question,
+                "context": context,
+                "initiator": initiator,
+            },
+            target="broadcast",
+        )
+
+        # Wait for votes with possible extension.
+        while True:
+            effective = max(vs.deadline, vs.extended_until)
+            remaining = effective - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.2, remaining))
+
+        vs.resolved = True
+        self._active_votes.pop(vote_id, None)
+
+        yay = [v for v in vs.votes if v.get("approve", True)]
+        nay = [v for v in vs.votes if not v.get("approve", True)]
+        outcome = "approved" if len(yay) >= len(nay) else "rejected"
+
+        await self.emit(
+            EventType.VOTE_RESULT,
+            payload={
+                "plan_id": vote_id,
+                "task": question,
+                "outcome": outcome,
+                "yay": len(yay),
+                "nay": len(nay),
+                "total": len(vs.votes),
+                "votes": vs.votes,
+                "reasons": [v.get("reason", "") for v in nay],
+                "vote_type": "peer",
+                "initiator": initiator,
+            },
+            target="broadcast",
+        )
+
+        log.info(
+            "orchestrator.peer_vote_result",
+            vote_id=vote_id[:8],
+            outcome=outcome,
+            yay=len(yay),
+            nay=len(nay),
+        )
+
+        # Shut down agents that were woken solely for this vote and are
+        # not currently assigned to an active plan.
+        active_plan_agents: set[str] = set()
+        for plan in self._plans.values():
+            if not plan.completed:
+                active_plan_agents.update(s.agent for s in plan.steps)
+
+        for agent in woken_for_vote:
+            if agent not in active_plan_agents:
+                await self.emit(
+                    EventType.AGENT_SHUTDOWN,
+                    payload={"vote_id": vote_id, "reason": "vote_complete"},
+                    target=agent,
+                )
+                log.info("orchestrator.vote_agent_shutdown", agent=agent, vote_id=vote_id[:8])
 
     async def _propose_plan_and_vote(
         self, plan: ExecutionPlan
