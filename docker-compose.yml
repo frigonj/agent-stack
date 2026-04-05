@@ -103,7 +103,8 @@ services:
       - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}   # Optional — #claude channel
       - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-} # Optional — #control channel
       - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}         # Optional — #agent-logs channel
-      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}      # Optional — #agent-deliberation channel
+      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}                        # Optional — #agent-deliberation channel
+      - DISCORD_USER_APPROVALS_CHANNEL_ID=${DISCORD_USER_APPROVALS_CHANNEL_ID:-}   # Optional — #user-approvals channel
       - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
       - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

@@ -32,12 +32,13 @@ claude.escalation event payload fields:
   escalation_id  — unique id for this escalation request
 
 Environment variables:
-  DISCORD_BOT_TOKEN          — required
-  DISCORD_TASK_CHANNEL_ID    — required (#agent-tasks)
-  DISCORD_CLAUDE_CHANNEL_ID  — optional (#claude → Claude API agent)
-  DISCORD_CONTROL_CHANNEL_ID — optional (#control → restart commands)
-  CONTROL_HELPER_URL         — optional (default http://host.docker.internal:7799)
-  DISCORD_GUILD_ID           — optional (auto-detected)
+  DISCORD_BOT_TOKEN                 — required
+  DISCORD_TASK_CHANNEL_ID           — required (#agent-tasks)
+  DISCORD_CLAUDE_CHANNEL_ID         — optional (#claude → Claude API agent)
+  DISCORD_CONTROL_CHANNEL_ID        — optional (#control → restart commands)
+  DISCORD_USER_APPROVALS_CHANNEL_ID — optional (#user-approvals → user-escalated votes)
+  CONTROL_HELPER_URL                — optional (default http://host.docker.internal:7799)
+  DISCORD_GUILD_ID                  — optional (auto-detected)
 """
 
 from __future__ import annotations
@@ -156,6 +157,9 @@ VISIBLE_EVENTS = {
     "system.error",
     "plan.proposed",
     "agent.vote",
+    "vote.initiated",
+    "vote.result",
+    "vote.escalated_to_user",
     "context.closed",
     "agent.response",
     "discord.action",
@@ -507,6 +511,7 @@ class DiscordBridgeClient(discord.Client):
         control_channel_id: str | None = None,
         log_channel_id: str | None = None,
         vote_channel_id: str | None = None,
+        user_approvals_channel_id: str | None = None,
         control_helper_url: str = "http://host.docker.internal:7799",
         guild_id: str | None = None,
         **kwargs,
@@ -518,6 +523,7 @@ class DiscordBridgeClient(discord.Client):
         self.control_channel_id = control_channel_id
         self.log_channel_id = log_channel_id
         self.vote_channel_id = vote_channel_id  # #agent-deliberation channel
+        self.user_approvals_channel_id = user_approvals_channel_id  # #user-approvals channel
         self.control_helper_url = control_helper_url.rstrip("/")
         self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
@@ -1464,6 +1470,15 @@ class DiscordBridgeClient(discord.Client):
         except Exception:
             return None
 
+    async def _get_user_approvals_channel(self):
+        """Return the #user-approvals channel, falling back to the vote channel."""
+        for cid in filter(None, [self.user_approvals_channel_id]):
+            try:
+                return await self.fetch_channel(int(cid))
+            except Exception:
+                pass
+        return await self._get_vote_channel()
+
     async def _post_plan_proposed(self, payload: dict) -> None:
         """Post a brief vote-initiated notice to the votes channel."""
         ch = await self._get_vote_channel()
@@ -1558,7 +1573,7 @@ class DiscordBridgeClient(discord.Client):
 
     async def _post_vote_escalated(self, payload: dict) -> None:
         """Post an interactive user-vote embed when agent quorum was not met."""
-        ch = await self._get_vote_channel()
+        ch = await self._get_user_approvals_channel()
         if not ch:
             return
         vote_id = payload.get("vote_id", "")
@@ -1736,6 +1751,7 @@ def main() -> None:
     control_channel_id = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
     log_channel_id = os.environ.get("DISCORD_LOG_CHANNEL_ID")
     vote_channel_id = os.environ.get("DISCORD_VOTE_CHANNEL_ID")  # #agent-deliberation
+    user_approvals_channel_id = os.environ.get("DISCORD_USER_APPROVALS_CHANNEL_ID")  # #user-approvals
     control_helper_url = os.environ.get(
         "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
     )
@@ -1753,6 +1769,7 @@ def main() -> None:
         control_channel_id=control_channel_id,
         log_channel_id=log_channel_id,
         vote_channel_id=vote_channel_id,
+        user_approvals_channel_id=user_approvals_channel_id,
         control_helper_url=control_helper_url,
         guild_id=guild_id,
         intents=intents,
@@ -1765,6 +1782,7 @@ def main() -> None:
         control_channel=control_channel_id or "(not configured)",
         log_channel=log_channel_id or "(not configured)",
         vote_channel=vote_channel_id or "(not configured — using log/task channel)",
+        user_approvals_channel=user_approvals_channel_id or "(not configured — using vote channel)",
     )
     client.run(bot_token)
 
