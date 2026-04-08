@@ -28,12 +28,16 @@ import time
 from pathlib import Path
 
 import pytest
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
+
+# Load .env so LM_STUDIO_URL / LM_STUDIO_MODEL are available without hardcoding
+load_dotenv(Path(__file__).parents[2] / ".env")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
-LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "qwen2.5-14b")
+LM_STUDIO_MODEL = os.environ["LM_STUDIO_MODEL"]
 
 BASELINE_FILE = Path(__file__).parent / "throughput_baseline.json"
 REGRESSION_THRESHOLD = 0.20  # 20% drop triggers a failure

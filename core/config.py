@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     )
     lm_studio_model: str = Field("qwen3-vl-8b", validation_alias="LM_STUDIO_MODEL")
 
+    # Claude fallback (used when ANTHROPIC_API_KEY is set and LM Studio circuit-breaks)
+    claude_fallback_model: str = Field(
+        "claude-haiku-4-5-20251001", validation_alias="CLAUDE_FALLBACK_MODEL"
+    )
+
     # Agent identity
     agent_role: str = Field("agent", validation_alias="AGENT_ROLE")
 

@@ -146,7 +146,7 @@ class BaseAgent(ABC):
                 from langchain_anthropic import ChatAnthropic
 
                 self._claude_fallback: Optional[Any] = ChatAnthropic(
-                    model="claude-haiku-4-5-20251001",  # cheapest/fastest for fallback
+                    model=settings.claude_fallback_model,
                     api_key=_api_key,
                     temperature=0.1,
                     max_tokens=2048,
