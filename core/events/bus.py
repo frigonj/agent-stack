@@ -601,9 +601,7 @@ class EventBus:
 
     # ── Peer-vote result helpers ──────────────────────────────────────────────
 
-    async def wait_for_vote_result(
-        self, vote_id: str, timeout: float = 120.0
-    ) -> str:
+    async def wait_for_vote_result(self, vote_id: str, timeout: float = 120.0) -> str:
         """
         Block until the orchestrator pushes the final outcome for *vote_id*.
 

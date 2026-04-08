@@ -40,3 +40,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Claude Code local settings (machine-specific paths)
+.claude/settings.json

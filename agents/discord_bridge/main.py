@@ -2044,7 +2044,9 @@ class DiscordBridgeClient(discord.Client):
                 ),
                 color=discord.Color.orange(),
             )
-            embed.add_field(name="Command", value=f"```{command[:900]}```", inline=False)
+            embed.add_field(
+                name="Command", value=f"```{command[:900]}```", inline=False
+            )
             if task:
                 embed.add_field(name="Task context", value=task[:300], inline=False)
             embed.add_field(
@@ -2064,7 +2066,9 @@ class DiscordBridgeClient(discord.Client):
                 description=f"**{icon} {source}** wants to run a privileged command.",
                 color=discord.Color.yellow(),
             )
-            embed.add_field(name="Command", value=f"```{command[:900]}```", inline=False)
+            embed.add_field(
+                name="Command", value=f"```{command[:900]}```", inline=False
+            )
             if task:
                 embed.add_field(name="Task context", value=task[:300], inline=False)
             embed.set_footer(text="No response within 5 minutes = auto-denied")

@@ -615,7 +615,9 @@ REQUIRES_APPROVAL = {
 _PIP_SAFE_SUBCOMMANDS = {"list", "show", "freeze", "check", "inspect"}
 
 
-_ALLOWLIST_REDIS_KEY = "executor:runtime_allowlist"  # Redis Set — persists across restarts
+_ALLOWLIST_REDIS_KEY = (
+    "executor:runtime_allowlist"  # Redis Set — persists across restarts
+)
 
 
 class ExecutorAgent(BaseAgent):
@@ -1180,9 +1182,13 @@ class ExecutorAgent(BaseAgent):
         # Check runtime allowlist first (commands approved by agents+user at runtime)
         runtime_allowed = base_cmd in getattr(self, "_runtime_allowlist", set())
 
-        if not pip_read_only and not runtime_allowed and (
-            base_cmd in REQUIRES_APPROVAL
-            or (base_cmd in AUTO_APPROVED_COMMANDS and self._needs_escalation(cmd))
+        if (
+            not pip_read_only
+            and not runtime_allowed
+            and (
+                base_cmd in REQUIRES_APPROVAL
+                or (base_cmd in AUTO_APPROVED_COMMANDS and self._needs_escalation(cmd))
+            )
         ):
             approved = await self._request_approval(cmd, task, task_id)
             if not approved:
@@ -1306,7 +1312,9 @@ class ExecutorAgent(BaseAgent):
 
         # ── Step 2: user escalation ──────────────────────────────────────────
         approval_id = str(uuid.uuid4())
-        log.info("executor.allowlist_user_escalation", cmd=base_cmd, approval_id=approval_id)
+        log.info(
+            "executor.allowlist_user_escalation", cmd=base_cmd, approval_id=approval_id
+        )
 
         await self.emit(
             EventType.APPROVAL_REQUIRED,
