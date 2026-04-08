@@ -23,9 +23,11 @@ import json
 import time
 import uuid
 
+import os
+
 import pytest
 
-REDIS_URL = "redis://localhost:6379"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 PERF_STREAM = "perf:event_bus_test"
 PERF_GROUP = "perf_consumer_group"
 PERF_CONSUMER = "perf_consumer_1"
@@ -54,7 +56,7 @@ def _redis_available() -> bool:
 
 redis_live = pytest.mark.skipif(
     not _redis_available(),
-    reason="Redis not reachable at localhost:6379 — start the stack to run perf tests",
+    reason=f"Redis not reachable at {REDIS_URL} — start the stack to run perf tests",
 )
 
 
@@ -227,7 +229,9 @@ async def test_round_trip_latency():
         await r.xadd(stream, {"event": payload})
 
         while True:
-            entries = await r.xreadgroup(group, "rtt_consumer", {stream: ">"}, count=1, block=100)
+            entries = await r.xreadgroup(
+                group, "rtt_consumer", {stream: ">"}, count=1, block=100
+            )
             if entries:
                 for _s, messages in entries:
                     ids = [mid for mid, _ in messages]

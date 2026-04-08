@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -59,7 +60,10 @@ _FULL_BUILD_INTERVAL = int(os.getenv("ARCH_FULL_BUILD_INTERVAL", str(86400)))
 # AND the optimizer has not run within the cooldown window.
 _OPT_LAST_RUN_KEY = "optimizer:last_run"  # Unix timestamp (str) in Redis
 _OPT_IDLE_TRIGGER_S = int(os.getenv("OPTIMIZER_IDLE_TRIGGER_S", str(15 * 60)))  # 15 min
-_OPT_COOLDOWN_S = int(os.getenv("OPTIMIZER_COOLDOWN_S", str(12 * 3600)))        # 12 h
+_OPT_COOLDOWN_S = int(os.getenv("OPTIMIZER_COOLDOWN_S", str(12 * 3600)))  # 12 h
+
+_QUEUE_SCAN_KEY = "queue_scan:last_run"  # Unix timestamp (str) in Redis
+_QUEUE_SCAN_INTERVAL_S = int(os.getenv("QUEUE_SCAN_INTERVAL_S", str(3 * 3600)))  # 3 h
 
 WATCHED_PATHS: list[str] = [
     "/workspace/src/docker-compose.yml",
@@ -252,6 +256,17 @@ _KEYWORD_ROUTES: list[tuple[re.Pattern, str]] = [
             re.I,
         ),
         "optimizer",
+    ),
+    # Merch bot — find trending topics and generate merch concepts
+    (
+        re.compile(
+            r"\b(merch|merchandise)\b.{0,60}\b(idea|concept|design|topic|trend|bot|generat)\b"
+            r"|\b(trending|viral|popular)\b.{0,40}\b(merch|merchandise|design)\b"
+            r"|\bmerch\s+bot\b"
+            r"|\bfind\b.{0,40}\bmerch\b",
+            re.I,
+        ),
+        "merch",
     ),
     # Direct — never reached; kept as fallback sentinel only
     # Conversational classification is handled by _classify_intent() before routing.
@@ -471,38 +486,68 @@ SYSTEM_PROMPT = """You are the technical project manager of an AI agent stack.
 Never create a plan for conversational messages. When in doubt, respond directly.
 Always resolve pronouns and references ("the tool", "it", "that") from conversation context before deciding to clarify.
 
-## Specialists
-- executor          : shell commands, file R/W, docker operations, running Python/bash scripts,
-                      web fetches (curl/wget), package installs. Paths available:
-                      /workspace/src (agent source — read/write), /workspace/user (user home),
-                      /workspace/projects (coding projects), /workspace/tools (reusable scripts).
-                      Safe without approval: ls, cat, grep, find, curl, python3 -c.
-                      Requires approval: git push/commit, docker restart/rm, tee (file writes), pip install.
-- document_qa       : answer questions from documents in /workspace/docs (PDF, markdown, text);
-                      review agent-stack source architecture at /workspace/src;
-                      generate LaTeX documents and compile them to PDF via latexmk;
-                      output goes to /workspace/docs/generated/.
-- code_search       : search and explain code in /workspace/repos (function definitions, usages, patterns).
-- research          : multi-source internet research via SearXNG (Google+Bing+DDG aggregated).
-                      Decomposes questions into sub-queries, searches, extracts facts, checks consensus
-                      across independent sources, then synthesises a cited answer. Zero Claude API calls.
-                      Use for: "what is X", "latest version of Y", "current status of Z", web lookups.
-- developer         : code developer — writes, edits, refactors, and fixes code in the agent stack
-                      (/workspace/src) and user projects (/workspace/projects).
-                      Capabilities: implement features, fix bugs, scaffold new agent modules,
-                      write tests, review code. Uses executor for file writes (approval-gated)
-                      and code_search for codebase navigation.
-                      Use for: "add X feature", "fix the Y bug", "refactor Z", "write tests for W",
-                      "create a new agent", "review this file".
-- claude_code_agent : full Anthropic Claude API agent with tool use — best for complex multi-step reasoning,
-                      code generation, analysis, or tasks requiring very deep intelligence.
-                      Do NOT use for simple web lookups — use research agent instead.
-- discord           : full Discord server management — channels, categories, topics, messages, pins.
-- optimizer         : runs the perf test suite (Redis throughput, LLM latency, memory ops, end-to-end
-                      latency) and produces structured improvement suggestions. Always-on agent —
-                      dispatched automatically when the stack has been idle for 15 min. Can be triggered
-                      manually: "run the optimizer", "check performance", "what's slow", "optimise the stack".
-                      Accepts optional focus parameter: redis | llm | memory | e2e.
+## Specialists and routing rules
+
+### executor
+Runs shell commands, reads/writes files, manages Docker containers.
+- ALWAYS use for: ls, cat, grep, find, docker ops, running scripts, curl, pip install
+- Safe (no approval): ls, cat, grep, find, head, tail, python3 -c, docker logs/inspect
+- Requires approval: git push/commit, docker restart/rm, tee (file writes), pip install
+- Paths: /workspace/src (agent source), /workspace/user (user home),
+         /workspace/projects (coding projects), /workspace/tools (reusable scripts)
+- NEVER use executor to understand or write code — that's developer + code_search
+
+### code_search
+Investigation and analysis of codebases — finding, explaining, and understanding code.
+- Use for: "what does X do?", "find all usages of Y", "where is Z defined?",
+           "explain how this module works", "find all occurrences of pattern X"
+- Returns findings to caller; does NOT write or modify code
+- When code_search finds a bug or improvement opportunity, it flags it for developer
+- NEVER route code *modification* tasks to code_search
+
+### developer
+Writes, edits, refactors, and fixes code. Delegates: reads→code_search, writes→executor.
+- Use for: "add feature X", "fix bug Y", "refactor Z", "write tests for W",
+           "create new agent", "implement this change"
+- developer proposes changes; executor writes files (approval-gated for state-changing ops)
+- developer calls code_search for navigation; does NOT run shell commands directly
+- NEVER route "explain what this does" tasks to developer (use code_search)
+
+### research
+Multi-source internet research via SearXNG (Google+Bing+DDG).
+- Use for: "what is X?", "latest version of Y", "current news/status of Z", any web lookup
+- Returns sourced, consensus-checked facts. Zero Claude API calls.
+- NEVER use for codebase questions — that's code_search
+
+### document_qa
+Answers questions from /workspace/docs (PDF, markdown). Generates architecture docs and LaTeX PDFs.
+- Use for: questions about project documentation, architecture review, generating reports/PDFs
+- Output goes to /workspace/docs/generated/
+
+### claude_code_agent
+Full Anthropic Claude API with tool use. Best for complex multi-step reasoning requiring
+the highest intelligence — use only when local LLM (Qwen) is insufficient.
+- Use for: complex analysis, nuanced code generation, tasks needing deep reasoning
+- Do NOT use for web lookups (→research), simple shell ops (→executor), or routine code edits (→developer)
+
+### discord
+Discord server management — channels, categories, topics, messages, pins.
+- Use for: create/rename/delete channels, send messages, manage server structure
+
+### optimizer
+Runs perf test suite and produces improvement suggestions. Always-on; auto-triggered after 15 min idle.
+- Use for: "run the optimizer", "check performance", "what's slow", "optimise the stack"
+- Accepts optional focus: redis | llm | memory | e2e
+
+## Routing decision tree
+1. Shell command / file read / Docker → executor
+2. "What does X code do?" / find patterns / explain code → code_search
+3. Write/fix/refactor code → developer (delegates searches to code_search, writes to executor)
+4. Web lookup / current info / internet research → research
+5. Questions about docs / generate PDF → document_qa
+6. Complex reasoning / nuanced analysis → claude_code_agent
+7. Discord server actions → discord
+8. Performance / slow queries → optimizer
 
 ## Stack architecture (for context)
 - Redis Streams     : event bus between agents (streams: agents:{role}, agents:broadcast)
@@ -520,13 +565,16 @@ Always resolve pronouns and references ("the tool", "it", "that") from conversat
                       save_context_snapshot / close_context_snapshot / search_context_snapshots
                       save_topic_pattern / search_topic_patterns — topic category learning
                       Full source: /workspace/emrys/ (README, src/, pyproject.toml)
-- LM Studio         : local LLM inference at http://host.docker.internal:1234 (model: qwen2.5-14b)
+- LM Studio         : local LLM inference at http://host.docker.internal:1234 (model: qwen3-vl-8b)
 
-## Voting
-Before executing a plan, broadcast PLAN_PROPOSED. Specialist agents may reply with AGENT_VOTE
-(approve=True/False, reason, confidence 0–1) within the vote_timeout_ms window (default 3 s,
-configurable via self.bus.set_config). Agents may request more time via VOTE_EXTENSION_REQUESTED.
-High-confidence rejections (confidence ≥ 0.7) trigger plan revision before execution.
+## Voting (objection-driven — silence means approval)
+Before executing a plan, broadcast PLAN_PROPOSED so specialist agents can raise concerns.
+Agents should ABSTAIN (return None) unless they have a genuine concern, disagreement, or
+question about the plan — most plans are fine and should proceed without votes.
+Voting is NOT a rubber-stamp ritual; it is an exception handler for contested decisions.
+If no agent raises a high-confidence objection (confidence ≥ 0.7) within vote_timeout_ms,
+the plan proceeds automatically. Only high-confidence rejections trigger plan revision.
+Use initiate_peer_vote() to call a vote on any specific question when agents disagree.
 
 ## Context recall by user
 Users can ask "recall <id>" or "show task <id>" to retrieve any past task, chat, or plan.
@@ -543,9 +591,31 @@ Agents maintain reusable scripts in /workspace/tools/. Before planning new work,
 if an existing tool covers the need. When completed work produces a reusable pattern,
 instruct executor to save it as a named script there.
 
-## Self-modification
-Source: /workspace/src/agents/<name>/main.py
-1. cat the file  2. tee new content (approval)  3. docker restart agent_<name> (approval)
+## Self-modification and self-improvement
+You and all agents can read, modify, and restart themselves. The executor is the execution
+arm — delegate file writes and restarts to it.
+
+Workflow:
+1. Identify what needs improving (from optimizer suggestions, failure patterns, or observation).
+2. Plan: delegate to executor — "cat /workspace/src/agents/<role>/main.py" to read current source.
+3. Delegate to developer — describe the exact change needed.
+4. Delegate to executor — tee the corrected file, then docker restart agent_<role>.
+5. Verify: check docker logs to confirm the restart succeeded.
+
+**When the optimizer publishes suggestions, act on them.** High-priority suggestions
+are automatically enqueued as tasks — when the think loop drains one, treat it as a
+real task: plan, delegate to developer+executor, restart the affected agent.
+
+**After any successful fix, store what worked:**
+  delegate to executor: store_finding("Fix: <what changed> — fixed <problem>", topic="self_improvement")
+
+**Prior knowledge section (injected above):** If it contains a USER CORRECTION or FAILURE
+entry relevant to this task, respect it — do not repeat the failed approach.
+
+Source paths: /workspace/src/agents/<name>/main.py
+Container names: agent_orchestrator, agent_executor, agent_document_qa,
+  agent_code_search, agent_discord_bridge, agent_claude_code, agent_developer,
+  agent_research, agent_optimizer
 """
 
 # ── Plan data model ───────────────────────────────────────────────────────────
@@ -666,7 +736,9 @@ class VoteState:
 
 
 class OrchestratorAgent(BaseAgent):
-    think_interval = 900  # 15 minutes
+    think_interval = (
+        60  # 1 minute — fast queue drain; individual checks are rate-limited
+    )
     PLAN_TIMEOUT = 1200  # stale plan expiry (20 min — accounts for agent startup time)
     _CONVERSATION_TIMEOUT = 900  # 15 min gap → reset context window
 
@@ -773,7 +845,15 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             "route-to-optimizer",
             "Run the performance test suite and receive concrete improvement suggestions for the agent stack",
             "event:task.assigned:optimizer",
-            ["optimizer", "perf", "performance", "benchmark", "bottleneck", "slow", "improve"],
+            [
+                "optimizer",
+                "perf",
+                "performance",
+                "benchmark",
+                "bottleneck",
+                "slow",
+                "improve",
+            ],
         ),
     ]
 
@@ -824,6 +904,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_task_paused(event)
         elif event.type == EventType.TASK_RESUMED:
             await self._handle_task_resumed(event)
+        elif event.type == EventType.TASK_UPDATED:
+            await self._handle_task_updated(event)
         elif event.type == EventType.DISCORD_ACTION_DONE:
             await self._handle_discord_done(event)
         elif event.type == EventType.AGENT_VOTE:
@@ -836,6 +918,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             asyncio.create_task(self._run_peer_vote(event))
         elif event.type == EventType.VOTE_USER_RESULT:
             await self._handle_vote_user_result(event)
+        elif event.type == EventType.AGENT_RESPONSE:
+            await self._handle_agent_response(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -975,6 +1059,14 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         return "task"  # safe fallback — always attempt to help
 
+    # Phrases that indicate the user is correcting a previous agent action.
+    _CORRECTION_PHRASES = re.compile(
+        r"\b(no[,\s]|wrong[,\s]|that'?s wrong|incorrect|not what i|that'?s not|"
+        r"don'?t do|shouldn'?t|you should(n'?t)?|try instead|use .* instead|"
+        r"actually[,\s]|i meant|what i wanted|please don'?t|stop doing)\b",
+        re.I,
+    )
+
     async def _respond_chat(
         self,
         task: str,
@@ -983,6 +1075,21 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         session_id: str = "",
     ) -> None:
         """Respond directly to a conversational message. No plan created."""
+        # Detect user correction and persist to memory immediately so future
+        # LLM calls are primed with the corrected expectation.
+        if self._CORRECTION_PHRASES.search(task):
+            # Include recent prior exchange as context for the correction
+            prior = ""
+            if self._conversation:
+                last = self._conversation[-1]
+                prior = f"Prior: You='{last[0][:120]}' Me='{last[1][:120]}'"
+            self.stage_finding(
+                content=f"USER CORRECTION: '{task[:300]}' {prior}",
+                topic="user_correction",
+                tags=["correction", "feedback", "orchestrator"],
+            )
+            log.info("orchestrator.user_correction_staged", task=task[:80])
+
         conversation_context = ""
         if self._conversation:
             now = time.time()
@@ -1000,8 +1107,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             if hist:
                 conversation_context = f"\n\nFrom chat history:\n{hist}"
 
+        mem_ctx = await self.build_task_context(task, tools_limit=0, memory_limit=4)
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=SYSTEM_PROMPT + mem_ctx),
             HumanMessage(content=task + conversation_context),
         ]
         response = await self.llm_invoke(messages)
@@ -1185,10 +1293,59 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             plan,
             f"▶ Resuming from phase {paused_at_phase}…",
         )
-        log.info(
-            "orchestrator.plan_resumed", task_id=task_id, phase=paused_at_phase
-        )
+        log.info("orchestrator.plan_resumed", task_id=task_id, phase=paused_at_phase)
         await self._dispatch_phase(plan, paused_at_phase)
+
+    # ── Task updated (user edited original Discord message) ───────────────────
+
+    async def _handle_task_updated(self, event: Event) -> None:
+        """
+        A user edited a Discord message that is currently an active in-flight task.
+        If the plan is still in the planning or early-running phase, amend the
+        original_task text and emit a plan.status notice.  If the plan is already
+        far along, log it and ignore — too late to interrupt.
+        """
+        task_id = event.payload.get("task_id") or event.task_id
+        updated_task = event.payload.get("updated_task", "").strip()
+        if not task_id or not updated_task:
+            return
+
+        plan = self._plans.get(task_id)
+        if not plan:
+            log.info("orchestrator.task_update_ignored_no_plan", task_id=task_id)
+            return
+
+        # Only amend if no steps have completed yet (still early)
+        completed_steps = sum(1 for s in plan.steps if s.status == "completed")
+        if completed_steps > 0:
+            await self._emit_plan_status(
+                plan,
+                f"✏️ Task edited but plan is already underway ({completed_steps} step(s) done) — update ignored.",
+            )
+            log.info(
+                "orchestrator.task_update_too_late",
+                task_id=task_id,
+                completed=completed_steps,
+            )
+            return
+
+        old_task = plan.original_task
+        plan.original_task = updated_task[:500]
+        await self.memory.upsert_plan(
+            task_id, plan.plan_id, plan.original_task, "planning", plan.to_dict()
+        )
+        await self._emit_plan_status(
+            plan,
+            f"✏️ Task updated by user — replanning with amended instructions.",
+        )
+        log.info(
+            "orchestrator.task_updated",
+            task_id=task_id,
+            old=old_task[:60],
+            new=updated_task[:60],
+        )
+        # Re-run planning with the updated task text
+        asyncio.create_task(self._run_task(updated_task, task_id))
 
     # ── Session reset ─────────────────────────────────────────────────────────
 
@@ -1717,7 +1874,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             container = self._CONTAINER_NAME.get(agent, f"agent_{agent}")
             try:
                 inspect = await asyncio.create_subprocess_exec(
-                    "docker", "inspect", "--format", "{{.State.Running}}", container,
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    container,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -1734,8 +1895,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         await asyncio.gather(*start_tasks, return_exceptions=True)
 
         vote_ms = int(await self.bus.get_config("vote_timeout_ms", 20_000))
-        min_quorum = int(await self.bus.get_config("vote_min_quorum", 3))
         max_retries = int(await self.bus.get_config("vote_max_retries", 3))
+
+        # Quorum = strict majority: more than half of all voters must respond.
+        # We include the orchestrator itself (+1) since it casts a tie-break vote.
+        # ceil(n_voters / 2) ensures > 50 % participation is always required.
+        n_voters = len(self._EPHEMERAL_AGENTS) + 1  # agents + orchestrator tie-break
+        min_quorum = math.ceil(n_voters / 2)
 
         vote_initiated_payload = {
             "vote_id": vote_id,
@@ -1755,7 +1921,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             vs = VoteState(plan_id=vote_id, deadline=deadline, attempt=attempt)
             self._active_votes[vote_id] = vs
 
-            await self.emit(EventType.VOTE_INITIATED, payload=vote_initiated_payload, target="broadcast")
+            await self.emit(
+                EventType.VOTE_INITIATED,
+                payload=vote_initiated_payload,
+                target="broadcast",
+            )
 
             # Wait for votes with possible extension.
             while True:
@@ -1786,10 +1956,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                             "plan_id": vote_id,
                             "task": question,
                             "outcome": "no_quorum",
-                            "yay": 0, "nay": 0,
+                            "yay": 0,
+                            "nay": 0,
                             "total": total_votes,
                             "votes": vs.votes,
-                            "reasons": [f"Quorum not met (attempt {attempt}/{max_retries}), retrying…"],
+                            "reasons": [
+                                f"Quorum not met (attempt {attempt}/{max_retries}), retrying…"
+                            ],
                             "vote_type": "peer",
                             "initiator": initiator,
                         },
@@ -1803,7 +1976,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     vote_id=vote_id[:8],
                     attempts=attempt,
                 )
-                user_timeout_h = int(await self.bus.get_config("vote_user_timeout_hours", 48))
+                user_timeout_h = int(
+                    await self.bus.get_config("vote_user_timeout_hours", 48)
+                )
                 user_approved = await self._escalate_vote_to_user(
                     vote_id=vote_id,
                     question=question,
@@ -1821,14 +1996,28 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         "yay": 1 if user_approved else 0,
                         "nay": 0 if user_approved else 1,
                         "total": 1,
-                        "votes": [{"agent": "user", "approve": user_approved, "confidence": 1.0, "reason": "user decision after quorum failure"}],
-                        "reasons": [] if user_approved else ["User rejected after quorum was not reached."],
+                        "votes": [
+                            {
+                                "agent": "user",
+                                "approve": user_approved,
+                                "confidence": 1.0,
+                                "reason": "user decision after quorum failure",
+                            }
+                        ],
+                        "reasons": []
+                        if user_approved
+                        else ["User rejected after quorum was not reached."],
                         "vote_type": "peer",
                         "initiator": initiator,
                     },
                     target="broadcast",
                 )
-                log.info("orchestrator.peer_vote_result", vote_id=vote_id[:8], outcome=outcome, via="user_escalation")
+                log.info(
+                    "orchestrator.peer_vote_result",
+                    vote_id=vote_id[:8],
+                    outcome=outcome,
+                    via="user_escalation",
+                )
                 break
 
             else:
@@ -1839,8 +2028,22 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
                 # Tie-breaking: orchestrator casts the deciding +1 yay.
                 if len(yay) == len(nay):
-                    yay = list(yay) + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
-                    all_votes = all_votes + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
+                    yay = list(yay) + [
+                        {
+                            "agent": "orchestrator",
+                            "approve": True,
+                            "confidence": 1.0,
+                            "reason": "tie-break",
+                        }
+                    ]
+                    all_votes = all_votes + [
+                        {
+                            "agent": "orchestrator",
+                            "approve": True,
+                            "confidence": 1.0,
+                            "reason": "tie-break",
+                        }
+                    ]
                     tie_broken = True
                     log.info("orchestrator.peer_vote_tiebreak", vote_id=vote_id[:8])
 
@@ -1886,19 +2089,25 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     payload={"vote_id": vote_id, "reason": "vote_complete"},
                     target=agent,
                 )
-                log.info("orchestrator.vote_agent_shutdown", agent=agent, vote_id=vote_id[:8])
+                log.info(
+                    "orchestrator.vote_agent_shutdown", agent=agent, vote_id=vote_id[:8]
+                )
 
     async def _propose_plan_and_vote(
         self, plan: ExecutionPlan
     ) -> tuple[bool, list[str]]:
         """
-        Broadcast a proposed plan, collect agent votes for vote_timeout_ms
-        (plus any granted extensions), then decide whether to proceed.
+        Broadcast a proposed plan, collect agent votes for vote_timeout_ms.
 
-        If fewer than vote_min_quorum votes arrive, the vote is retried up to
-        vote_max_retries times.  If quorum is still not met after all retries,
-        the question is escalated to the user via Discord with a 48 h window
-        (auto-rejects on timeout).
+        Voting policy (objection-driven, not consensus-required):
+          - If NO high-confidence objections (nay with confidence ≥ 0.7) arrive
+            within the window, the plan proceeds immediately — silence = approval.
+          - If ANY high-confidence objection arrives, the plan is contested and
+            will be revised.
+          - Quorum is only enforced when there is an active dispute (nay votes
+            present) — a plan with 0 votes proceeds without retries.
+          - User escalation only happens when agents are actively disagreeing AND
+            quorum cannot be reached after max_retries.
 
         Tie-breaking: when yay == nay the orchestrator casts the deciding +1 yay.
 
@@ -1924,7 +2133,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             vs = VoteState(plan_id=plan.plan_id, deadline=deadline, attempt=attempt)
             self._active_votes[plan.plan_id] = vs
 
-            await self.emit(EventType.PLAN_PROPOSED, payload=plan_payload, target="broadcast")
+            await self.emit(
+                EventType.PLAN_PROPOSED, payload=plan_payload, target="broadcast"
+            )
 
             # Wait for votes with possible extension.
             while True:
@@ -1938,8 +2149,39 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             self._active_votes.pop(plan.plan_id, None)
 
             total_votes = len(vs.votes)
+            active_nay = [
+                v
+                for v in vs.votes
+                if not v.get("approve", True) and float(v.get("confidence", 0)) >= 0.7
+            ]
 
-            # ── Quorum check ──────────────────────────────────────────────────
+            # ── Silence = approval: no high-confidence objections → proceed ──
+            # Quorum is only enforced when agents are actively objecting.
+            if total_votes < min_quorum and not active_nay:
+                log.info(
+                    "orchestrator.plan_no_objections",
+                    plan_id=plan.plan_id[:8],
+                    votes=total_votes,
+                )
+                # Emit a lightweight VOTE_RESULT so Discord shows the outcome
+                await self.emit(
+                    EventType.VOTE_RESULT,
+                    payload={
+                        "plan_id": plan.plan_id,
+                        "task": plan.original_task[:200],
+                        "outcome": "approved",
+                        "yay": 0,
+                        "nay": 0,
+                        "total": total_votes,
+                        "votes": vs.votes,
+                        "reasons": [],
+                        "note": "No objections — proceeding.",
+                    },
+                    target="broadcast",
+                )
+                return True, []
+
+            # ── Active dispute: quorum needed to resolve ──────────────────────
             if total_votes < min_quorum:
                 if attempt <= max_retries:
                     log.warning(
@@ -1965,18 +2207,23 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     plan,
                     f"🗳️ Quorum not reached after {max_retries} retries — escalating to user.",
                 )
-                user_timeout_h = int(await self.bus.get_config("vote_user_timeout_hours", 48))
+                user_timeout_h = int(
+                    await self.bus.get_config("vote_user_timeout_hours", 48)
+                )
                 approved = await self._escalate_vote_to_user(
                     vote_id=plan.plan_id,
                     question=plan.original_task[:400],
                     context="\n".join(
-                        f"Phase {s.phase} [{s.agent}]: {s.task[:80]}" for s in plan.steps
+                        f"Phase {s.phase} [{s.agent}]: {s.task[:80]}"
+                        for s in plan.steps
                     ),
                     timeout_hours=user_timeout_h,
                     vote_type="plan",
                 )
                 if approved:
-                    log.info("orchestrator.plan_user_approved", plan_id=plan.plan_id[:8])
+                    log.info(
+                        "orchestrator.plan_user_approved", plan_id=plan.plan_id[:8]
+                    )
                     return True, []
                 log.info("orchestrator.plan_user_rejected", plan_id=plan.plan_id[:8])
                 return False, ["User rejected the plan after quorum was not reached."]
@@ -1990,8 +2237,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         "plan_id": plan.plan_id,
                         "task": plan.original_task[:200],
                         "outcome": "approved",
-                        "yay": 0, "nay": 0, "total": 0,
-                        "votes": [], "reasons": [],
+                        "yay": 0,
+                        "nay": 0,
+                        "total": 0,
+                        "votes": [],
+                        "reasons": [],
                     },
                     target="broadcast",
                 )
@@ -2004,7 +2254,14 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             # Tie-breaking: orchestrator casts the deciding +1 yay.
             tie_broken = False
             if len(yay) == len(nay):
-                yay = list(yay) + [{"agent": "orchestrator", "approve": True, "confidence": 1.0, "reason": "tie-break"}]
+                yay = list(yay) + [
+                    {
+                        "agent": "orchestrator",
+                        "approve": True,
+                        "confidence": 1.0,
+                        "reason": "tie-break",
+                    }
+                ]
                 tie_broken = True
                 log.info("orchestrator.plan_vote_tiebreak", plan_id=plan.plan_id[:8])
 
@@ -2086,7 +2343,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         timeout_secs = timeout_hours * 3600
         approved = False
         try:
-            approved = await asyncio.wait_for(asyncio.shield(future), timeout=timeout_secs)
+            approved = await asyncio.wait_for(
+                asyncio.shield(future), timeout=timeout_secs
+            )
         except asyncio.TimeoutError:
             log.warning(
                 "orchestrator.user_vote_timeout",
@@ -2139,6 +2398,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         # Build plan steps
         keyword_plan = _route_by_keyword(task)
+
+        # Merch bot: special multi-phase workflow (research → synthesise)
+        if keyword_plan and keyword_plan[0].get("agent") == "merch":
+            await self._run_merch_workflow(task, task_id, discord_message_id)
+            return
+
         if keyword_plan and not retry_context:
             steps = [
                 PlanStep(
@@ -2432,11 +2697,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     step.result = "Could not parse Discord action from task description"
 
             elif step.agent == "direct":
+                task_ctx = await self.build_task_context(step.task)
                 messages = [
                     SystemMessage(
                         content=SYSTEM_PROMPT
                         + self.self_modify_context()
                         + self.task_queue_context()
+                        + task_ctx
                     ),
                     HumanMessage(content=f"Answer directly: {step.task}"),
                 ]
@@ -2955,6 +3222,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self.memory.upsert_plan(
                 plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict()
             )
+            # ── Feedback loop: persist failure pattern so agents learn from it ──
+            for s in exhausted:
+                self.stage_finding(
+                    content=(
+                        f"FAILURE: task='{s.task[:200]}' agent={s.agent} "
+                        f"depth={s.depth} error='{s.result[:300]}'\n"
+                        f"Parent task: {plan.original_task[:200]}"
+                    ),
+                    topic="task_failure",
+                    tags=["failure", s.agent, "feedback"],
+                )
             await self._shutdown_plan_agents(plan)
         else:
             # Phase succeeded
@@ -2994,6 +3272,18 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     plan.original_task,
                     "completed",
                     plan.to_dict(),
+                )
+                # ── Feedback loop: record successful plan as a reusable pattern ──
+                agent_sequence = " → ".join(
+                    dict.fromkeys(s.agent for s in plan.steps if s.status == "done")
+                )
+                self.stage_finding(
+                    content=(
+                        f"SUCCESS: task='{plan.original_task[:200]}' "
+                        f"agents={agent_sequence} phases={plan.max_phase()}"
+                    ),
+                    topic="task_success",
+                    tags=["success", "plan_pattern", "feedback"],
                 )
                 await self._shutdown_plan_agents(plan)
 
@@ -3135,7 +3425,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 except Exception:
                     pass
                 await asyncio.sleep(self._DEP_HEALTH_INTERVAL)
-        log.warning("orchestrator.dep_not_ready", dep=dep, url=url, timeout=self._DEP_HEALTH_TIMEOUT)
+        log.warning(
+            "orchestrator.dep_not_ready",
+            dep=dep,
+            url=url,
+            timeout=self._DEP_HEALTH_TIMEOUT,
+        )
         return False
 
     async def _ensure_agent_running(
@@ -3153,7 +3448,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         for dep in self._AGENT_DEPS.get(agent, []):
             try:
                 dep_proc = await asyncio.create_subprocess_exec(
-                    "docker", "start", dep,
+                    "docker",
+                    "start",
+                    dep,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -3161,14 +3458,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 if dep_proc.returncode != 0:
                     log.warning(
                         "orchestrator.dep_start_failed",
-                        agent=agent, dep=dep,
+                        agent=agent,
+                        dep=dep,
                         error=dep_err.decode().strip()[:200],
                     )
                 else:
                     log.info("orchestrator.dep_started", agent=agent, dep=dep)
                     await self._wait_for_dep_ready(dep)
             except Exception as exc:
-                log.warning("orchestrator.dep_start_error", agent=agent, dep=dep, error=str(exc))
+                log.warning(
+                    "orchestrator.dep_start_error", agent=agent, dep=dep, error=str(exc)
+                )
 
         container = self._CONTAINER_NAME.get(agent, f"agent_{agent}")
         if plan:
@@ -3328,6 +3628,22 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         discord_message_id: str | None = None,
     ) -> None:
         """Pass-through for single clean results; LLM synthesis for command output or multiple."""
+        # Merch bot: intercept research results and run merch synthesis
+        merch_key = f"merch:pending:{task_id}"
+        is_merch = await self.bus._client.getdel(merch_key)
+        if is_merch and raw_results:
+            trending_research = raw_results[0][1] if raw_results else ""
+            merch_concepts = await self._synthesise_merch_concepts(
+                task_id, trending_research
+            )
+            await self._publish_reply(
+                f"🛍️ **Trending Merch Ideas**\n\n{merch_concepts}",
+                task_id,
+                discord_message_id,
+                original_task=original_task,
+            )
+            return
+
         if len(raw_results) == 1:
             source, result = raw_results[0]
             result = result.strip()
@@ -3440,6 +3756,22 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         last_run_ago_h=round((now - last_run) / 3600, 1),
                     )
                     await self._dispatch_optimizer_run(reason="idle_trigger")
+
+        # ── Periodic task-queue scan (every 3 h) ─────────────────────────────
+        # Ask the Discord bridge to mark recent task-channel messages with ✅ or 📓
+        last_scan_raw = await self.bus._client.get(_QUEUE_SCAN_KEY)
+        last_scan = float(last_scan_raw) if last_scan_raw else 0.0
+        if (now - last_scan) >= _QUEUE_SCAN_INTERVAL_S:
+            await self.bus._client.set(_QUEUE_SCAN_KEY, str(now))
+            await self.emit(
+                EventType.DISCORD_ACTION,
+                payload={
+                    "action": "scan_task_queue",
+                    "limit": 50,
+                },
+                target="broadcast",
+            )
+            log.info("orchestrator.task_queue_scan_triggered")
 
         pending = await self.memory.get_pending_tasks(limit=1)
         if not pending:
@@ -3633,6 +3965,141 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         )
         log.info("orchestrator.optimizer_dispatched", reason=reason, task_id=task_id)
         await self._dispatch_phase(plan, 1)
+
+    # ── Optimizer suggestion handler ─────────────────────────────────────────
+
+    async def _handle_agent_response(self, event: Event) -> None:
+        """
+        Handle AGENT_RESPONSE events.  Currently acts on optimizer suggestion
+        reports: each high-priority suggestion is enqueued as an autonomous task
+        so the agent stack will actually attempt to apply the improvement.
+
+        Other AGENT_RESPONSE events (e.g. orchestrator publishing a context reply)
+        are silently ignored — they are consumed by the Discord bridge instead.
+        """
+        if event.source != "optimizer":
+            return
+
+        payload = event.payload
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            return
+
+        suggestions = result.get("suggestions", [])
+        if not suggestions:
+            log.info("orchestrator.optimizer_no_suggestions")
+            return
+
+        log.info(
+            "orchestrator.optimizer_suggestions_received",
+            count=len(suggestions),
+        )
+
+        for s in suggestions:
+            priority_label = s.get("priority", "low")
+            if priority_label not in ("high", "medium"):
+                # Enqueue low-priority suggestions but at a lower task priority.
+                task_priority = 8
+            else:
+                task_priority = 3 if priority_label == "high" else 5
+
+            title = s.get("title", "")
+            detail = s.get("detail", "")
+            category = s.get("category", "")
+            task_text = f"[optimizer/{category}] {title}: {detail}"
+            await self.memory.enqueue_task(task_text, priority=task_priority)
+            log.info(
+                "orchestrator.optimizer_suggestion_enqueued",
+                title=title[:60],
+                priority=task_priority,
+            )
+
+    async def _run_merch_workflow(
+        self,
+        task: str,
+        task_id: str,
+        discord_message_id: str | None = None,
+    ) -> None:
+        """
+        Merch bot workflow:
+          Phase 1 — research agent finds 5-8 trending topics
+          Phase 2 — orchestrator LLM synthesises merch concepts for each topic
+          Phase 3 — result posted back to Discord
+
+        The research step is dispatched as a normal plan; on completion the result
+        is fed to the LLM to produce concrete merch ideas.
+        """
+        research_task = (
+            "Find the 5-8 most trending internet topics right now that would make "
+            "great merchandise (t-shirts, hoodies, mugs, stickers). Focus on: viral memes, "
+            "popular games/shows, cultural moments, internet humour. "
+            "Include topic name, why it's trending, and estimated audience size."
+        )
+        research_id = str(uuid.uuid4())
+
+        plan = ExecutionPlan(
+            plan_id=str(uuid.uuid4()),
+            task_id=task_id,
+            original_task=task,
+            steps=[
+                PlanStep(
+                    step_id=str(uuid.uuid4()),
+                    phase=1,
+                    task=research_task,
+                    agent="research",
+                    expected="list of trending topics with context",
+                ),
+            ],
+            discord_message_id=discord_message_id,
+            context_id=task_id,
+        )
+        self._plans[task_id] = plan
+        await self.memory.upsert_plan(
+            task_id, plan.plan_id, task, "running", plan.to_dict()
+        )
+        await self._emit_plan_status(
+            plan, "🛍️ Merch bot starting — researching trending topics…"
+        )
+
+        log.info("orchestrator.merch_workflow_start", task_id=task_id)
+        await self._dispatch_phase(plan, 1)
+
+        # The phase-completion callback will pick up the result.
+        # We hook into the result in _handle_step_completion — the merch synthesis
+        # is triggered when the single phase-1 research step completes.
+        # Store a marker so _handle_step_completion knows to run merch synthesis.
+        await self.bus._client.set(f"merch:pending:{task_id}", "1", ex=3600)
+
+    async def _synthesise_merch_concepts(
+        self, task_id: str, trending_research: str
+    ) -> str:
+        """Use LLM to turn trending topic research into actionable merch concepts."""
+        try:
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are a creative merchandise strategist. Given a list of trending topics, "
+                            "generate specific, actionable merch concepts for each one.\n\n"
+                            "For each topic output:\n"
+                            "**[Topic Name]**\n"
+                            "- Merch type: (t-shirt / hoodie / mug / sticker / poster)\n"
+                            "- Design concept: (1-2 sentence description)\n"
+                            "- Tagline: (catchy text for the design)\n"
+                            "- Target audience: (brief description)\n"
+                            "- Potential: (High / Medium / Low)\n\n"
+                            "Be specific and creative. Avoid generic designs."
+                        )
+                    ),
+                    HumanMessage(
+                        content=f"Trending topics research:\n\n{trending_research[:3000]}"
+                    ),
+                ]
+            )
+            return resp.content.strip()
+        except Exception as exc:
+            log.warning("orchestrator.merch_synthesis_failed", error=str(exc))
+            return f"Could not synthesise merch concepts: {exc}"
 
     async def on_shutdown(self) -> None:
         log.info("orchestrator.shutdown", active_plans=len(self._plans))

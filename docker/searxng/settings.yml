@@ -42,13 +42,13 @@ outgoing:
   pool_maxsize: 20
 
 # Engines used by the research agent.
-# Only these three are needed; keeping the list short means faster cold starts.
+# Keep a broad set so results survive bot-detection blocks from any single engine.
 engines:
   - name: google
     engine: google
     shortcut: g
     timeout: 10.0
-    disabled: false
+    disabled: true  # Google HTML layout change breaks scraper (IndexError in response parser)
 
   - name: bing
     engine: bing
@@ -59,6 +59,26 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: d
+    timeout: 10.0
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    timeout: 10.0
+    disabled: false
+
+  # Wikipedia is highly reliable and great for factual / encyclopaedic queries
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    timeout: 10.0
+    disabled: false
+
+  # Mojeek: independent index, no Google/Bing dependency, bot-detection resistant
+  - name: mojeek
+    engine: mojeek
+    shortcut: mj
     timeout: 10.0
     disabled: false
 

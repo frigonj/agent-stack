@@ -44,6 +44,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
@@ -143,6 +144,7 @@ _CONTROL_HELP = (
     "`build docs` — force a full architecture document rebuild now\n"
     "`verbose on` — forward all Redis events to #agent-logs\n"
     "`verbose off` — return to normal (only high-level events)\n"
+    "`loglevel <DEBUG|INFO|WARNING|ERROR>` — change agent log level across all containers\n"
     "`reset session` — clear orchestrator conversation history and reload intents\n"
     "`pause <task_id>` — pause a running research task after its current iteration\n"
     "`resume <task_id>` — resume a paused research task from its last checkpoint\n\n"
@@ -152,6 +154,8 @@ _CONTROL_HELP = (
 # Event types we surface to Discord (others are silently ack'd)
 VISIBLE_EVENTS = {
     "task.completed",
+    "task.created",
+    "task.failed",
     "approval.required",
     "claude.escalation",
     "system.error",
@@ -510,6 +514,8 @@ class DiscordBridgeClient(discord.Client):
         claude_channel_id: str | None = None,
         control_channel_id: str | None = None,
         log_channel_id: str | None = None,
+        error_log_channel_id: str | None = None,
+        tasks_channel_id: str | None = None,
         vote_channel_id: str | None = None,
         user_approvals_channel_id: str | None = None,
         control_helper_url: str = "http://host.docker.internal:7799",
@@ -522,8 +528,12 @@ class DiscordBridgeClient(discord.Client):
         self.claude_channel_id = claude_channel_id
         self.control_channel_id = control_channel_id
         self.log_channel_id = log_channel_id
+        self.error_log_channel_id = error_log_channel_id  # #error-logs channel
+        self.tasks_channel_id = tasks_channel_id  # #tasks-tracking channel
         self.vote_channel_id = vote_channel_id  # #agent-deliberation channel
-        self.user_approvals_channel_id = user_approvals_channel_id  # #user-approvals channel
+        self.user_approvals_channel_id = (
+            user_approvals_channel_id  # #user-approvals channel
+        )
         self.control_helper_url = control_helper_url.rstrip("/")
         self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
@@ -534,10 +544,24 @@ class DiscordBridgeClient(discord.Client):
         # to prevent unbounded growth when tasks time out or agents crash.
         self._pending_messages: dict[str, tuple[int, int, float]] = {}
         self._PENDING_TTL_SECS = 1800  # 30 minutes — generous for slow tasks
+        # Reverse index: message_id → task_id (for edit detection)
+        self._message_to_task: dict[int, str] = {}
         # log channel object — cached after first fetch
         self._log_channel = None
+        # error log channel — separate from general log channel
+        self._error_log_channel = None
+        # tasks tracking channel
+        self._tasks_channel = None
         # Pending relaunch confirmations: message_id → (mode, svc, expires_at)
         self._relaunch_pending: dict[int, tuple[str, str | None, float]] = {}
+        # Deduplication: recently-dispatched event_ids (capped at 2000 entries)
+        # Prevents double-posting when the consumer group redelivers unacked messages
+        # after a bridge restart or Redis reconnect.
+        self._seen_event_ids: dict[str, float] = {}
+        self._SEEN_TTL_SECS = 300  # 5 minutes — long enough to catch redeliveries
+        # Per-vote guard: (plan_id, agent) → True — prevents a single agent's vote
+        # from being appended to the embed twice if the event is redelivered.
+        self._posted_votes: set[str] = set()
 
     async def setup_hook(self) -> None:
         self.redis = await aioredis.from_url(
@@ -617,6 +641,48 @@ class DiscordBridgeClient(discord.Client):
             return
 
         await self._queue_task(message, stream="agents:orchestrator")
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        """
+        Detect edits to task-channel messages that are still in-flight.
+        If the user edits a message that mapped to an active task_id, publish a
+        task.updated event to the orchestrator so it can interrupt or amend the task.
+        """
+        channel_str = str(payload.channel_id)
+        if channel_str not in (self.task_channel_id, self.claude_channel_id or ""):
+            return
+
+        task_id = self._message_to_task.get(payload.message_id)
+        if not task_id:
+            return  # message not in-flight, ignore
+
+        new_content = (payload.data.get("content") or "").strip()
+        if not new_content:
+            return
+
+        await self.redis.xadd(
+            "agents:orchestrator",
+            {
+                "event_id": str(uuid.uuid4()),
+                "type": "task.updated",
+                "source": "discord",
+                "task_id": task_id,
+                "timestamp": str(time.time()),
+                "payload": json.dumps(
+                    {
+                        "task_id": task_id,
+                        "updated_task": new_content[:500],
+                        "message_id": str(payload.message_id),
+                        "channel_id": str(payload.channel_id),
+                    }
+                ),
+            },
+        )
+        log.info(
+            "discord_bridge.task_updated",
+            task_id=task_id,
+            new_content=new_content[:80],
+        )
 
     async def _detect_chat_session(self, keywords: list[str]) -> str | None:
         """
@@ -720,6 +786,7 @@ class DiscordBridgeClient(discord.Client):
         }
         await self.redis.xadd(stream, event)
         self._pending_messages[task_id] = (message.channel.id, message.id, time.time())
+        self._message_to_task[message.id] = task_id
         await message.add_reaction("⏳")
         log.info(
             "discord_bridge.task_queued",
@@ -820,6 +887,25 @@ class DiscordBridgeClient(discord.Client):
                 "🔇 Verbose mode **off** — returning to normal event filtering."
             )
             log.info("discord_bridge.verbose_disabled")
+            return
+
+        # loglevel <level>
+        if len(parts) == 2 and parts[0] == "loglevel":
+            level = parts[1].upper()
+            if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+                await message.reply(
+                    "❌ Invalid level. Use: `loglevel DEBUG|INFO|WARNING|ERROR`"
+                )
+                return
+            await self.redis.set("config:log_level", level)
+            # Apply immediately to the bridge process itself
+            import logging as _logging
+
+            _logging.getLogger().setLevel(getattr(_logging, level))
+            await message.reply(
+                f"📋 Log level set to **{level}** — agents will pick this up on their next think cycle."
+            )
+            log.info("discord_bridge.loglevel_set", level=level)
             return
 
         # reset session
@@ -925,7 +1011,9 @@ class DiscordBridgeClient(discord.Client):
                 return
             mode, svc, expires_at = entry
             if time.time() > expires_at:
-                await message.reply("⏰ Confirmation window expired. Re-issue the relaunch command.")
+                await message.reply(
+                    "⏰ Confirmation window expired. Re-issue the relaunch command."
+                )
                 return
             await self._run_relaunch(message, mode, svc)
             return
@@ -951,7 +1039,7 @@ class DiscordBridgeClient(discord.Client):
             footer = "\n```"
             max_out = 2000 - len(header) - len(footer)
             if len(output) > max_out:
-                output = "..." + output[-max_out + 3:]
+                output = "..." + output[-max_out + 3 :]
             await message.reply(f"{header}{output}{footer}")
         else:
             await message.reply(f"{icon} {msg}")
@@ -980,7 +1068,9 @@ class DiscordBridgeClient(discord.Client):
             if "BUSYGROUP" not in str(e):
                 raise
 
-        channel_id = int(self.task_channel_id)
+        # Default channel for broadcast events is #agent-logs; fall back to
+        # #agent-tasks only if no log channel is configured.
+        channel_id = int(self.log_channel_id or self.task_channel_id)
 
         while True:
             try:
@@ -992,7 +1082,7 @@ class DiscordBridgeClient(discord.Client):
                     block=1000,
                 )
                 if not results:
-                    # Evict stale pending messages on idle ticks
+                    # Evict stale pending messages and seen event ids on idle ticks
                     now = time.time()
                     expired = [
                         k
@@ -1003,6 +1093,13 @@ class DiscordBridgeClient(discord.Client):
                         del self._pending_messages[k]
                     if expired:
                         log.debug("discord_bridge.pending_evicted", count=len(expired))
+                    expired_seen = [
+                        k
+                        for k, ts in self._seen_event_ids.items()
+                        if now - ts > self._SEEN_TTL_SECS
+                    ]
+                    for k in expired_seen:
+                        del self._seen_event_ids[k]
                     continue
                 for _stream_key, messages in results:
                     for entry_id, data in messages:
@@ -1040,6 +1137,60 @@ class DiscordBridgeClient(discord.Client):
             self._log_channel = None
         return self._log_channel
 
+    async def _get_error_log_channel(self):
+        """Return the error-logs channel, falling back to the general log channel."""
+        if self._error_log_channel is not None:
+            return self._error_log_channel
+        if self.error_log_channel_id:
+            try:
+                self._error_log_channel = await self.fetch_channel(
+                    int(self.error_log_channel_id)
+                )
+                return self._error_log_channel
+            except Exception as exc:
+                log.warning(
+                    "discord_bridge.error_log_channel_fetch_failed", error=str(exc)
+                )
+        # Fall back to general log channel
+        return await self._get_log_channel()
+
+    async def _get_tasks_channel(self):
+        """Return the tasks-tracking channel, falling back to the log channel."""
+        if self._tasks_channel is not None:
+            return self._tasks_channel
+        if self.tasks_channel_id:
+            try:
+                self._tasks_channel = await self.fetch_channel(
+                    int(self.tasks_channel_id)
+                )
+                return self._tasks_channel
+            except Exception as exc:
+                log.warning("discord_bridge.tasks_channel_fetch_failed", error=str(exc))
+        return await self._get_log_channel()
+
+    async def _send_long_result(
+        self,
+        channel: discord.abc.Messageable,
+        embed: discord.Embed,
+        text: str,
+        filename: str = "result.txt",
+    ) -> None:
+        """
+        Send `embed` to `channel`. If `text` exceeds 3800 chars (safe embed limit),
+        attach the full text as a file so nothing is silently cut off.
+        Discord embed descriptions cap at 4096; we use 3800 to leave room for title/footer.
+        """
+        if len(text) <= 3800:
+            await channel.send(embed=embed)
+        else:
+            # Truncate embed description with note, attach full text
+            embed.description = text[:3800] + "\n\n*[full output attached below]*"
+            file = discord.File(
+                io.BytesIO(text.encode("utf-8", errors="replace")),
+                filename=filename,
+            )
+            await channel.send(embed=embed, file=file)
+
     async def _is_verbose(self) -> bool:
         """Return True when verbose mode is enabled (config:verbose_events = '1')."""
         try:
@@ -1050,6 +1201,24 @@ class DiscordBridgeClient(discord.Client):
 
     async def _dispatch(self, data: dict, channel_id: int) -> None:
         event_type = data.get("type", "")
+
+        # Dedup: skip events we've already dispatched (redeliveries after restart/reconnect)
+        event_id = data.get("event_id", "")
+        if event_id:
+            now = time.time()
+            if event_id in self._seen_event_ids:
+                log.debug(
+                    "discord_bridge.dedup_skip",
+                    event_id=event_id,
+                    event_type=event_type,
+                )
+                return
+            self._seen_event_ids[event_id] = now
+            # Evict oldest entries if the table grows too large
+            if len(self._seen_event_ids) > 2000:
+                oldest = sorted(self._seen_event_ids.items(), key=lambda x: x[1])[:500]
+                for k, _ in oldest:
+                    del self._seen_event_ids[k]
 
         verbose = event_type in VERBOSE_EVENTS
         if event_type not in VISIBLE_EVENTS:
@@ -1106,31 +1275,84 @@ class DiscordBridgeClient(discord.Client):
             await dest.send(embed=embed)
             return
 
-        if event_type == "task.completed":
+        if event_type == "task.created":
+            # Post to tasks-tracking channel when a new task enters the queue
+            task_text = payload.get("task", "")[:200]
+            task_id_short = data.get("task_id", "")[:8]
+            embed = discord.Embed(
+                title="📋 Task Queued",
+                description=task_text,
+                color=discord.Color.blurple(),
+            )
+            embed.set_footer(text=f"task {task_id_short} | {source}")
+            tasks_ch = await self._get_tasks_channel()
+            if tasks_ch:
+                await tasks_ch.send(embed=embed)
+
+        elif event_type == "task.failed":
+            task_text = payload.get("task", "")[:200]
+            error = payload.get("error", "")[:300]
+            task_id_short = data.get("task_id", "")[:8]
+            embed = discord.Embed(
+                title="❌ Task Failed",
+                description=f"**Task:** {task_text}\n**Error:** {error}",
+                color=discord.Color.red(),
+            )
+            embed.set_footer(text=f"task {task_id_short} | {source}")
+            tasks_ch = await self._get_tasks_channel()
+            if tasks_ch:
+                await tasks_ch.send(embed=embed)
+
+        elif event_type == "task.completed":
             result = payload.get("result", "(no output)")
             task_id = payload.get("task_id")
             embed = discord.Embed(
                 title=f"{icon} {source.replace('_', ' ').title()}",
-                description=result[:4000],
+                description=result[:3800],
                 color=color,
             )
+
+            # Post completion to tasks-tracking channel
+            tasks_ch = await self._get_tasks_channel()
+            if tasks_ch:
+                task_id_short = (task_id or "")[:8]
+                t_embed = discord.Embed(
+                    title="✅ Task Completed",
+                    description=result[:500],
+                    color=discord.Color.green(),
+                )
+                t_embed.set_footer(text=f"task {task_id_short} | {source}")
+                await tasks_ch.send(embed=t_embed)
 
             # Try to reply to the original user message so it threads nicely
             origin = self._pending_messages.pop(task_id, None) if task_id else None
             if origin:
                 ch_id, msg_id, _enqueued_at = origin
+                self._message_to_task.pop(msg_id, None)
                 try:
                     ch = await self.fetch_channel(ch_id)
                     msg = await ch.fetch_message(msg_id)
                     await msg.remove_reaction("⏳", self.user)
                     await msg.add_reaction("✅")
-                    await msg.reply(embed=embed, mention_author=False)
+                    if len(result) > 3800:
+                        embed.description = (
+                            result[:3800] + "\n\n*[full output attached below]*"
+                        )
+                        file = discord.File(
+                            io.BytesIO(result.encode("utf-8", errors="replace")),
+                            filename=f"result_{(task_id or 'task')[:8]}.txt",
+                        )
+                        await msg.reply(embed=embed, file=file, mention_author=False)
+                    else:
+                        await msg.reply(embed=embed, mention_author=False)
                     log.info("discord_bridge.reply_sent", task_id=task_id)
                     return
                 except Exception as exc:
                     log.warning("discord_bridge.reply_failed", error=str(exc))
 
-            await channel.send(embed=embed)
+            await self._send_long_result(
+                channel, embed, result, filename=f"result_{(task_id or 'task')[:8]}.txt"
+            )
             log.info(
                 "discord_bridge.message_sent", event_type=event_type, source=source
             )
@@ -1143,18 +1365,17 @@ class DiscordBridgeClient(discord.Client):
 
         elif event_type in ("system.error", "agent.response"):
             text = payload.get("error") or payload.get("response") or str(payload)
+            is_error = event_type == "system.error"
             embed = discord.Embed(
                 title=f"{icon} {source.replace('_', ' ').title()}",
-                description=f"```{text[:1500]}```"
-                if event_type == "system.error"
-                else text[:4000],
-                color=discord.Color.dark_red()
-                if event_type == "system.error"
-                else color,
+                description=f"```{text[:1500]}```" if is_error else text[:3800],
+                color=discord.Color.dark_red() if is_error else color,
             )
-            log_ch = await self._get_log_channel()
-            dest = log_ch if log_ch and event_type == "system.error" else channel
-            await dest.send(embed=embed)
+            if is_error:
+                err_ch = await self._get_error_log_channel()
+                await (err_ch or channel).send(embed=embed)
+            else:
+                await self._send_long_result(channel, embed, text)
 
         elif event_type == "memory.pruned":
             message = payload.get("message", "Memory pruned.")
@@ -1165,8 +1386,9 @@ class DiscordBridgeClient(discord.Client):
                 color=discord.Color.yellow(),
             )
             embed.set_footer(text=f"Source: {source} | Reason: {reason}")
-            log_ch = await self._get_log_channel()
-            await (log_ch or channel).send(embed=embed)
+            # Warnings go to #error-logs channel
+            err_ch = await self._get_error_log_channel()
+            await (err_ch or channel).send(embed=embed)
             log.info(
                 "discord_bridge.memory_pruned_notified", source=source, reason=reason
             )
@@ -1422,6 +1644,51 @@ class DiscordBridgeClient(discord.Client):
                 lines = [f"#{ch.name} (id={ch.id})" for ch in guild.text_channels]
                 await _ack("Channels:\n" + "\n".join(lines))
 
+            elif action == "scan_task_queue":
+                # Scan the last N messages in the task channel.
+                # For each human message: react ✅ if already completed, 📓 if still pending,
+                # or skip if already has one of these reactions.
+                limit = int(payload.get("limit", 50))
+                try:
+                    task_ch = await self.fetch_channel(int(self.task_channel_id))
+                except Exception as exc:
+                    await _ack(f"Could not fetch task channel: {exc}", ok=False)
+                    return
+
+                # Build reverse lookup: message_id → task_id
+                pending_msg_ids = {
+                    msg_id for (_ch, msg_id, _ts) in self._pending_messages.values()
+                }
+                checked = reacted_done = reacted_pending = 0
+                async for msg in task_ch.history(limit=limit):
+                    if msg.author.bot:
+                        continue
+                    checked += 1
+                    existing_reactions = {str(r.emoji) for r in msg.reactions}
+                    if "✅" in existing_reactions or "📓" in existing_reactions:
+                        continue  # already marked
+
+                    if msg.id in pending_msg_ids:
+                        # Still in-flight
+                        if "⏳" not in existing_reactions:
+                            await msg.add_reaction("📓")
+                            reacted_pending += 1
+                    else:
+                        # No pending entry → completed or superseded
+                        if "✅" not in existing_reactions:
+                            await msg.add_reaction("✅")
+                            reacted_done += 1
+
+                await _ack(
+                    f"Scanned {checked} messages: {reacted_done} marked ✅, {reacted_pending} marked 📓."
+                )
+                log.info(
+                    "discord_bridge.task_queue_scanned",
+                    checked=checked,
+                    done=reacted_done,
+                    pending=reacted_pending,
+                )
+
             elif action == "find_and_delete_duplicates":
                 # Find text channels that share a name (case-insensitive), keep the oldest (lowest id)
                 seen: dict[str, discord.TextChannel] = {}
@@ -1531,20 +1798,26 @@ class DiscordBridgeClient(discord.Client):
         tie_broken = payload.get("tie_broken", False)
         if outcome == "approved":
             color = discord.Color.green()
-            title = "✅ Vote passed" + (" (tie-broken by orchestrator)" if tie_broken else "")
+            title = "✅ Vote passed" + (
+                " (tie-broken by orchestrator)" if tie_broken else ""
+            )
         elif outcome == "no_quorum":
             color = discord.Color.yellow()
             title = "⏳ Quorum not met — retrying vote…"
         else:
             color = discord.Color.red()
-            title = "❌ Vote failed" + (" — plan will be revised" if vote_type == "plan" else "")
+            title = "❌ Vote failed" + (
+                " — plan will be revised" if vote_type == "plan" else ""
+            )
 
         if total == 0:
             distribution = "No agents voted (silent approval)."
         else:
             yay_pct = int(yay / total * 100)
             nay_pct = int(nay / total * 100)
-            distribution = f"**Yay:** {yay} ({yay_pct}%)  |  **Nay:** {nay} ({nay_pct}%)"
+            distribution = (
+                f"**Yay:** {yay} ({yay_pct}%)  |  **Nay:** {nay} ({nay_pct}%)"
+            )
 
         lines = []
         for v in votes:
@@ -1602,7 +1875,11 @@ class DiscordBridgeClient(discord.Client):
             timeout_seconds=timeout_hours * 3600,
         )
         await ch.send(embed=embed, view=view)
-        log.info("discord_bridge.vote_escalated_posted", vote_id=vote_id[:8], timeout_hours=timeout_hours)
+        log.info(
+            "discord_bridge.vote_escalated_posted",
+            vote_id=vote_id[:8],
+            timeout_hours=timeout_hours,
+        )
 
     async def _post_agent_vote(self, payload: dict) -> None:
         """Append a vote line to the existing plan-proposed embed (or post standalone)."""
@@ -1614,6 +1891,19 @@ class DiscordBridgeClient(discord.Client):
         approve = payload.get("approve", True)
         reason = payload.get("reason", "")
         confidence = payload.get("confidence", 1.0)
+
+        # Guard: don't post the same agent's vote on the same plan twice
+        vote_key = f"{plan_id}:{agent}"
+        if vote_key in self._posted_votes:
+            log.debug(
+                "discord_bridge.vote_dedup_skip", plan_id=plan_id[:8], agent=agent
+            )
+            return
+        self._posted_votes.add(vote_key)
+        # Prune old vote keys to prevent unbounded growth (keep last 500)
+        if len(self._posted_votes) > 500:
+            self._posted_votes = set(list(self._posted_votes)[-400:])
+
         icon = "✅" if approve else "❌"
         line = f"{icon} **{agent}** (conf={confidence:.2f}): {reason or 'no reason'}"
 
@@ -1750,8 +2040,12 @@ def main() -> None:
     claude_channel_id = os.environ.get("DISCORD_CLAUDE_CHANNEL_ID")
     control_channel_id = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
     log_channel_id = os.environ.get("DISCORD_LOG_CHANNEL_ID")
+    error_log_channel_id = os.environ.get("DISCORD_ERROR_LOG_CHANNEL_ID")  # #error-logs
+    tasks_channel_id = os.environ.get("DISCORD_ERROR_LOG_CHANNEL_ID")  # #tasks-tracking
     vote_channel_id = os.environ.get("DISCORD_VOTE_CHANNEL_ID")  # #agent-deliberation
-    user_approvals_channel_id = os.environ.get("DISCORD_USER_APPROVALS_CHANNEL_ID")  # #user-approvals
+    user_approvals_channel_id = os.environ.get(
+        "DISCORD_USER_APPROVALS_CHANNEL_ID"
+    )  # #user-approvals
     control_helper_url = os.environ.get(
         "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
     )
@@ -1768,6 +2062,8 @@ def main() -> None:
         claude_channel_id=claude_channel_id,
         control_channel_id=control_channel_id,
         log_channel_id=log_channel_id,
+        error_log_channel_id=error_log_channel_id,
+        tasks_channel_id=tasks_channel_id,
         vote_channel_id=vote_channel_id,
         user_approvals_channel_id=user_approvals_channel_id,
         control_helper_url=control_helper_url,
@@ -1781,8 +2077,11 @@ def main() -> None:
         claude_channel=claude_channel_id or "(not configured)",
         control_channel=control_channel_id or "(not configured)",
         log_channel=log_channel_id or "(not configured)",
+        error_log_channel=error_log_channel_id
+        or "(not configured — using log channel)",
         vote_channel=vote_channel_id or "(not configured — using log/task channel)",
-        user_approvals_channel=user_approvals_channel_id or "(not configured — using vote channel)",
+        user_approvals_channel=user_approvals_channel_id
+        or "(not configured — using vote channel)",
     )
     client.run(bot_token)
 

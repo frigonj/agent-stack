@@ -22,6 +22,7 @@ Services:
   document-qa      — docker restart agent_document_qa
   discord          — docker restart agent_discord_bridge
   claude           — docker restart agent_claude_code
+  optimizer        — docker restart agent_optimizer
   redis            — docker restart agent_redis
   postgres         — docker restart agent_postgres
   all              — restart all agent containers (not infra)
@@ -68,6 +69,7 @@ CONTAINER_MAP: dict[str, str] = {
     "document_qa": "agent_document_qa",
     "discord": "agent_discord_bridge",
     "claude": "agent_claude_code",
+    "optimizer": "agent_optimizer",
     "redis": "agent_redis",
     "postgres": "agent_postgres",
 }
@@ -80,6 +82,7 @@ AGENT_CONTAINERS = [
     "agent_document_qa",
     "agent_discord_bridge",
     "agent_claude_code",
+    "agent_optimizer",
 ]
 
 # Common LM Studio install locations; first match wins
@@ -285,8 +288,16 @@ def _do_relaunch(mode: str, svc: str | None = None) -> dict:
         )
         output = (r.stdout + r.stderr).strip()
         if r.returncode == 0:
-            return {"ok": True, "message": f"Relaunch ({mode}) complete", "output": output}
-        return {"ok": False, "message": f"Relaunch ({mode}) failed (exit {r.returncode})", "output": output}
+            return {
+                "ok": True,
+                "message": f"Relaunch ({mode}) complete",
+                "output": output,
+            }
+        return {
+            "ok": False,
+            "message": f"Relaunch ({mode}) failed (exit {r.returncode})",
+            "output": output,
+        }
     except subprocess.TimeoutExpired:
         return {"ok": False, "message": f"Relaunch ({mode}) timed out after 5 minutes"}
     except FileNotFoundError:

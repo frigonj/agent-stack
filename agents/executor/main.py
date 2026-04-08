@@ -414,29 +414,71 @@ def _command_tags(cmd: str) -> list[str]:
 
 
 SYSTEM_PROMPT = """You are a tool execution specialist with full access to the agent stack \
-source code and runtime environment.
+source code and runtime environment. You are the "hands" of the system — other agents \
+delegate concrete actions to you. Act autonomously and completely: don't stop at one step \
+when multiple steps are needed to fully solve the problem.
+
+## Decision order — always follow this before invoking the LLM
+1. Check shared tool registry (injected above as "Relevant tools") — run a matching shell: tool directly.
+2. Check /workspace/tools/ for a reusable script:  CMD: ls /workspace/tools/
+3. Check "Prior knowledge" section (injected above) — apply a known-good approach.
+4. Only if none of the above apply: reason from scratch and issue a CMD:.
 
 ## Shell commands
-If a task requires a shell command, respond with exactly:
-CMD: <the command>
+Respond with exactly:
+  CMD: <the command>
 
-Report results clearly: stdout, stderr, exit codes. Flag unexpected outputs for the orchestrator.
+Issue multiple CMD: lines in one response when the full solution is multi-step.
+After each CMD: you receive an OBSERVATION:. Use it to decide the next step.
+When done, end with:
+  DONE: <concise summary of what was accomplished>
 
-## Tool-building (PRIORITY)
-Agents maintain a growing toolset in /workspace/tools/. Before generating a new shell command:
-1. Check if a script already exists:  CMD: ls /workspace/tools/
-2. If a matching script exists, run it instead of generating a new command.
+Rules: DONE: must be the last line. Never put CMD: after DONE:.
 
-After solving a new type of problem via a shell command, build a reusable script:
+## Multi-step example — patching a source file
+  CMD: cat /workspace/src/agents/executor/main.py
+  OBSERVATION: <file content>
+  CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
+  <corrected full file content>
+  EOF
+  OBSERVATION: <write confirmed>
+  CMD: docker restart agent_executor
+  OBSERVATION: Exit code: 0
+  DONE: Patched executor/main.py — fixed the docker whitelist logic and restarted the container.
+
+## Multi-step example — diagnosing a failing container
+  CMD: docker logs --tail 50 agent_orchestrator
+  OBSERVATION: <logs showing import error>
+  CMD: cat /workspace/src/agents/orchestrator/main.py | grep -n "import"
+  OBSERVATION: <imports>
+  CMD: docker restart agent_orchestrator
+  DONE: Identified missing import in orchestrator; restarted after fix.
+
+## Self-improvement — read → understand → improve → restart
+When you notice a pattern in failures, bugs, or slow paths, fix them proactively:
+1. CMD: cat /workspace/src/agents/<role>/main.py         (read full source)
+2. Identify the improvement. Write the corrected file.
+3. CMD: tee /workspace/src/agents/<role>/main.py << 'EOF'
+   <full corrected content>
+   EOF
+4. CMD: docker restart agent_<role>
+5. DONE: <what was improved and why>
+
+Always read the current file before writing — never overwrite from memory alone.
+After a successful fix, register it in the tool registry so other agents benefit:
+  CMD: python3 -c "import asyncio; from core.memory.long_term import LongTermMemory; ..."
+(or delegate: ask orchestrator to call memory.register_tool)
+
+## Tool-building
+After solving a new class of problem, save a reusable script:
   CMD: tee /workspace/tools/<descriptive-name>.sh << 'EOF'
   #!/bin/bash
-  # Description: <what this script does>
+  # Description: <what this does>
   <command>
   EOF
   CMD: chmod +x /workspace/tools/<descriptive-name>.sh
 
-Name scripts clearly: list-docker-containers.sh, find-large-files.sh, check-agent-logs.sh.
-Over time this toolset replaces LLM calls for routine operations.
+Name clearly: check-redis-streams.sh, tail-agent-logs.sh, restart-all-agents.sh.
 
 ## Command trust tiers
 SAFE (instant, no log):
@@ -444,55 +486,20 @@ SAFE (instant, no log):
   df, du, ps, ss, lsof, netstat, uname, uptime, free
   pip list/show/freeze/check (read-only pip sub-commands)
 AUTO_APPROVED (instant, audit log to #agent-logs):
-  docker start/restart/stop/logs/exec/inspect
+  docker ps/start/stop/restart/logs/exec/inspect/images/stats/top/port/diff/compose
   tee, mkdir, touch, chmod, cp  (within /workspace only)
   python, python3, pytest, bash, sh
   git log/diff/status/show/fetch/pull
-REQUIRES_APPROVAL (Discord gate):
-  docker rm/rmi/prune  |  git push/commit/reset/rebase
-  pip install/npm/yarn/apt  |  curl/wget
+REQUIRES_APPROVAL (Discord gate — will pause for user confirmation):
+  docker <anything not in whitelist above: rm, rmi, prune, volume rm, …>
+  git push/commit/reset/rebase  |  pip install/npm/yarn/apt  |  curl/wget
   rm, mv, patch, chown
 
-Prefer AUTO_APPROVED commands — operate autonomously. Only escalate for truly
-destructive or external operations.
+Prefer AUTO_APPROVED — operate autonomously. Escalate only for truly destructive operations.
 
-## Multi-step execution (ReAct loop)
-You may issue multiple commands to complete a task. After each CMD: line you will
-receive an OBSERVATION: with the output. Use the observation to decide your next step.
-
-Example:
-  CMD: cat /workspace/src/agents/executor/main.py
-  (receive OBSERVATION with file content)
-  CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
-  <patched content>
-  EOF
-  (receive OBSERVATION confirming write)
-  CMD: docker restart agent_executor
-  DONE: Patched executor/main.py and restarted the container.
-
-When the task is fully complete, respond with:
-  DONE: <summary of what was done>
-
-DONE: must always be the last line. Never put a CMD: after DONE:.
-If only one command is needed, issue it followed by DONE: on the same response.
-If no command is needed, respond directly — the loop treats any response without CMD: as done.
-
-## Self-modification
-The agent stack source is at /workspace/src/. Read, write, and restart autonomously.
-
-Read a file:  CMD: cat /workspace/src/agents/executor/main.py
-List agents:  CMD: ls /workspace/src/agents/
-Write a file: CMD: tee /workspace/src/agents/executor/main.py << 'EOF'
-              <content>
-              EOF
-Restart:      CMD: docker restart agent_executor
-
-Container names: agent_orchestrator, agent_executor, agent_document_qa,
-                 agent_code_search, agent_discord_bridge, agent_claude_code,
-                 agent_developer
-
-## Self-improvement workflow
-1. cat the file  2. propose change  3. tee (auto-approved)  4. docker restart (auto-approved)
+## Container names
+agent_orchestrator, agent_executor, agent_document_qa, agent_code_search,
+agent_discord_bridge, agent_claude_code, agent_developer, agent_research, agent_optimizer
 
 ## document_qa capabilities (delegate via orchestrator)
 The document_qa agent can:
@@ -565,7 +572,7 @@ SAFE_COMMANDS = {
 # Run automatically; emits AUDIT event so every action is visible in #agent-logs
 AUTO_APPROVED_COMMANDS = {
     # Container lifecycle within the stack
-    "docker",  # start/restart/stop/logs/exec/inspect (NOT rm/rmi)
+    "docker",  # whitelisted subcommands only: ps/start/stop/restart/logs/exec/inspect/images/stats/top/port/diff/compose
     "docker-compose",
     # Workspace file writes
     "tee",  # write files inside /workspace — blocked for /workspace/user outside tests
@@ -736,7 +743,11 @@ class ExecutorAgent(BaseAgent):
             task_text = step.get("task", "").lower()
             for pattern in _DANGEROUS:
                 if pattern in task_text:
-                    return False, f"step contains potentially destructive command: {pattern!r}", 0.9
+                    return (
+                        False,
+                        f"step contains potentially destructive command: {pattern!r}",
+                        0.9,
+                    )
 
         steps_txt = "\n".join(
             f"  Phase {s.get('phase', 1)}: {s.get('task', '')}" for s in my_steps
@@ -744,22 +755,27 @@ class ExecutorAgent(BaseAgent):
         original_task = payload.get("original_task", "")
 
         try:
-            response = await self.llm_invoke([
-                SystemMessage(content=(
-                    "You are the executor agent. You run shell commands and manage files. "
-                    "You are reviewing steps assigned to you in a proposed execution plan. "
-                    "Decide if you can execute them safely and whether you understand them fully.\n\n"
-                    "Reply in exactly this format:\n"
-                    "UNDERSTOOD: yes/no\n"
-                    "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
-                    "APPROVE: yes/no\n"
-                    "REASON: <one sentence>"
-                )),
-                HumanMessage(content=(
-                    f"Overall task: {original_task}\n"
-                    f"My steps:\n{steps_txt}"
-                )),
-            ])
+            response = await self.llm_invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are the executor agent. You run shell commands and manage files. "
+                            "You are reviewing steps assigned to you in a proposed execution plan. "
+                            "Decide if you can execute them safely and whether you understand them fully.\n\n"
+                            "Reply in exactly this format:\n"
+                            "UNDERSTOOD: yes/no\n"
+                            "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
+                            "APPROVE: yes/no\n"
+                            "REASON: <one sentence>"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Overall task: {original_task}\nMy steps:\n{steps_txt}"
+                        )
+                    ),
+                ]
+            )
             lines = {
                 k.strip(): v.strip()
                 for line in response.content.splitlines()
@@ -776,24 +792,35 @@ class ExecutorAgent(BaseAgent):
         reason = lines.get("REASON", "")
 
         # Ask for clarification if the LLM flagged something as unclear.
-        if not understood and clarification_q and clarification_q.lower() != "none" and request_clarification:
+        if (
+            not understood
+            and clarification_q
+            and clarification_q.lower() != "none"
+            and request_clarification
+        ):
             answer = await request_clarification(clarification_q)
             if answer:
                 # Re-evaluate with the clarification folded in.
                 try:
-                    response2 = await self.llm_invoke([
-                        SystemMessage(content=(
-                            "You are the executor agent re-evaluating a plan step after receiving clarification."
-                            " Reply in exactly this format:\n"
-                            "APPROVE: yes/no\n"
-                            "REASON: <one sentence>"
-                        )),
-                        HumanMessage(content=(
-                            f"Overall task: {original_task}\n"
-                            f"My steps:\n{steps_txt}\n\n"
-                            f"Clarification received: {answer}"
-                        )),
-                    ])
+                    response2 = await self.llm_invoke(
+                        [
+                            SystemMessage(
+                                content=(
+                                    "You are the executor agent re-evaluating a plan step after receiving clarification."
+                                    " Reply in exactly this format:\n"
+                                    "APPROVE: yes/no\n"
+                                    "REASON: <one sentence>"
+                                )
+                            ),
+                            HumanMessage(
+                                content=(
+                                    f"Overall task: {original_task}\n"
+                                    f"My steps:\n{steps_txt}\n\n"
+                                    f"Clarification received: {answer}"
+                                )
+                            ),
+                        ]
+                    )
                     lines2 = {
                         k.strip(): v.strip()
                         for line in response2.content.splitlines()
@@ -870,7 +897,11 @@ class ExecutorAgent(BaseAgent):
                 else:
                     # ── 4. Try capability registry (no LLM) ───────────────────
                     cached_cmd = await self.memory.lookup_capability(task)
-                    if cached_cmd:
+                    _cached_base = cached_cmd.strip().split()[0] if cached_cmd else ""
+                    _cached_valid = cached_cmd and _cached_base in (
+                        SAFE_COMMANDS | AUTO_APPROVED_COMMANDS | REQUIRES_APPROVAL
+                    )
+                    if _cached_valid:
                         log.info(
                             "executor.capability_hit",
                             task=task[:80],
@@ -880,10 +911,23 @@ class ExecutorAgent(BaseAgent):
                             cached_cmd, task, task_id, timeout=timeout
                         )
                     else:
+                        if cached_cmd:
+                            log.warning(
+                                "executor.capability_invalid",
+                                cmd=cached_cmd[:80],
+                                reason="not a shell command — skipping cache",
+                            )
                         # ── 5. Fall back to LLM with multi-step ReAct loop ────
-                        tools_ctx = self.format_tools_context(tool_hits)
+                        # Inject memory + tools so the model is primed with prior knowledge.
+                        # tool_hits already fetched above; reuse them to avoid double embed.
+                        mem_hits, _ = await self.recall_and_search_tools(
+                            task, tools_limit=0, memory_limit=5
+                        )
+                        task_ctx = self.format_memory_context(
+                            mem_hits
+                        ) + self.format_tools_context(tool_hits)
                         messages = [
-                            SystemMessage(content=SYSTEM_PROMPT + tools_ctx),
+                            SystemMessage(content=SYSTEM_PROMPT + task_ctx),
                             HumanMessage(content=f"Task: {task}"),
                         ]
 
@@ -900,33 +944,10 @@ class ExecutorAgent(BaseAgent):
                             max_steps=5,
                         )
 
-                        # Store successful result in capability cache for future reuse
-                        if (
-                            result
-                            and not result.startswith("Command denied")
-                            and not result.startswith("Error")
-                        ):
-                            tool_tags = ["executor", "multi-step"]
-                            await self.memory.store_capability(
-                                task, result[:200], tool_tags
-                            )
-                            words = [
-                                w
-                                for w in re.sub(
-                                    r"[^a-z0-9\s]", "", task.lower()
-                                ).split()
-                                if len(w) > 2
-                            ][:4]
-                            tool_name = "-".join(words)[:50]
-                            if tool_name:
-                                await self.memory.register_tool(
-                                    tool_name,
-                                    task[:120],
-                                    "executor",
-                                    f"shell:{result[:200]}",
-                                    tool_tags,
-                                    self.role,
-                                )
+                        # NOTE: agent_loop returns DONE: prose summaries, not shell
+                        # commands — never cache the loop result as a capability.
+                        # Capabilities are only registered via workspace tool scan
+                        # or explicit tool registry hits (shell: prefix path above).
 
         await self.emit(
             EventType.AGENT_TOOL_RESULT,
@@ -1055,22 +1076,65 @@ class ExecutorAgent(BaseAgent):
         return None
 
     # ── Safety guardrails for AUTO_APPROVED docker/git subcommands ───────────────
-    # Certain subcommands within AUTO_APPROVED bases are still destructive.
-    # If the full command matches any of these patterns, escalate to REQUIRES_APPROVAL.
-    _ESCALATE_PATTERNS: list[re.Pattern] = [
-        re.compile(
-            r"\bdocker\s+(rm|rmi|volume\s+rm|network\s+rm|system\s+prune)\b", re.I
-        ),
-        re.compile(
-            r"\bgit\s+(push|commit|reset|rebase|merge|cherry-pick|force)\b", re.I
-        ),
-        re.compile(
-            r"\btee\b.*/workspace/(user|projects)/", re.I
-        ),  # outside container workspace
-    ]
+    # docker: explicit whitelist — only the listed subcommands run without approval.
+    # Anything outside this list (rm, rmi, prune, volume rm, …) escalates.
+    _DOCKER_SAFE_SUBCOMMANDS: frozenset[str] = frozenset(
+        {
+            "ps",
+            "start",
+            "stop",
+            "restart",
+            "logs",
+            "exec",
+            "inspect",
+            "images",
+            "stats",
+            "top",
+            "port",
+            "diff",
+            "compose",  # docker compose ps/up/down/logs — handled by docker-compose token too
+        }
+    )
+
+    # git: denylist of destructive subcommands (push, force-write, history rewrites).
+    _GIT_BLOCKED_SUBCOMMANDS: frozenset[str] = frozenset(
+        {
+            "push",
+            "commit",
+            "reset",
+            "rebase",
+            "merge",
+            "cherry-pick",
+            "force",
+            "reflog",
+            "bisect",
+        }
+    )
+
+    # tee: must not write outside the container workspace.
+    _TEE_BLOCKED: re.Pattern = re.compile(r"\btee\b.*/workspace/(user|projects)/", re.I)
 
     def _needs_escalation(self, cmd: str) -> bool:
-        return any(p.search(cmd) for p in self._ESCALATE_PATTERNS)
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            return True  # unparseable — escalate to be safe
+
+        base = parts[0] if parts else ""
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if base == "docker":
+            # docker-compose syntax: docker compose <subcommand>
+            # sub is "compose" → whitelisted; actual sub is parts[2]
+            return sub not in self._DOCKER_SAFE_SUBCOMMANDS
+
+        if base in ("git",):
+            return sub in self._GIT_BLOCKED_SUBCOMMANDS
+
+        if base == "tee":
+            return bool(self._TEE_BLOCKED.search(cmd))
+
+        return False
 
     async def _run_command(
         self,

@@ -61,7 +61,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=orchestrator
       - AGENT_VERSION=${AGENT_VERSION:-1.0}
       - COMPOSE_PROJECT_DIR=/workspace/src
@@ -102,8 +102,10 @@ services:
       - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
       - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}   # Optional — #claude channel
       - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-} # Optional — #control channel
-      - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}         # Optional — #agent-logs channel
-      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}                        # Optional — #agent-deliberation channel
+      - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}              # Optional — #agent-logs channel
+      - DISCORD_ERROR_LOG_CHANNEL_ID=${DISCORD_ERROR_LOG_CHANNEL_ID:-}  # Optional — #error-logs channel
+      - DISCORD_TASKS_CHANNEL_ID=${DISCORD_TASKS_CHANNEL_ID:-}          # Optional — #tasks-tracking channel
+      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}            # Optional — #agent-deliberation channel
       - DISCORD_USER_APPROVALS_CHANNEL_ID=${DISCORD_USER_APPROVALS_CHANNEL_ID:-}   # Optional — #user-approvals channel
       - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
       - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
@@ -129,7 +131,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=document_qa
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
@@ -171,7 +173,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=code_search
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -203,7 +205,8 @@ services:
       - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-6}
       - CLAUDE_MAX_TOKENS=${CLAUDE_MAX_TOKENS:-8192}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
+      - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-300}
+      - DISABLED=true
     volumes:
       - ./agents/claude_code_agent:/app/agent
       - ./workspace:/workspace
@@ -254,7 +257,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=research
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -288,7 +291,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=executor
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -324,7 +327,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=developer
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -368,7 +371,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
-      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen2.5-14b}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-qwen3-vl-8b}
       - AGENT_ROLE=optimizer
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}

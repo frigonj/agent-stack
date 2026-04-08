@@ -119,21 +119,26 @@ def _run_perf_suite(marks: list[str] | None = None) -> dict[str, Any]:
     marks: list of pytest marks to filter (e.g. ["redis_live", "db_live"]).
            If None, runs all perf tests that don't require external services.
     """
+    mark_expr = "perf"
+    if marks:
+        mark_expr = "perf and (" + " or ".join(marks) + ")"
+
     cmd = [
         sys.executable,
         "-m",
         "pytest",
         str(_PERF_DIR),
         "-m",
-        "perf",
-        "--tb=no",
+        mark_expr,
+        "--tb=short",
         "-q",
         "--no-header",
         f"--rootdir={_PERF_DIR.parents[1]}",
+        # Pass service URLs so tests connect to container services, not localhost
+        f"--perf-url-redis={_REDIS_URL}",
+        f"--perf-url-db={_DB_URL}",
+        f"--perf-url-lm={_LM_URL}",
     ]
-
-    if marks:
-        cmd += ["-m", "perf and (" + " or ".join(marks) + ")"]
 
     env = os.environ.copy()
     env.update(
@@ -284,12 +289,16 @@ class OptimizerAgent(BaseAgent):
                 start = raw.find("{")
                 if start != -1:
                     self._prior_run = json.loads(raw[start:])
-                    log.info("optimizer.prior_run_restored", ts=self._prior_run.get("run_ts"))
+                    log.info(
+                        "optimizer.prior_run_restored", ts=self._prior_run.get("run_ts")
+                    )
         except Exception as exc:
             log.warning("optimizer.restore_failed", error=str(exc))
 
         # Run an initial pass shortly after startup (5 s delay so infra is ready)
-        asyncio.get_event_loop().call_later(5, lambda: asyncio.create_task(self._run_and_analyse()))
+        asyncio.get_event_loop().call_later(
+            5, lambda: asyncio.create_task(self._run_and_analyse())
+        )
 
     async def on_shutdown(self) -> None:
         log.info("optimizer.shutdown")
@@ -308,7 +317,10 @@ class OptimizerAgent(BaseAgent):
         payload = event.payload or {}
 
         # Accept direct task routing
-        if event.type in (EventType.TASK_CREATED,) and payload.get("target_agent") == "optimizer":
+        if (
+            event.type in (EventType.TASK_CREATED,)
+            and payload.get("target_agent") == "optimizer"
+        ):
             await self._handle_optimize_request(event, payload)
             return
 
@@ -360,7 +372,9 @@ class OptimizerAgent(BaseAgent):
         """Run full perf suite, analyse, store results, publish suggestions."""
         log.info("optimizer.full_run_start")
 
-        run_result = await asyncio.get_event_loop().run_in_executor(None, _run_perf_suite, None)
+        run_result = await asyncio.get_event_loop().run_in_executor(
+            None, _run_perf_suite, None
+        )
         log.info(
             "optimizer.full_run_complete",
             passed=run_result.get("passed"),
@@ -373,8 +387,8 @@ class OptimizerAgent(BaseAgent):
         # Persist result to long-term memory
         await self.memory.store(
             content=f"Optimizer perf suite run {run_result['run_ts']}: "
-                    f"passed={run_result.get('passed')} failed={run_result.get('failed')} "
-                    f"suggestions={json.dumps(suggestions)}",
+            f"passed={run_result.get('passed')} failed={run_result.get('failed')} "
+            f"suggestions={json.dumps(suggestions)}",
             topic="optimizer_results",
             tags=["optimizer", "perf", "suggestions"],
         )
@@ -401,7 +415,10 @@ class OptimizerAgent(BaseAgent):
             target="broadcast",
         )
 
-        log.info("optimizer.suggestions_published", n_suggestions=len(suggestions.get("suggestions", [])))
+        log.info(
+            "optimizer.suggestions_published",
+            n_suggestions=len(suggestions.get("suggestions", [])),
+        )
 
     async def _analyse(self, run_result: dict) -> dict:
         """
@@ -435,7 +452,9 @@ class OptimizerAgent(BaseAgent):
 
         try:
             response = await self.llm_invoke(messages)
-            content = response.content if hasattr(response, "content") else str(response)
+            content = (
+                response.content if hasattr(response, "content") else str(response)
+            )
 
             # Extract JSON from response
             start = content.find("{")
@@ -489,9 +508,9 @@ def _fallback_analysis(metrics: dict, regressions: list[dict]) -> dict:
                 "detail": (
                     f"Time-to-first-token is {ttft:.1f}s (target ≤3s). "
                     "Ensure no other processes are consuming VRAM (check with nvidia-smi). "
-                    "If using Qwen2.5-14B, switch to Qwen3.5-8B Q4_K_M which fits in 5 GB VRAM "
-                    "and typically halves TTFT on an RTX 3070. "
-                    "Set LM_STUDIO_MODEL=qwen3.5-8b in .env and restart the stack."
+                    "If using a large model, switch to Qwen3 VL 8B Q8_0 which fits across RTX 3070 + P4000 (16 GB split) "
+                    "and typically halves TTFT. "
+                    "Set LM_STUDIO_MODEL=qwen3-vl-8b in .env and restart the stack."
                 ),
                 "estimated_impact": "40–60% TTFT reduction",
             }
@@ -506,10 +525,9 @@ def _fallback_analysis(metrics: dict, regressions: list[dict]) -> dict:
                 "title": "Low token throughput — consider smaller model",
                 "detail": (
                     f"Generating {tps:.1f} tok/s (target ≥10). "
-                    "For orchestration tasks (routing, planning) a smaller model like "
-                    "Qwen3.5-8B Q4_K_M is sufficient and significantly faster. "
-                    "Reserve the 14B model for code_search and document_qa tasks by "
-                    "adding per-agent LM_STUDIO_MODEL overrides in docker-compose.yml."
+                    "For orchestration tasks (routing, planning) Qwen3 VL 8B Q8_0 is the recommended model. "
+                    "Ensure it is split across RTX 3070 (primary) and P4000 (overflow) in LM Studio. "
+                    "If throughput is still low, try Q6_K quantisation."
                 ),
                 "estimated_impact": "2× throughput for routine agent tasks",
             }
@@ -623,7 +641,9 @@ def _fallback_analysis(metrics: dict, regressions: list[dict]) -> dict:
         )
 
     regression_summary = (
-        f"{len(regressions)} regression(s) detected" if regressions else "no regressions"
+        f"{len(regressions)} regression(s) detected"
+        if regressions
+        else "no regressions"
     )
     return {
         "summary": (

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     lm_studio_url: str = Field(
         "http://host.docker.internal:1234", validation_alias="LM_STUDIO_URL"
     )
-    lm_studio_model: str = Field("qwen2.5-14b", validation_alias="LM_STUDIO_MODEL")
+    lm_studio_model: str = Field("qwen3-vl-8b", validation_alias="LM_STUDIO_MODEL")
 
     # Agent identity
     agent_role: str = Field("agent", validation_alias="AGENT_ROLE")

@@ -29,6 +29,8 @@ import anthropic
 import redis.asyncio as aioredis
 import structlog
 
+from core.context import truncate_task
+
 log = structlog.get_logger()
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
@@ -37,6 +39,8 @@ STREAM = "agents:claude_code"
 GROUP = "claude_code_group"
 CONSUMER = "claude_code_agent"
 BROADCAST = "agents:broadcast"
+_env_idle = os.environ.get("IDLE_TIMEOUT", "")
+IDLE_TIMEOUT = int(_env_idle) if _env_idle.isdigit() else 0  # 0 = never exit
 
 # Hard caps on tool output returned to Claude.
 # The account rate limit is 10,000 input tokens/minute.
@@ -385,11 +389,44 @@ async def run_task(client: anthropic.AsyncAnthropic, task: str) -> str:
 # ── Event handling ────────────────────────────────────────────────────────────
 
 
+_API_UNAVAILABLE = False  # module-level flag: True while Claude API is unreachable
+_API_LAST_RETRY: float = 0.0  # monotonic time of last API availability check
+_API_RETRY_INTERVAL = 120  # recheck API availability every 2 minutes
+
+
+async def _check_api_available(client: anthropic.AsyncAnthropic) -> bool:
+    """Quick liveness check — send a minimal message to verify the API is up."""
+    global _API_UNAVAILABLE, _API_LAST_RETRY
+    import time as _time
+
+    if not _API_UNAVAILABLE:
+        return True
+
+    # Only recheck every _API_RETRY_INTERVAL seconds
+    if _time.monotonic() - _API_LAST_RETRY < _API_RETRY_INTERVAL:
+        return False
+
+    _API_LAST_RETRY = _time.monotonic()
+    try:
+        await client.messages.create(
+            model=MODEL,
+            max_tokens=10,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        _API_UNAVAILABLE = False
+        log.info("claude_code_agent.api_recovered")
+        return True
+    except Exception:
+        return False
+
+
 async def _handle_event(
     redis: aioredis.Redis,
     client: anthropic.AsyncAnthropic,
     data: dict,
 ) -> None:
+    global _API_UNAVAILABLE
+
     if data.get("type") not in (
         "task.created",
         "task.assigned",
@@ -399,7 +436,7 @@ async def _handle_event(
         return
 
     payload = json.loads(data.get("payload", "{}"))
-    task = payload.get("task", "").strip()
+    task = truncate_task(payload.get("task", "").strip())
     task_id = data.get("task_id", str(uuid.uuid4()))
     parent_task_id = payload.get("parent_task_id", "")
     subtask_id = payload.get("subtask_id", "")
@@ -407,9 +444,60 @@ async def _handle_event(
     if not task:
         return
 
+    # Self-recovery: if API was previously unavailable, check before attempting
+    if _API_UNAVAILABLE:
+        if not await _check_api_available(client):
+            log.warning("claude_code_agent.api_unavailable_skip", task=task[:80])
+            # Re-queue the task to orchestrator so work doesn't stall
+            await redis.xadd(
+                "agents:broadcast",
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "type": "system.error",
+                    "source": "claude_code_agent",
+                    "task_id": task_id,
+                    "timestamp": str(time.time()),
+                    "payload": json.dumps(
+                        {
+                            "error": "Claude API unavailable — task skipped. Will retry when API recovers.",
+                            "task": task[:200],
+                            "task_id": task_id,
+                        }
+                    ),
+                },
+                maxlen=10_000,
+                approximate=True,
+            )
+            return
+
     log.info("claude_code_agent.task_start", task=task[:80], task_id=task_id)
 
-    result = await run_task(client, task)
+    try:
+        result = await run_task(client, task)
+    except (anthropic.APIConnectionError, anthropic.InternalServerError) as exc:
+        # API is down — set flag, emit error, don't crash the agent
+        _API_UNAVAILABLE = True
+        log.error("claude_code_agent.api_down", error=str(exc))
+        await redis.xadd(
+            "agents:broadcast",
+            {
+                "event_id": str(uuid.uuid4()),
+                "type": "system.error",
+                "source": "claude_code_agent",
+                "task_id": task_id,
+                "timestamp": str(time.time()),
+                "payload": json.dumps(
+                    {
+                        "error": f"Claude API unavailable: {exc}. Agent will self-recover when API returns.",
+                        "task": task[:200],
+                        "task_id": task_id,
+                    }
+                ),
+            },
+            maxlen=10_000,
+            approximate=True,
+        )
+        return
 
     log.info("claude_code_agent.task_done", task_id=task_id, result_len=len(result))
 
@@ -439,8 +527,18 @@ async def _handle_event(
 
 
 async def main_loop() -> None:
+    if os.environ.get("DISABLED", "").lower() in ("1", "true", "yes"):
+        log.info("claude_code_agent.disabled", reason="DISABLED env var set — exiting")
+        return
+
     redis_url = os.environ["REDIS_URL"]
     api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    if not api_key:
+        log.warning(
+            "claude_code_agent.no_api_key", reason="ANTHROPIC_API_KEY not set — exiting"
+        )
+        return
 
     redis = await aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
     client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -451,7 +549,10 @@ async def main_loop() -> None:
         if "BUSYGROUP" not in str(e):
             raise
 
-    log.info("claude_code_agent.ready", model=MODEL, stream=STREAM)
+    log.info(
+        "claude_code_agent.ready", model=MODEL, stream=STREAM, idle_timeout=IDLE_TIMEOUT
+    )
+    _last_event = time.monotonic()
 
     while True:
         try:
@@ -460,10 +561,17 @@ async def main_loop() -> None:
                 consumername=CONSUMER,
                 streams={STREAM: ">"},
                 count=1,
-                block=1000,
+                block=5000,
             )
             if not results:
+                if IDLE_TIMEOUT and (time.monotonic() - _last_event) >= IDLE_TIMEOUT:
+                    log.info(
+                        "claude_code_agent.idle_exit",
+                        idle_secs=int(time.monotonic() - _last_event),
+                    )
+                    return
                 continue
+            _last_event = time.monotonic()
             for _stream_key, messages in results:
                 for entry_id, data in messages:
                     try:

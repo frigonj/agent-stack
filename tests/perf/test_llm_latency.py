@@ -24,10 +24,12 @@ import json
 import time
 from pathlib import Path
 
+import os
+
 import pytest
 
-LM_STUDIO_URL = "http://localhost:1234"
-LM_STUDIO_MODEL = "qwen2.5-14b"
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
+LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "qwen3-vl-8b")
 REGRESSION_THRESHOLD = 0.25  # 25% — inference latency is noisier than Redis
 
 
@@ -46,7 +48,7 @@ def _lm_available() -> bool:
 
 lm_live = pytest.mark.skipif(
     not _lm_available(),
-    reason="LM Studio not reachable at localhost:1234",
+    reason=f"LM Studio not reachable at {LM_STUDIO_URL}",
 )
 
 
@@ -140,7 +142,7 @@ async def test_short_prompt_ttft(perf_baseline, update_perf):
         max_ttft = baseline * (1.0 + REGRESSION_THRESHOLD)
         assert result["ttft_s"] <= max_ttft, (
             f"TTFT regression: {result['ttft_s']}s > {max_ttft:.2f}s "
-            f"(baseline {baseline}s, threshold +{REGRESSION_THRESHOLD*100:.0f}%)"
+            f"(baseline {baseline}s, threshold +{REGRESSION_THRESHOLD * 100:.0f}%)"
         )
     else:
         perf_baseline[kpi_key] = result["ttft_s"]
@@ -226,7 +228,7 @@ async def test_concurrency_scaling():
         print(
             f"\n[PERF] concurrency={concurrency}: wall={wall:.2f}s  "
             f"avg_tokens={avg_tokens:.0f}  "
-            f"scaling={wall/results[1]:.2f}×"
+            f"scaling={wall / results[1]:.2f}×"
         )
 
     # Wall time for 3 concurrent must not exceed 4× single (generous — LM Studio queues)

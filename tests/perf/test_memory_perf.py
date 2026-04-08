@@ -27,9 +27,13 @@ import uuid
 from pathlib import Path
 from statistics import mean, median
 
+import os
+
 import pytest
 
-DATABASE_URL = "postgresql://agent:agent@localhost:5432/agentmem"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://agent:agent@localhost:5432/agentmem"
+)
 REGRESSION_THRESHOLD = 0.30  # memory ops can be noisy; 30% threshold
 
 
@@ -49,7 +53,7 @@ def _postgres_available() -> bool:
 
 db_live = pytest.mark.skipif(
     not _postgres_available(),
-    reason="Postgres not reachable at localhost:5432 — start the stack to run perf tests",
+    reason=f"Postgres not reachable at {DATABASE_URL} — start the stack to run perf tests",
 )
 
 
@@ -238,7 +242,9 @@ async def test_concurrent_agent_memory():
         query_times: list[float] = []
         for _ in range(5):
             t0 = time.perf_counter()
-            await mem.search("concurrent agent architecture finding", semantic=True, limit=3)
+            await mem.search(
+                "concurrent agent architecture finding", semantic=True, limit=3
+            )
             query_times.append((time.perf_counter() - t0) * 1000)
 
         return {
@@ -290,7 +296,11 @@ async def test_batch_store_vs_individual(perf_baseline, update_perf):
     await mem.open_session()
 
     entries = [
-        {"content": f"Batch entry {i}: {uuid.uuid4()}", "topic": "batch_test", "tags": ["perf"]}
+        {
+            "content": f"Batch entry {i}: {uuid.uuid4()}",
+            "topic": "batch_test",
+            "tags": ["perf"],
+        }
         for i in range(10)
     ]
 

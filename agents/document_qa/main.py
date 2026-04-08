@@ -439,7 +439,9 @@ class DocumentQAAgent(BaseAgent):
                 md_path.write_text(llm_output, encoding="utf-8")
                 log.info("document_qa.md_written", path=str(md_path))
             except Exception as exc:
-                log.warning("document_qa.md_write_error", path=str(md_path), error=str(exc))
+                log.warning(
+                    "document_qa.md_write_error", path=str(md_path), error=str(exc)
+                )
             return f"\n\n[No LaTeX block found — saved as {md_path}]"
 
         # Sanitise basename

@@ -332,8 +332,16 @@ class LongTermMemory:
             )
             await self._pool.open()
             async with self._pool.connection() as conn:
-                for stmt in _SCHEMA:
-                    await conn.execute(stmt)
+                # Serialize schema migrations across all agents using a
+                # PostgreSQL advisory lock. ALTER TABLE statements acquire
+                # AccessExclusiveLock; without serialization, concurrent agents
+                # deadlock on the same relation in conflicting order.
+                await conn.execute("SELECT pg_advisory_lock(8675309)")
+                try:
+                    for stmt in _SCHEMA:
+                        await conn.execute(stmt)
+                finally:
+                    await conn.execute("SELECT pg_advisory_unlock(8675309)")
         return self._pool
 
     # ── Session lifecycle ────────────────────────────────────────────────────
@@ -659,7 +667,12 @@ class LongTermMemory:
                     (task_id, iteration, json.dumps(f)),
                 )
             await conn.commit()
-        log.debug("memory.research_staging_saved", task_id=task_id, iteration=iteration, count=len(facts))
+        log.debug(
+            "memory.research_staging_saved",
+            task_id=task_id,
+            iteration=iteration,
+            count=len(facts),
+        )
 
     async def load_research_staging(self, task_id: str) -> list[dict]:
         """Return all staged facts for a task, ordered by iteration."""
@@ -994,7 +1007,9 @@ class LongTermMemory:
                 (normalized, normalized),
             )
             row = await cur.fetchone()
-            if row and row["rank"] > 0.05:
+            # Require a high FTS rank to avoid confusing partial matches from
+            # previous tasks (e.g. "list docker containers" ≠ "list docker logs").
+            if row and row["rank"] > 0.3:
                 log.debug("memory.capability_hit_fts", task=task[:80], rank=row["rank"])
                 return row["content"]
 

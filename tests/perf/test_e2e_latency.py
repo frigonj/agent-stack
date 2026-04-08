@@ -30,9 +30,11 @@ import uuid
 from pathlib import Path
 from statistics import median
 
+import os
+
 import pytest
 
-REDIS_URL = "redis://localhost:6379"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 TASK_TIMEOUT_S = 120  # max seconds to wait for a single task to complete
 REGRESSION_THRESHOLD = 0.30  # 30% — e2e is noisy (includes LLM)
 
@@ -68,8 +70,8 @@ def _stack_available() -> bool:
 stack_live = pytest.mark.skipif(
     not _stack_available(),
     reason=(
-        "Full stack not running — start docker compose up and wait for orchestrator "
-        "to announce before running e2e perf tests"
+        f"Full stack not running at {REDIS_URL} — start docker compose up and wait for "
+        "orchestrator to announce before running e2e perf tests"
     ),
 )
 
@@ -94,7 +96,9 @@ async def _dispatch_task(r, task_id: str, prompt: str) -> None:
     await r.xadd("agents:orchestrator", {"event": payload})
 
 
-async def _wait_for_completion(r, task_id: str, timeout_s: float = TASK_TIMEOUT_S) -> float:
+async def _wait_for_completion(
+    r, task_id: str, timeout_s: float = TASK_TIMEOUT_S
+) -> float:
     """
     Listen on agents:broadcast for TASK_COMPLETED / TASK_FAILED matching task_id.
     Returns wall-clock latency in seconds.
@@ -105,7 +109,9 @@ async def _wait_for_completion(r, task_id: str, timeout_s: float = TASK_TIMEOUT_
 
     while time.perf_counter() < deadline:
         remaining_ms = max(100, int((deadline - time.perf_counter()) * 1000))
-        entries = await r.xread({"agents:broadcast": last_id}, block=remaining_ms, count=20)
+        entries = await r.xread(
+            {"agents:broadcast": last_id}, block=remaining_ms, count=20
+        )
         if not entries:
             continue
         for _stream, messages in entries:
@@ -161,7 +167,7 @@ async def test_sequential_task_latency(perf_baseline, update_perf):
         await _wait_for_completion(r, task_id)
         elapsed = time.perf_counter() - t0
         latencies_s.append(elapsed)
-        print(f"\n[PERF] e2e task {i+1}: {elapsed:.2f}s  (task_id={task_id})")
+        print(f"\n[PERF] e2e task {i + 1}: {elapsed:.2f}s  (task_id={task_id})")
 
     await r.aclose()
 
@@ -278,7 +284,7 @@ async def test_orchestrator_routing_overhead():
     if routing_latency is None:
         pytest.skip("No task.assigned event observed — orchestrator may not emit it")
 
-    print(f"\n[PERF] routing_overhead: {routing_latency*1000:.0f}ms to assign task")
+    print(f"\n[PERF] routing_overhead: {routing_latency * 1000:.0f}ms to assign task")
     assert routing_latency < 5.0, (
         f"Routing overhead too high: {routing_latency:.2f}s (expected <5s)"
     )

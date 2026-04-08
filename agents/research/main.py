@@ -33,6 +33,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
+from core.context import truncate_task
 from core.events.bus import Event, EventType
 
 log = structlog.get_logger()
@@ -45,27 +46,51 @@ MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "8"))
 MIN_SOURCES_FOR_CONSENSUS = 3  # ≥3 independent domains → fact is reliable
 CONFIDENCE_COMMIT_THRESHOLD = 0.75  # facts above this go to Postgres
 
-SYSTEM_PROMPT = """You are a research specialist. You receive internet search results and
-reason across multiple sources to produce accurate, well-sourced answers.
+# Engine sets tried in order. If the first set returns 0 results (bot-blocked),
+# fall through to the next set so we always get something back.
+_SEARCH_ENGINE_SETS = [
+    "bing,duckduckgo,brave",  # primary: Google disabled (HTML parser broken)
+    "wikipedia,brave,mojeek",  # fallback: bot-detection-resistant
+]
 
-Your workflow:
-1. Decompose the question into targeted sub-queries
-2. Evaluate snippets for relevance, freshness, and source credibility
-3. Identify agreements and contradictions across sources
-4. Synthesise a clear, concise answer — cite sources inline as [domain.com]
-5. Flag gaps where you could not find reliable information
+SYSTEM_PROMPT = """You are a research specialist in a multi-agent AI stack. You receive \
+internet search results and reason across multiple sources to produce accurate, well-sourced \
+answers that are immediately actionable by the other agents.
 
-Rules:
-- Never fabricate facts; only state what sources confirm
-- Prefer primary sources (official docs, papers) over secondary
-- Shorter, sharper sub-queries return better search results than natural language questions
-- If two sources contradict, note the conflict and give both viewpoints
+## Workflow
+1. Decompose the question into 2–4 targeted sub-queries (short keyword phrases, not questions).
+2. Evaluate each snippet for relevance, freshness, and source credibility.
+3. Identify agreements and contradictions across sources.
+4. Synthesise a concise, direct answer — cite inline as [domain.com].
+5. Where the answer directly informs an engineering decision (version numbers, API changes,
+   known bugs, correct approaches), make that conclusion explicit and prominent.
+6. Flag gaps only when they are significant; don't pad with caveats.
+
+## Quality rules
+- Never fabricate. Only state what sources confirm.
+- Prefer primary sources: official docs, GitHub releases, RFCs, papers.
+- Shorter sub-queries return sharper results: "redis stream consumer group lag" not
+  "how do I check the lag of a redis stream consumer group in python asyncio".
+- If sources contradict, give both views with their source dates.
+- Lead with the most actionable fact. Put caveats last.
+
+## Output format for engineering questions
+When the question is about a library, tool, or version:
+  ANSWER: <direct one-sentence answer>
+  VERSION/DETAILS: <specifics — version number, API name, config key, etc.>
+  SOURCE: [domain.com] [other.com]
+  CAVEATS: <only if genuinely important>
+
+## Prior knowledge injection
+If "Prior knowledge" is injected above this prompt: cross-check it against search results.
+If search results contradict prior memory, trust the search results (they are more current)
+and note the discrepancy so the orchestrator can update memory.
 
 ## Other agents in this stack
-- executor: shell commands, file I/O, Docker
-- code_search: codebase search, grep patterns
+- executor: shell commands, file I/O, Docker operations
+- code_search: codebase search, grep patterns, understanding local code
 - document_qa: PDF reading, LaTeX generation, architecture review
-Route non-research tasks back via the orchestrator.
+Route non-research tasks back via the orchestrator. Do not attempt to run commands.
 """
 
 # ── SearXNG helpers ───────────────────────────────────────────────────────────
@@ -81,26 +106,41 @@ async def _search(
     Each result has: url, title, content (snippet), engine.
     Returns [] on any error so the loop can continue gracefully.
     """
-    try:
-        resp = await client.get(
-            f"{SEARXNG_URL}/search",
-            params={
-                "q": query,
-                "format": "json",
-                "engines": "google,bing,duckduckgo",
-                "language": "en",
-                "safesearch": "0",
-            },
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])[:num_results]
-        log.info("research.search_done", query=query[:60], hits=len(results))
-        return results
-    except Exception as exc:
-        log.warning("research.search_failed", query=query[:60], error=str(exc))
-        return []
+    # Primary engines: broad coverage.  If SearXNG blocks or returns 0 hits,
+    # retry with a different engine set (Wikipedia + Brave + Mojeek) as fallback.
+    for engines in _SEARCH_ENGINE_SETS:
+        try:
+            resp = await client.get(
+                f"{SEARXNG_URL}/search",
+                params={
+                    "q": query,
+                    "format": "json",
+                    "engines": engines,
+                    "language": "en",
+                    "safesearch": "0",
+                },
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])[:num_results]
+            if results:
+                log.info(
+                    "research.search_done",
+                    query=query[:60],
+                    hits=len(results),
+                    engines=engines,
+                )
+                return results
+            log.debug("research.search_empty", query=query[:60], engines=engines)
+        except Exception as exc:
+            log.warning(
+                "research.search_failed",
+                query=query[:60],
+                engines=engines,
+                error=str(exc),
+            )
+    return []
 
 
 def _domain(url: str) -> str:
@@ -156,12 +196,21 @@ def _gap_prompt(question: str, facts: list[dict], iteration: int) -> str:
 def _parse_json_from_llm(text: str) -> object:
     """Extract the first JSON value (array or string or null) from LLM output."""
     text = text.strip()
+    # Strip Qwen3 <think>...</think> reasoning blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
     # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.M)
     text = re.sub(r"\s*```$", "", text, flags=re.M)
     text = text.strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        # Qwen3 wraps string answers in {"text": "..."} — unwrap it
+        if isinstance(parsed, dict):
+            for key in ("text", "sentence", "fact", "answer", "result"):
+                if key in parsed and isinstance(parsed[key], str):
+                    return parsed[key]
+            return None
+        return parsed
     except json.JSONDecodeError:
         # Try to find a JSON array or string
         m = re.search(r'(\[.*?\]|".*?")', text, re.S)
@@ -174,6 +223,41 @@ def _parse_json_from_llm(text: str) -> object:
 
 
 # ── Research Agent ────────────────────────────────────────────────────────────
+
+
+def _cluster_prompt(topic: str, facts: list[dict]) -> str:
+    facts_text = "\n".join(
+        f"{i + 1}. {f['fact']} [source: {f['domain']}]" for i, f in enumerate(facts)
+    )
+    return (
+        "You are organising research facts about a topic into a structured knowledge database.\n"
+        "Group the facts below into 3-6 sub-topics. For each sub-topic:\n"
+        "  - Give it a short, specific name (3-6 words)\n"
+        "  - List the fact numbers that belong to it\n"
+        "Return ONLY a JSON array of objects with keys 'subtopic' and 'indices' (array of 1-based ints).\n\n"
+        f"Topic: {topic}\n\nFacts:\n{facts_text}"
+    )
+
+
+def _knowledge_summary_prompt(subtopic: str, facts: list[dict]) -> str:
+    facts_text = "\n".join(f"- [{f['domain']}] {f['fact']}" for f in facts)
+    return (
+        "Synthesise the following facts about a subtopic into a concise knowledge entry (2-5 sentences).\n"
+        "Cite domains inline as [domain]. Be factual and precise.\n\n"
+        f"Subtopic: {subtopic}\n\nFacts:\n{facts_text}"
+    )
+
+
+_BUILD_KNOWLEDGE_PHRASES = (
+    "build knowledge",
+    "knowledge database",
+    "knowledge base",
+    "knowledge db",
+    "research and store",
+    "deep research",
+    "compile information",
+    "build a database",
+)
 
 
 class ResearchAgent(BaseAgent):
@@ -189,6 +273,12 @@ class ResearchAgent(BaseAgent):
             "Find current information about a topic (news, documentation, prices, status)",
             "event:task.assigned:research",
             ["research", "current", "lookup", "news"],
+        ),
+        (
+            "build-knowledge-base",
+            "Build a structured knowledge database on a topic by running deep multi-angle research and storing organised facts by subtopic",
+            "event:task.assigned:research",
+            ["knowledge", "database", "deep-research", "compile", "store", "topic"],
         ),
     ]
 
@@ -209,22 +299,27 @@ class ResearchAgent(BaseAgent):
         original_task = payload.get("original_task", "")
 
         try:
-            response = await self.llm_invoke([
-                SystemMessage(content=(
-                    "You are the research agent. You search the internet and synthesise information. "
-                    "You are reviewing steps assigned to you in a proposed execution plan. "
-                    "Decide if the research topic is clear enough for you to execute effectively.\n\n"
-                    "Reply in exactly this format:\n"
-                    "UNDERSTOOD: yes/no\n"
-                    "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
-                    "APPROVE: yes/no\n"
-                    "REASON: <one sentence>"
-                )),
-                HumanMessage(content=(
-                    f"Overall task: {original_task}\n"
-                    f"My steps:\n{steps_txt}"
-                )),
-            ])
+            response = await self.llm_invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are the research agent. You search the internet and synthesise information. "
+                            "You are reviewing steps assigned to you in a proposed execution plan. "
+                            "Decide if the research topic is clear enough for you to execute effectively.\n\n"
+                            "Reply in exactly this format:\n"
+                            "UNDERSTOOD: yes/no\n"
+                            "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
+                            "APPROVE: yes/no\n"
+                            "REASON: <one sentence>"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Overall task: {original_task}\nMy steps:\n{steps_txt}"
+                        )
+                    ),
+                ]
+            )
             lines = {
                 k.strip(): v.strip()
                 for line in response.content.splitlines()
@@ -240,23 +335,34 @@ class ResearchAgent(BaseAgent):
         approve_str = lines.get("APPROVE", "yes").lower()
         reason = lines.get("REASON", "")
 
-        if not understood and clarification_q and clarification_q.lower() != "none" and request_clarification:
+        if (
+            not understood
+            and clarification_q
+            and clarification_q.lower() != "none"
+            and request_clarification
+        ):
             answer = await request_clarification(clarification_q)
             if answer:
                 try:
-                    response2 = await self.llm_invoke([
-                        SystemMessage(content=(
-                            "You are the research agent re-evaluating a plan step after receiving clarification. "
-                            "Reply in exactly this format:\n"
-                            "APPROVE: yes/no\n"
-                            "REASON: <one sentence>"
-                        )),
-                        HumanMessage(content=(
-                            f"Overall task: {original_task}\n"
-                            f"My steps:\n{steps_txt}\n\n"
-                            f"Clarification received: {answer}"
-                        )),
-                    ])
+                    response2 = await self.llm_invoke(
+                        [
+                            SystemMessage(
+                                content=(
+                                    "You are the research agent re-evaluating a plan step after receiving clarification. "
+                                    "Reply in exactly this format:\n"
+                                    "APPROVE: yes/no\n"
+                                    "REASON: <one sentence>"
+                                )
+                            ),
+                            HumanMessage(
+                                content=(
+                                    f"Overall task: {original_task}\n"
+                                    f"My steps:\n{steps_txt}\n\n"
+                                    f"Clarification received: {answer}"
+                                )
+                            ),
+                        ]
+                    )
                     lines2 = {
                         k.strip(): v.strip()
                         for line in response2.content.splitlines()
@@ -276,7 +382,7 @@ class ResearchAgent(BaseAgent):
         if event.type not in (EventType.TASK_ASSIGNED, EventType.TASK_CREATED):
             return
 
-        task = event.payload.get("task", "")
+        task = truncate_task(event.payload.get("task", ""))
         task_id = event.task_id or str(uuid.uuid4())
         subtask_id = event.payload.get("subtask_id", str(uuid.uuid4()))
         parent_id = event.payload.get("parent_task_id", task_id)
@@ -284,8 +390,13 @@ class ResearchAgent(BaseAgent):
 
         log.info("research.task_received", task=task[:80])
 
+        is_knowledge_build = any(p in task.lower() for p in _BUILD_KNOWLEDGE_PHRASES)
+
         try:
-            result = await self._research(task, task_id)
+            if is_knowledge_build:
+                result = await self._build_knowledge_db(task, task_id)
+            else:
+                result = await self._research(task, task_id)
         except Exception as exc:
             log.exception("research.task_failed", error=str(exc))
             result = f"Research failed: {exc}"
@@ -321,7 +432,9 @@ class ResearchAgent(BaseAgent):
         prior_facts = await self.memory.load_research_staging(task_id)
         if prior_facts:
             resume_iter = max(f.get("_iteration", 1) for f in prior_facts)
-            all_facts: list[dict] = [{k: v for k, v in f.items() if k != "_iteration"} for f in prior_facts]
+            all_facts: list[dict] = [
+                {k: v for k, v in f.items() if k != "_iteration"} for f in prior_facts
+            ]
             start_iteration = resume_iter + 1
             log.info(
                 "research.resuming",
@@ -349,7 +462,9 @@ class ResearchAgent(BaseAgent):
             else:
                 # Re-derive follow-up queries from what we already know
                 confident_so_far = _compute_confidence(all_facts)
-                sub_queries = await self._find_gaps(question, confident_so_far, start_iteration - 1)
+                sub_queries = await self._find_gaps(
+                    question, confident_so_far, start_iteration - 1
+                )
                 if not sub_queries:
                     sub_queries = [question]
 
@@ -473,7 +588,141 @@ class ResearchAgent(BaseAgent):
 
         return answer
 
+    async def _build_knowledge_db(self, task: str, task_id: str) -> str:
+        """
+        Multi-angle deep research → cluster facts by subtopic → store in knowledge table.
+
+        1. Run _research() to collect high-confidence facts on the topic
+        2. Ask LLM to cluster facts into 3-6 named subtopics
+        3. For each subtopic: synthesise a knowledge entry and batch-store in `knowledge`
+        4. Return a summary of what was stored
+        """
+        # Extract the core topic: strip common prefixes like "build knowledge base on ..."
+        topic_raw = (
+            re.sub(
+                r"(?i)^(build|compile|create|research and store|deep research|"
+                r"build a knowledge (database|base|db) (on|about|for)|"
+                r"knowledge (database|base|db) (on|about|for)|"
+                r"build knowledge (on|about|for))\s*",
+                "",
+                task,
+            ).strip()
+            or task
+        )
+
+        log.info(
+            "research.build_knowledge_start", topic=topic_raw[:80], task_id=task_id
+        )
+
+        # Run normal research loop to gather facts
+        answer = await self._research(topic_raw, task_id)
+
+        # Reload facts committed in that research pass
+        pool = await self.memory._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT fact, domain, url, title
+                FROM research_sources
+                WHERE query_id = %s AND committed = TRUE
+                ORDER BY confidence DESC
+                """,
+                (task_id,),
+            )
+            rows = await cur.fetchall()
+
+        if not rows:
+            return (
+                f"Research completed but no high-confidence facts were found for '{topic_raw}'. "
+                f"The synthesised answer: {answer}"
+            )
+
+        facts = [
+            {"fact": r[0], "domain": r[1], "url": r[2], "title": r[3]} for r in rows
+        ]
+
+        # Cluster facts into subtopics
+        clusters = await self._cluster_facts(topic_raw, facts)
+        if not clusters:
+            # Fallback: store everything as one entry
+            clusters = [
+                {"subtopic": topic_raw, "indices": list(range(1, len(facts) + 1))}
+            ]
+
+        # Build knowledge entries per subtopic
+        entries: list[dict] = []
+        subtopics_built: list[str] = []
+        for cluster in clusters:
+            subtopic = cluster.get("subtopic", "general")
+            indices = [
+                i - 1 for i in cluster.get("indices", []) if 1 <= i <= len(facts)
+            ]
+            cluster_facts = [facts[i] for i in indices]
+            if not cluster_facts:
+                continue
+            summary = await self._summarise_subtopic(subtopic, cluster_facts)
+            tags = ["research", "knowledge-db", topic_raw[:50].lower()]
+            entries.append(
+                {
+                    "topic": f"{topic_raw}/{subtopic}",
+                    "content": summary,
+                    "tags": tags,
+                }
+            )
+            subtopics_built.append(subtopic)
+
+        if entries:
+            # Use batch_store which handles embeddings automatically
+            await self.memory.batch_store(entries)
+            log.info(
+                "research.knowledge_stored",
+                topic=topic_raw[:60],
+                subtopics=len(entries),
+                task_id=task_id,
+            )
+
+        subtopic_list = ", ".join(subtopics_built) if subtopics_built else "none"
+        return (
+            f"Knowledge database built for '{topic_raw}': "
+            f"{len(entries)} subtopic entries stored ({subtopic_list}). "
+            f"Summary: {answer[:400]}"
+        )
+
     # ── LLM calls (local) ─────────────────────────────────────────────────────
+
+    async def _cluster_facts(self, topic: str, facts: list[dict]) -> list[dict]:
+        """Ask LLM to group facts into named subtopics. Returns list of {subtopic, indices}."""
+        try:
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=_cluster_prompt(topic, facts)),
+                ]
+            )
+            parsed = _parse_json_from_llm(resp.content)
+            if isinstance(parsed, list) and parsed:
+                return [
+                    c
+                    for c in parsed
+                    if isinstance(c, dict) and "subtopic" in c and "indices" in c
+                ]
+        except Exception as exc:
+            log.warning("research.cluster_failed", error=str(exc))
+        return []
+
+    async def _summarise_subtopic(self, subtopic: str, facts: list[dict]) -> str:
+        """Synthesise a knowledge paragraph for a single subtopic cluster."""
+        try:
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=_knowledge_summary_prompt(subtopic, facts)),
+                ]
+            )
+            return resp.content.strip()
+        except Exception as exc:
+            log.warning("research.subtopic_summary_failed", error=str(exc))
+            return " ".join(f["fact"] for f in facts)
 
     async def _decompose(self, question: str) -> list[str]:
         try:
@@ -536,9 +785,13 @@ class ResearchAgent(BaseAgent):
                 "multiple independent sources. Please try a more specific query."
             )
         try:
+            # Inject prior memory so the LLM can cross-check and flag discrepancies.
+            mem_ctx = await self.build_task_context(
+                question, tools_limit=0, memory_limit=4
+            )
             resp = await self.llm_invoke(
                 [
-                    SystemMessage(content=SYSTEM_PROMPT),
+                    SystemMessage(content=SYSTEM_PROMPT + mem_ctx),
                     HumanMessage(content=_synthesise_prompt(question, facts)),
                 ]
             )
@@ -627,7 +880,6 @@ def _compute_confidence(facts: list[dict]) -> list[dict]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import asyncio
     from core.config import Settings
 
-    asyncio.run(run_agent(ResearchAgent(Settings())))
+    run_agent(ResearchAgent(Settings()))

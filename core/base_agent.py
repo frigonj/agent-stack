@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import time
@@ -49,7 +50,7 @@ from core.context import (
 try:
     import tiktoken
 
-    _tok_enc = tiktoken.get_encoding("cl100k_base")  # good approximation for Qwen2.5
+    _tok_enc = tiktoken.get_encoding("cl100k_base")  # good approximation for Qwen3
 
     def _count_tokens(text: str) -> int:
         return len(_tok_enc.encode(text, disallowed_special=()))
@@ -112,6 +113,8 @@ class BaseAgent(ABC):
         self._stop_event: Optional[asyncio.Event] = None
         # context_id → asyncio.Task for multi-context consumer pool
         self._context_tasks: dict[str, asyncio.Task] = {}
+        # Tracks fire-and-forget _handle_and_ack tasks so stop() can drain them
+        self._handler_tasks: set[asyncio.Task] = set()
         self._model_context_limit: Optional[int] = None  # cached from LM Studio
         self._model_context_limit_ts: float = 0.0  # monotonic time of last fetch
         self._last_event_time: float = time.monotonic()
@@ -172,6 +175,10 @@ class BaseAgent(ABC):
         await self.on_startup()
         self._running = True
 
+        # ACK any stale PEL entries from a previous crashed run so they don't
+        # permanently block the think loop via _queue_is_idle()
+        await self._drain_stale_pel()
+
         # Announce presence
         await self.bus.publish(
             Event(
@@ -210,6 +217,20 @@ class BaseAgent(ABC):
                 except asyncio.CancelledError:
                     pass
         self._context_tasks.clear()
+
+        # Drain in-flight _handle_and_ack tasks — give them up to 10s to finish
+        # before cancelling so ACKs and error events are not lost.
+        if self._handler_tasks:
+            pending = [t for t in self._handler_tasks if not t.done()]
+            if pending:
+                _, still_pending = await asyncio.wait(pending, timeout=10.0)
+                for t in still_pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        self._handler_tasks.clear()
 
         # Promote any staged findings to long-term memory
         if self._findings:
@@ -320,6 +341,47 @@ class BaseAgent(ABC):
 
     # ── Event loop ───────────────────────────────────────────────────────────
 
+    async def _drain_stale_pel(self) -> None:
+        """
+        ACK any messages sitting in this consumer's PEL (pending entry list) that
+        were delivered to the previous incarnation of this container but never
+        ACKed (e.g. due to a crash or SIGKILL). Without this, pel-count stays > 0
+        and _queue_is_idle() always returns False, permanently blocking the think loop.
+
+        Uses XAUTOCLAIM with min-idle-time=0 to reclaim and immediately ACK all
+        such entries. The events themselves were almost certainly partially-processed
+        and are safe to drop — the task that generated them will time-out and be retried.
+        """
+        streams = [self.role, "broadcast"]
+        for stream_name in streams:
+            key = self.bus._stream_key(stream_name)
+            try:
+                # XAUTOCLAIM <key> <group> <consumer> <min-idle-ms> <start-id>
+                # Returns (next_id, [[entry_id, fields], ...], [deleted_ids])
+                result = await self.bus._client.xautoclaim(
+                    key,
+                    self.group_name,
+                    self.consumer_name,
+                    min_idle_time=0,
+                    start_id="0-0",
+                )
+                # result[1] is the list of claimed entries
+                claimed = result[1] if result and len(result) > 1 else []
+                if claimed:
+                    entry_ids = [e[0] for e in claimed if e]
+                    await self.bus._client.xack(key, self.group_name, *entry_ids)
+                    log.info(
+                        "agent.stale_pel_drained",
+                        role=self.role,
+                        stream=stream_name,
+                        count=len(entry_ids),
+                    )
+            except Exception as exc:
+                # XAUTOCLAIM requires Redis 6.2+; fall back gracefully
+                log.debug(
+                    "agent.stale_pel_drain_skipped", stream=stream_name, error=str(exc)
+                )
+
     async def _queue_is_idle(self) -> bool:
         """
         Return True if there are no unprocessed messages waiting in this
@@ -359,10 +421,17 @@ class BaseAgent(ABC):
 
             # Only run memory health check + think() when the queue is idle
             if not await self._queue_is_idle():
-                log.debug("agent.think_skipped_busy", role=self.role)
+                depth = await self._queue_depth()
+                log.debug(
+                    "agent.think_skipped_busy",
+                    role=self.role,
+                    queue_depth=depth,
+                    reason=f"{depth} message(s) pending in agents:{self.role}",
+                )
                 continue
 
             try:
+                await self._apply_log_level_override()
                 await self._check_memory_health()
                 await self.think()
             except Exception as exc:
@@ -419,7 +488,9 @@ class BaseAgent(ABC):
             # Fire-and-forget each event so the consumer loop stays unblocked.
             # Handlers that take a long time (LLM calls, docker spawning) won't
             # delay acknowledgement of subsequent events.
-            asyncio.create_task(self._handle_and_ack(stream, entry_id, event))
+            t = asyncio.create_task(self._handle_and_ack(stream, entry_id, event))
+            self._handler_tasks.add(t)
+            t.add_done_callback(self._handler_tasks.discard)
 
     async def _handle_and_ack(self, stream: str, entry_id: str, event: Event) -> None:
         # Orchestrator can send a targeted shutdown to any ephemeral agent.
@@ -530,7 +601,8 @@ class BaseAgent(ABC):
         """
         if (
             self._model_context_limit is not None
-            and time.monotonic() - self._model_context_limit_ts < self._MODEL_CTX_CACHE_TTL
+            and time.monotonic() - self._model_context_limit_ts
+            < self._MODEL_CTX_CACHE_TTL
         ):
             return self._model_context_limit
         try:
@@ -540,7 +612,9 @@ class BaseAgent(ABC):
                     r1 = await client.get(f"{self.settings.lm_studio_url}/v1/models")
                     r1.raise_for_status()
                     data1 = r1.json()
-                    models1 = data1 if isinstance(data1, list) else data1.get("data", [])
+                    models1 = (
+                        data1 if isinstance(data1, list) else data1.get("data", [])
+                    )
                     for m in models1:
                         ctx = m.get("context_window") or m.get("context_length")
                         if ctx:
@@ -609,10 +683,12 @@ class BaseAgent(ABC):
         Returns at least 1 000 chars so there's always something useful to send.
         """
         ctx_limit = await self._get_model_context_limit()
-        input_cap = int(ctx_limit * 0.70)  # 25% reply + 5% overhead
+        input_cap = int(ctx_limit * 0.70)  # reserve 25% for reply + 5% overhead
         sys_tokens = self._estimate_tokens([SystemMessage(content=system_msg)])
         fixed_toks = _count_tokens(fixed_content) if fixed_content else 0
-        available = max(1_000, (input_cap - sys_tokens - fixed_toks) * 4)
+        token_budget = max(250, input_cap - sys_tokens - fixed_toks)
+        # Convert token budget to chars conservatively (code/structured text ≈ 3 chars/token)
+        available = token_budget * 3
         log.debug(
             "agent.content_budget",
             role=self.role,
@@ -625,28 +701,33 @@ class BaseAgent(ABC):
 
     # ── Agent action loop (ReAct) ─────────────────────────────────────────────
 
+    # Patterns that indicate an action observation is an error/failure worth retrying
+    _ERROR_OBS_RE = re.compile(
+        r"\b(error|exception|traceback|command not found|permission denied|"
+        r"no such file|failed|exit code [^0]|returncode [^0])\b",
+        re.I,
+    )
+
     async def agent_loop(
         self,
         messages: list,
         action_handler: Callable[[str, str], Awaitable[str]],
-        max_steps: int = 5,
+        max_steps: int = 10,
     ) -> str:
         """
         ReAct-style multi-step loop: Reason → Act → Observe → repeat.
 
-        The LLM response is parsed for action lines:
-          CMD: <shell command>
-          SEARCH: <query>
-          READ: <filepath>
-
-        Each action is executed via ``action_handler(action_type, payload) → str``
-        and the result appended as an OBSERVATION back into the conversation.
+        Self-correction: when an observation indicates failure, the loop injects
+        an explicit "that failed, try a different approach" prompt so the LLM
+        can diagnose and recover rather than give up or loop blindly.
 
         The loop ends when the LLM emits ``DONE: <answer>`` (preferred),
         produces a response with no action lines (implicit done), or
-        exhausts ``max_steps`` (triggers a forced final synthesis).
+        exhausts ``max_steps``.
         """
         msgs = list(messages)
+        consecutive_errors = 0
+        _MAX_CONSECUTIVE_ERRORS = 3
 
         for step in range(max_steps):
             response = await self.llm_invoke(msgs)
@@ -673,6 +754,7 @@ class BaseAgent(ABC):
 
             # Execute actions sequentially, collect observations
             obs_parts: list[str] = []
+            step_had_error = False
             for prefix, payload in actions:
                 payload = payload.strip()
                 log.info(
@@ -687,14 +769,42 @@ class BaseAgent(ABC):
                 except Exception as exc:
                     obs = f"Error executing {prefix}: {exc}"
                 obs_parts.append(f"{prefix}: {payload}\nOBSERVATION: {obs}")
+                if self._ERROR_OBS_RE.search(obs):
+                    step_had_error = True
 
             obs_content = "\n\n".join(obs_parts)
 
-            # If DONE was present alongside actions, return now with the
-            # last observation as the result rather than looping again.
+            # If DONE was present alongside actions, return now.
             if done_m:
                 log.debug("agent_loop.done_after_actions", role=self.role, step=step)
                 return obs_parts[-1].split("OBSERVATION:", 1)[-1].strip()
+
+            # ── Self-correction: inject diagnostic nudge on persistent errors ──
+            if step_had_error:
+                consecutive_errors += 1
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    # Too many consecutive failures — ask LLM to try a completely
+                    # different strategy rather than repeating the same mistake.
+                    obs_content += (
+                        "\n\n[SYSTEM] The previous approach has failed multiple times. "
+                        "Stop and diagnose: what is the root cause? "
+                        "Try a completely different approach or command. "
+                        "If the problem is environmental (missing tool, wrong path, "
+                        "permissions), say so in DONE: rather than retrying."
+                    )
+                    consecutive_errors = 0
+                    log.warning(
+                        "agent_loop.self_correction_nudge",
+                        role=self.role,
+                        step=step,
+                    )
+                else:
+                    obs_content += (
+                        "\n\n[SYSTEM] The last action produced an error. "
+                        "Diagnose what went wrong and try a corrected approach."
+                    )
+            else:
+                consecutive_errors = 0
 
             # Prune old observations if needed to stay within context
             msgs = await self._prune_loop_observations(msgs, obs_content)
@@ -704,7 +814,11 @@ class BaseAgent(ABC):
         log.warning("agent_loop.max_steps_reached", role=self.role, max_steps=max_steps)
         msgs = msgs + [
             _HumanMessage(
-                content="You have reached the step limit. Summarise what you found and provide your best answer now. Start your response with DONE: "
+                content=(
+                    "You have reached the step limit. "
+                    "Summarise what you found, what worked, what didn't, and your best answer now. "
+                    "Start your response with DONE: "
+                )
             )
         ]
         final = await self.llm_invoke(msgs)
@@ -752,7 +866,11 @@ class BaseAgent(ABC):
                 ):
                     new_content = _compress_obs(content)
                     log.debug("agent_loop.obs_compressed", role=self.role, index=i)
-                    messages = messages[:i] + [_HumanMessage(content=new_content)] + messages[i + 1 :]
+                    messages = (
+                        messages[:i]
+                        + [_HumanMessage(content=new_content)]
+                        + messages[i + 1 :]
+                    )
                     candidate = messages + [_HumanMessage(content=incoming_obs)]
                     compressed = True
                     break
@@ -877,8 +995,16 @@ class BaseAgent(ABC):
                         acquired = True
                         continue
 
+                front_member = front[0] if front else "unknown"
+                blocking_role = (
+                    front_member.split(":")[0] if front_member else "unknown"
+                )
                 log.debug(
-                    "agent.llm_lock_waiting", role=self.role, priority=lock_priority
+                    "agent.llm_lock_waiting",
+                    role=self.role,
+                    priority=lock_priority,
+                    blocked_by=blocking_role,
+                    reason=f"LLM lock held by {blocking_role}",
                 )
                 pubsub = self.bus._client.pubsub()
                 await pubsub.subscribe(notify_chan)
@@ -992,9 +1118,11 @@ class BaseAgent(ABC):
             target="broadcast",
         )
 
-    async def recall(self, query: str, semantic: bool = True) -> list[dict]:
+    async def recall(
+        self, query: str, semantic: bool = True, limit: int = 5
+    ) -> list[dict]:
         """Query long-term memory before starting a task. Results are auto-truncated."""
-        results = await self.memory.search(query, semantic=semantic)
+        results = await self.memory.search(query, semantic=semantic, limit=limit)
         return truncate_memory_entries(results)
 
     async def search_tools(self, query: str, limit: int = 5) -> list[dict]:
@@ -1038,10 +1166,74 @@ class BaseAgent(ABC):
             return ""  # all hits filtered out
         return "\n".join(lines) + "\n"
 
+    def format_memory_context(
+        self, memories: list[dict], label: str = "Prior knowledge"
+    ) -> str:
+        """
+        Format long-term memory search results as a compact prompt section.
+        Inject before LLM calls so the agent is primed with what it already knows.
+
+        Filters out low-similarity hits (<0.35) and caps each entry at 300 chars
+        to stay within token budget.
+        """
+        if not memories:
+            return ""
+        lines = [f"\n## {label}"]
+        for m in memories:
+            sim = m.get("similarity", 1.0)
+            if sim and sim < 0.35:
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            topic = m.get("topic", "")
+            snippet = content[:300] + ("…" if len(content) > 300 else "")
+            line = f"- [{topic}] {snippet}" if topic else f"- {snippet}"
+            lines.append(line)
+        if len(lines) == 1:
+            return ""  # all hits filtered
+        return "\n".join(lines) + "\n"
+
+    async def build_task_context(
+        self, task: str, tools_limit: int = 5, memory_limit: int = 5
+    ) -> str:
+        """
+        Build a combined context string (memory + tools) for a given task.
+        Single embedding call shared across both lookups.
+        Call this before constructing LLM messages to prime the model with
+        relevant prior knowledge and available tools.
+        """
+        memories, tools = await self.recall_and_search_tools(
+            task, tools_limit=tools_limit, memory_limit=memory_limit
+        )
+        return self.format_memory_context(memories) + self.format_tools_context(tools)
+
+    # Redis key used to rate-limit memory warning notifications (per agent).
+    _MEMORY_WARN_KEY_PREFIX = "memory:warn_sent"
+    _MEMORY_WARN_INTERVAL = 86_400  # 24 hours — don't spam; one warning per day
+
+    async def _apply_log_level_override(self) -> None:
+        """Check Redis for a dynamic log level override and apply it if set."""
+        try:
+            level_str = await self.bus._client.get("config:log_level")
+            if level_str:
+                level = getattr(logging, level_str.upper(), None)
+                if level is not None:
+                    root = logging.getLogger()
+                    if root.level != level:
+                        root.setLevel(level)
+                        log.info(
+                            "agent.log_level_applied",
+                            role=self.role,
+                            level=level_str.upper(),
+                        )
+        except Exception:
+            pass
+
     async def _check_memory_health(self) -> None:
         """
         Check memory count. Emit MEMORY_PRUNED warning if over threshold,
-        and prune if over hard limit.
+        and prune if over hard limit.  Warnings are throttled to once per 24h.
         """
         try:
             count = await self.memory.count()
@@ -1064,23 +1256,30 @@ class BaseAgent(ABC):
                     target="broadcast",
                 )
             elif count >= MEMORY_WARN_THRESHOLD:
-                await self.bus.publish(
-                    Event(
-                        type=EventType.MEMORY_PRUNED,
-                        source=self.role,
-                        payload={
-                            "deleted": 0,
-                            "remaining": count,
-                            "reason": "warn_threshold",
-                            "message": (
-                                f"⚠️ Long-term memory at {count} entries "
-                                f"(warn threshold: {MEMORY_WARN_THRESHOLD}). "
-                                f"Will auto-prune at {MEMORY_HARD_LIMIT}."
-                            ),
-                        },
-                    ),
-                    target="broadcast",
-                )
+                # Rate-limit: only warn once per 24h to avoid constant noise
+                warn_key = f"{self._MEMORY_WARN_KEY_PREFIX}:{self.role}"
+                already_warned = await self.bus._client.get(warn_key)
+                if not already_warned:
+                    await self.bus._client.setex(
+                        warn_key, self._MEMORY_WARN_INTERVAL, "1"
+                    )
+                    await self.bus.publish(
+                        Event(
+                            type=EventType.MEMORY_PRUNED,
+                            source=self.role,
+                            payload={
+                                "deleted": 0,
+                                "remaining": count,
+                                "reason": "warn_threshold",
+                                "message": (
+                                    f"⚠️ Long-term memory at {count} entries "
+                                    f"(warn threshold: {MEMORY_WARN_THRESHOLD}). "
+                                    f"Will auto-prune at {MEMORY_HARD_LIMIT}."
+                                ),
+                            },
+                        ),
+                        target="broadcast",
+                    )
         except Exception as exc:
             import psycopg  # noqa: PLC0415
 
@@ -1235,11 +1434,15 @@ class BaseAgent(ABC):
                 plan_id, steps, event.payload, request_clarification
             )
         except Exception as exc:
-            log.warning("agent.plan_proposed_handler_error", role=self.role, error=str(exc))
+            log.warning(
+                "agent.plan_proposed_handler_error", role=self.role, error=str(exc)
+            )
             return
         if approve is None:
             return  # explicit opt-out — don't vote
-        await self.emit_vote(plan_id, approve=approve, reason=reason, confidence=confidence)
+        await self.emit_vote(
+            plan_id, approve=approve, reason=reason, confidence=confidence
+        )
 
     async def on_plan_proposed(
         self,
@@ -1331,6 +1534,7 @@ class BaseAgent(ABC):
         Returns the vote_id so the caller can correlate the VOTE_RESULT event.
         """
         import uuid as _uuid
+
         vid = vote_id or _uuid.uuid4().hex
         await self.emit(
             EventType.PEER_VOTE_REQUESTED,
@@ -1394,11 +1598,15 @@ class BaseAgent(ABC):
                 vote_id, question, context, initiator, request_clarification
             )
         except Exception as exc:
-            log.warning("agent.vote_initiated_handler_error", role=self.role, error=str(exc))
+            log.warning(
+                "agent.vote_initiated_handler_error", role=self.role, error=str(exc)
+            )
             return
         if approve is None:
             return
-        await self.emit_vote(vote_id, approve=approve, reason=reason, confidence=confidence)
+        await self.emit_vote(
+            vote_id, approve=approve, reason=reason, confidence=confidence
+        )
 
     async def on_vote_initiated(
         self,
@@ -1418,22 +1626,28 @@ class BaseAgent(ABC):
         from langchain_core.messages import HumanMessage as _HM, SystemMessage as _SM
 
         try:
-            response = await self.llm_invoke([
-                _SM(content=(
-                    f"You are the {self.role} agent participating in a peer vote. "
-                    "Read the question and any context, then decide whether to vote yay or nay "
-                    "based on your role's domain knowledge and concerns.\n\n"
-                    "Reply in exactly this format:\n"
-                    "UNDERSTOOD: yes/no\n"
-                    "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
-                    "VOTE: yay/nay\n"
-                    "REASON: <one sentence>"
-                )),
-                _HM(content=(
-                    f"Question: {question}\n"
-                    + (f"Context: {context}" if context else "")
-                )),
-            ])
+            response = await self.llm_invoke(
+                [
+                    _SM(
+                        content=(
+                            f"You are the {self.role} agent participating in a peer vote. "
+                            "Read the question and any context, then decide whether to vote yay or nay "
+                            "based on your role's domain knowledge and concerns.\n\n"
+                            "Reply in exactly this format:\n"
+                            "UNDERSTOOD: yes/no\n"
+                            "CLARIFICATION_NEEDED: <one focused question if UNDERSTOOD=no, else 'none'>\n"
+                            "VOTE: yay/nay\n"
+                            "REASON: <one sentence>"
+                        )
+                    ),
+                    _HM(
+                        content=(
+                            f"Question: {question}\n"
+                            + (f"Context: {context}" if context else "")
+                        )
+                    ),
+                ]
+            )
             lines = {
                 k.strip(): v.strip()
                 for line in response.content.splitlines()
@@ -1449,23 +1663,34 @@ class BaseAgent(ABC):
         vote_str = lines.get("VOTE", "yay").lower()
         reason = lines.get("REASON", "")
 
-        if not understood and clarification_q and clarification_q.lower() != "none" and request_clarification:
+        if (
+            not understood
+            and clarification_q
+            and clarification_q.lower() != "none"
+            and request_clarification
+        ):
             answer = await request_clarification(clarification_q)
             if answer:
                 try:
-                    r2 = await self.llm_invoke([
-                        _SM(content=(
-                            f"You are the {self.role} agent re-evaluating a peer vote after clarification. "
-                            "Reply in exactly this format:\n"
-                            "VOTE: yay/nay\n"
-                            "REASON: <one sentence>"
-                        )),
-                        _HM(content=(
-                            f"Question: {question}\n"
-                            + (f"Context: {context}\n" if context else "")
-                            + f"Clarification: {answer}"
-                        )),
-                    ])
+                    r2 = await self.llm_invoke(
+                        [
+                            _SM(
+                                content=(
+                                    f"You are the {self.role} agent re-evaluating a peer vote after clarification. "
+                                    "Reply in exactly this format:\n"
+                                    "VOTE: yay/nay\n"
+                                    "REASON: <one sentence>"
+                                )
+                            ),
+                            _HM(
+                                content=(
+                                    f"Question: {question}\n"
+                                    + (f"Context: {context}\n" if context else "")
+                                    + f"Clarification: {answer}"
+                                )
+                            ),
+                        ]
+                    )
                     lines2 = {
                         k.strip(): v.strip()
                         for line in r2.content.splitlines()
@@ -1617,3 +1842,12 @@ def run_agent(agent: BaseAgent) -> None:
         await agent.stop()
 
     loop.run_until_complete(_main())
+
+    # Drain any tasks that were created but not awaited before the loop closed.
+    # This prevents "Task was destroyed but it is pending!" warnings from
+    # fire-and-forget tasks (psycopg pool workers, Redis ACKs, etc.) that
+    # outlived the main coroutine.
+    pending = asyncio.all_tasks(loop)
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
