@@ -2931,20 +2931,29 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 "Executor produced no command — LLM described the task instead of running it",
             )
 
-        # Hard failure markers
-        fail_markers = [
+        # Hard failure markers — structured executor output formats (safe to match globally)
+        structured_fail_markers = [
             "Exit code: 1\n",
             "Exit code: 2\n",
             "Exit code: 127\n",
+        ]
+        for m in structured_fail_markers:
+            if m in result:
+                return False, m.strip()
+
+        # Prose-style markers — only meaningful when the executor itself produced the result;
+        # these phrases appear naturally in code being analysed by other agents (e.g. code_search).
+        executor_fail_markers = [
             "Traceback (most recent",
             "Exception:",
             "not on the allowlist",
             "Execution error:",
             "Command timed out",
         ]
-        for m in fail_markers:
-            if m in result:
-                return False, m.strip()
+        if source == "executor":
+            for m in executor_fail_markers:
+                if m in result:
+                    return False, m.strip()
 
         # Discord action failures
         if "'ok': False" in result or '"ok": false' in result.lower():
