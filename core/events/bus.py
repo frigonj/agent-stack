@@ -599,6 +599,36 @@ class EventBus:
         await self._client.lpush(notify_key, decision)
         await self._client.expire(notify_key, ex)
 
+    # ── Peer-vote result helpers ──────────────────────────────────────────────
+
+    async def wait_for_vote_result(
+        self, vote_id: str, timeout: float = 120.0
+    ) -> str:
+        """
+        Block until the orchestrator pushes the final outcome for *vote_id*.
+
+        notify_vote_result() is called by the orchestrator after VOTE_RESULT is
+        broadcast.  Returns 'approved' or 'rejected'.  Defaults to 'rejected'
+        on timeout.
+        """
+        notify_key = f"vote:notify:{vote_id}"
+        result = await self._client.blpop(notify_key, timeout=int(timeout))
+        if result is not None:
+            _key, outcome = result
+            return outcome.decode() if isinstance(outcome, bytes) else outcome
+        return "rejected"
+
+    async def notify_vote_result(
+        self, vote_id: str, outcome: str, ex: int = 300
+    ) -> None:
+        """
+        Push the final outcome so any wait_for_vote_result() waiter unblocks.
+        Called by the orchestrator at the end of _run_peer_vote().
+        """
+        notify_key = f"vote:notify:{vote_id}"
+        await self._client.lpush(notify_key, outcome)
+        await self._client.expire(notify_key, ex)
+
     # ── Checkpoint / fork helpers ─────────────────────────────────────────────
 
     async def copy_context_stream_to(

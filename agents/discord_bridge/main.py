@@ -252,6 +252,83 @@ class ApprovalView(discord.ui.View):
             await bus.set_approval(self.approval_id, "denied", ex=60)
 
 
+# ── Allowlist approval UI (one-time / permanent / deny) ─────────────────────
+
+
+class AllowlistApprovalView(discord.ui.View):
+    """
+    Three-button approval gate for unknown-command allowlist requests.
+
+    Approve once      → sends 'approved'          (command runs, not remembered)
+    Approve permanent → sends 'approved_permanent' (command added to Redis allowlist)
+    Deny              → sends 'denied'
+    """
+
+    def __init__(self, approval_id: str, redis_client: aioredis.Redis):
+        super().__init__(timeout=300)
+        self.approval_id = approval_id
+        self.redis = redis_client
+        self._decided = False
+
+    async def _resolve(self, interaction: discord.Interaction, decision: str) -> None:
+        if self._decided:
+            await interaction.response.send_message("Already decided.", ephemeral=True)
+            return
+        self._decided = True
+
+        from core.events.bus import EventBus
+
+        bus = EventBus.__new__(EventBus)
+        bus._client = self.redis
+        await bus.set_approval(self.approval_id, decision, ex=600)
+
+        if decision == "approved_permanent":
+            label = "♾️ Approved permanently"
+            color = discord.Color.green()
+        elif decision == "approved":
+            label = "✅ Approved once"
+            color = discord.Color.blurple()
+        else:
+            label = "❌ Denied"
+            color = discord.Color.red()
+
+        embed = interaction.message.embeds[0]
+        embed.color = color
+        embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Once", style=discord.ButtonStyle.primary, emoji="✅")
+    async def approve_once(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, "approved")
+
+    @discord.ui.button(label="Always", style=discord.ButtonStyle.success, emoji="♾️")
+    async def approve_permanent(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, "approved_permanent")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, "denied")
+
+    async def on_timeout(self) -> None:
+        if not self._decided:
+            from core.events.bus import EventBus
+
+            bus = EventBus.__new__(EventBus)
+            bus._client = self.redis
+            await bus.set_approval(self.approval_id, "denied", ex=60)
+
+
 # ── Claude escalation gate UI ────────────────────────────────────────────────
 
 
@@ -1954,18 +2031,45 @@ class DiscordBridgeClient(discord.Client):
         approval_id = payload.get("approval_id", "")
         command = payload.get("command", "")
         task = payload.get("task", "")
+        is_allowlist = payload.get("allowlist_request", False)
+        base_cmd = payload.get("base_cmd", command.split()[0] if command else "")
 
-        embed = discord.Embed(
-            title="🔐 Approval Required",
-            description=f"**{icon} {source}** wants to run a privileged command.",
-            color=discord.Color.yellow(),
-        )
-        embed.add_field(name="Command", value=f"```{command[:900]}```", inline=False)
-        if task:
-            embed.add_field(name="Task context", value=task[:300], inline=False)
-        embed.set_footer(text="No response within 5 minutes = auto-denied")
+        if is_allowlist:
+            embed = discord.Embed(
+                title="🛡️ Allowlist Exception Requested",
+                description=(
+                    f"**{icon} {source}** tried to run `{base_cmd}`, which is not on "
+                    f"the command allowlist.\n\nAgents **voted to permit** it. "
+                    f"Do you want to allow it?"
+                ),
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Command", value=f"```{command[:900]}```", inline=False)
+            if task:
+                embed.add_field(name="Task context", value=task[:300], inline=False)
+            embed.add_field(
+                name="Options",
+                value=(
+                    "**✅ Once** — run this time only, not remembered\n"
+                    "**♾️ Always** — add to allowlist permanently\n"
+                    "**❌ Deny** — block this command"
+                ),
+                inline=False,
+            )
+            embed.set_footer(text="No response within 5 minutes = auto-denied")
+            view = AllowlistApprovalView(approval_id, self.redis)
+        else:
+            embed = discord.Embed(
+                title="🔐 Approval Required",
+                description=f"**{icon} {source}** wants to run a privileged command.",
+                color=discord.Color.yellow(),
+            )
+            embed.add_field(name="Command", value=f"```{command[:900]}```", inline=False)
+            if task:
+                embed.add_field(name="Task context", value=task[:300], inline=False)
+            embed.set_footer(text="No response within 5 minutes = auto-denied")
+            view = ApprovalView(approval_id, self.redis)
 
-        view = ApprovalView(approval_id, self.redis)
         await channel.send(embed=embed, view=view)
 
     async def _post_claude_escalation(

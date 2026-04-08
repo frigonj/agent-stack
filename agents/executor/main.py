@@ -615,7 +615,14 @@ REQUIRES_APPROVAL = {
 _PIP_SAFE_SUBCOMMANDS = {"list", "show", "freeze", "check", "inspect"}
 
 
+_ALLOWLIST_REDIS_KEY = "executor:runtime_allowlist"  # Redis Set — persists across restarts
+
+
 class ExecutorAgent(BaseAgent):
+    # Runtime allowlist: commands approved by agents + user during this run.
+    # Entries may be permanent (persisted to Redis) or one-time (in-memory only).
+    _runtime_allowlist: set[str]
+
     async def on_startup(self) -> None:
         log.info("executor.startup")
         for name, desc, inv, tags in _BUILTIN_TOOLS:
@@ -626,6 +633,17 @@ class ExecutorAgent(BaseAgent):
         await self._seed_workspace_scripts()
         discovered = await self._scan_workspace_tools()
         log.info("executor.workspace_tools_scanned", discovered=discovered)
+        # Load permanent runtime-approved commands from Redis
+        self._runtime_allowlist = set()
+        raw = await self.bus._client.smembers(_ALLOWLIST_REDIS_KEY)
+        if raw:
+            self._runtime_allowlist = {
+                v.decode() if isinstance(v, bytes) else v for v in raw
+            }
+            log.info(
+                "executor.runtime_allowlist_loaded",
+                commands=sorted(self._runtime_allowlist),
+            )
 
     async def _seed_workspace_scripts(self) -> None:
         """
@@ -1159,7 +1177,10 @@ class ExecutorAgent(BaseAgent):
             and parts[1] in _PIP_SAFE_SUBCOMMANDS
         )
 
-        if not pip_read_only and (
+        # Check runtime allowlist first (commands approved by agents+user at runtime)
+        runtime_allowed = base_cmd in getattr(self, "_runtime_allowlist", set())
+
+        if not pip_read_only and not runtime_allowed and (
             base_cmd in REQUIRES_APPROVAL
             or (base_cmd in AUTO_APPROVED_COMMANDS and self._needs_escalation(cmd))
         ):
@@ -1167,12 +1188,13 @@ class ExecutorAgent(BaseAgent):
             if not approved:
                 log.info("executor.command_denied", cmd=cmd)
                 return f"Command denied by user: `{cmd}`"
-        elif pip_read_only or base_cmd in AUTO_APPROVED_COMMANDS:
+        elif pip_read_only or runtime_allowed or base_cmd in AUTO_APPROVED_COMMANDS:
             # Run immediately — emit audit event so the action is visible in #agent-logs
             await self._emit_audit(cmd, task_id)
         elif base_cmd not in SAFE_COMMANDS:
             log.warning("executor.blocked_command", cmd=base_cmd)
-            return f"Command '{base_cmd}' is not on the allowlist and cannot be run."
+            # Unknown command — put it to a peer vote, then escalate to user if approved
+            return await self._request_allowlist_approval(cmd, task, task_id)
 
         log.info("executor.running", cmd=cmd)
         await self.emit(EventType.AGENT_TOOL_CALL, payload={"command": cmd})
@@ -1232,6 +1254,126 @@ class ExecutorAgent(BaseAgent):
             },
         )
         log.info("executor.auto_approved", cmd=cmd[:120])
+
+    async def _request_allowlist_approval(
+        self, cmd: str, task: str, task_id: str
+    ) -> str:
+        """
+        Full allowlist-exception flow for an unknown command:
+
+        1. Initiate a peer vote — agents decide whether the command is safe to run.
+        2. If agents approve → escalate to user via Discord approval with
+           one-time / permanent choice.
+        3. If user approves permanently → persist the base command to Redis so it
+           survives container restarts.
+        4. If user approves one-time → add to the in-memory set for this session only.
+        5. If agents or user reject → return a blocked message without running.
+
+        Returns the string that should be fed back to the LLM as the command result.
+        """
+        try:
+            base_cmd = cmd.split()[0]
+        except IndexError:
+            return f"Command '{cmd}' is not on the allowlist and cannot be run."
+
+        log.warning("executor.unknown_command_vote_initiated", cmd=base_cmd)
+
+        # ── Step 1: peer vote ────────────────────────────────────────────────
+        vote_id = await self.initiate_peer_vote(
+            question=f"Should `{base_cmd}` be added to the executor allowlist?",
+            context=(
+                f"The executor tried to run `{cmd}` as part of task: {task[:200]}\n"
+                f"`{base_cmd}` is not in SAFE_COMMANDS, AUTO_APPROVED_COMMANDS, or "
+                f"REQUIRES_APPROVAL. Vote YES to permit it (will then escalate to the "
+                f"user for final sign-off), NO to block it permanently for this task."
+            ),
+        )
+
+        # Vote timeout: give agents a bit longer than the default vote window
+        vote_outcome = await self.bus.wait_for_vote_result(vote_id, timeout=120.0)
+        log.info(
+            "executor.allowlist_vote_result",
+            cmd=base_cmd,
+            outcome=vote_outcome,
+            vote_id=vote_id[:8],
+        )
+
+        if vote_outcome != "approved":
+            return (
+                f"Command `{base_cmd}` was rejected by agent vote and cannot be run. "
+                f"If you need this command, ask the user to add it to the allowlist manually."
+            )
+
+        # ── Step 2: user escalation ──────────────────────────────────────────
+        approval_id = str(uuid.uuid4())
+        log.info("executor.allowlist_user_escalation", cmd=base_cmd, approval_id=approval_id)
+
+        await self.emit(
+            EventType.APPROVAL_REQUIRED,
+            payload={
+                "approval_id": approval_id,
+                "command": cmd,
+                "task": task,
+                "task_id": task_id,
+                "allowlist_request": True,
+                "base_cmd": base_cmd,
+                "agent_vote": "approved",
+                "prompt": (
+                    f"Agents voted to allow `{base_cmd}`. "
+                    f"Full command: `{cmd}`\n"
+                    f"Task: {task[:200]}\n\n"
+                    f"React with:\n"
+                    f"  ✅ — approve **one time** (runs now, not remembered)\n"
+                    f"  ♾️ — approve **permanently** (added to allowlist forever)\n"
+                    f"  ❌ — deny"
+                ),
+            },
+        )
+
+        decision = await self.bus.wait_for_approval(approval_id, timeout=300)
+        log.info(
+            "executor.allowlist_user_decision",
+            cmd=base_cmd,
+            decision=decision,
+            approval_id=approval_id,
+        )
+
+        if decision == "denied":
+            return f"Command `{base_cmd}` was denied by the user."
+
+        # decision is "approved" (one-time) or "approved_permanent"
+        permanent = decision == "approved_permanent"
+
+        if permanent:
+            # Add to Redis set so it persists across container restarts
+            await self.bus._client.sadd(_ALLOWLIST_REDIS_KEY, base_cmd)
+            log.info("executor.allowlist_permanently_added", cmd=base_cmd)
+
+        # Always add to the in-memory set for this run
+        if not hasattr(self, "_runtime_allowlist"):
+            self._runtime_allowlist = set()
+        self._runtime_allowlist.add(base_cmd)
+
+        scope = "permanently" if permanent else "for this session"
+        log.info("executor.allowlist_approved", cmd=base_cmd, permanent=permanent)
+
+        # Emit an audit event so the allowlist change is visible in #agent-logs
+        await self.emit(
+            EventType.AGENT_TOOL_CALL,
+            payload={
+                "command": cmd,
+                "task_id": task_id,
+                "tier": "runtime_allowlist",
+                "audit": True,
+                "allowlist_added": base_cmd,
+                "permanent": permanent,
+            },
+        )
+
+        # Now actually run the command (it's in runtime_allowlist so _run_command
+        # will skip the gate on recursive call)
+        result = await self._run_command(cmd, task, task_id)
+        return f"[`{base_cmd}` added to allowlist {scope}]\n{result}"
 
     async def _request_approval(self, cmd: str, task: str, task_id: str) -> bool:
         """

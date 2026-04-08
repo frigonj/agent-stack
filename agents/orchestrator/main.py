@@ -2012,6 +2012,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     },
                     target="broadcast",
                 )
+                await self.bus.notify_vote_result(vote_id, outcome)
                 log.info(
                     "orchestrator.peer_vote_result",
                     vote_id=vote_id[:8],
@@ -2065,6 +2066,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     },
                     target="broadcast",
                 )
+                await self.bus.notify_vote_result(vote_id, outcome)
                 log.info(
                     "orchestrator.peer_vote_result",
                     vote_id=vote_id[:8],
