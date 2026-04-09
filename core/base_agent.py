@@ -36,7 +36,12 @@ from langchain_openai import ChatOpenAI
 
 from core.events.bus import Event, EventBus, EventType
 from core.errors import AgentError
-from core.memory.long_term import LongTermMemory
+from core.memory.long_term import (
+    LongTermMemory,
+    MEMORY_CLASSIFY_STREAM,
+    MEMORY_CLASSIFY_GROUP,
+    TTL_SIZE_NAMES,
+)
 from core.config import Settings
 from core.context import (
     truncate_memory_entries,
@@ -132,6 +137,12 @@ class BaseAgent(ABC):
         # plan_id → answer string
         self._clarification_answers: dict[str, str] = {}
 
+        # ── Pending knowledge gap requests ────────────────────────────────────
+        # task_id → asyncio.Event (set when knowledge.teach arrives)
+        self._gap_events: dict[str, asyncio.Event] = {}
+        # task_id → source supplied by the user
+        self._gap_sources: dict[str, str] = {}
+
         # ── Circuit breaker state ─────────────────────────────────────────────
         # Tracks consecutive LM Studio failures. After CIRCUIT_THRESHOLD failures
         # the circuit opens and llm_invoke() fails fast (or uses Claude fallback).
@@ -189,12 +200,15 @@ class BaseAgent(ABC):
             target="broadcast",
         )
 
+        await self._requeue_unclassified()
+
         log.info("agent.ready", role=self.role)
         await self._set_status("idle")
         await asyncio.gather(
             self._event_loop(),
             self._think_loop(),
             self._idle_watchdog_loop(),
+            self._classify_loop(),
         )
 
     async def stop(self, summary: Optional[str] = None) -> None:
@@ -232,10 +246,18 @@ class BaseAgent(ABC):
                         pass
         self._handler_tasks.clear()
 
-        # Promote any staged findings to long-term memory
+        # Promote any staged findings to long-term memory and queue classify jobs
         if self._findings:
-            await self.memory.batch_store(self._findings)
+            result = await self.memory.batch_store(self._findings)
             log.info("agent.promoted_findings", count=len(self._findings))
+            for i, knowledge_id in enumerate(result.get("ids", [])):
+                entry = self._findings[i]
+                await self._publish_classify_job(
+                    knowledge_id,
+                    entry.get("topic", "general"),
+                    entry.get("content", ""),
+                    entry.get("tags") or [self.role],
+                )
 
         await self.memory.close_session(
             summary=summary or f"{self.role} session ended cleanly"
@@ -524,6 +546,11 @@ class BaseAgent(ABC):
         if event.type == EventType.VOTE_CLARIFICATION_RESPONSE:
             await self.bus.ack(stream, self.group_name, entry_id)
             self._handle_clarification_response(event)
+            return
+
+        if event.type == EventType.KNOWLEDGE_TEACH:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            self._handle_knowledge_teach(event)
             return
 
         self._active_tasks += 1
@@ -1089,11 +1116,19 @@ class BaseAgent(ABC):
     # ── Memory helpers ───────────────────────────────────────────────────────
 
     def stage_finding(
-        self, content: str, topic: str, tags: Optional[list[str]] = None
+        self,
+        content: str,
+        topic: str,
+        tags: Optional[list[str]] = None,
+        ttl_days: Optional[int] = None,
     ) -> None:
         """
-        Stage a finding for promotion to Emrys on shutdown.
+        Stage a finding for promotion to long-term memory on shutdown.
         Use this instead of immediate store() for batching efficiency.
+
+        ttl_days: if set, the entry expires after this many days. Pass None
+        for permanent retention. Callers must explicitly decide — there is no
+        default TTL so that permanent storage remains a deliberate choice.
         """
         self._findings.append(
             {
@@ -1101,14 +1136,24 @@ class BaseAgent(ABC):
                 "topic": topic,
                 "tags": tags or [self.role],
                 "kind": "finding",
+                "ttl_days": ttl_days,
             }
         )
 
     async def promote_now(
-        self, content: str, topic: str, tags: Optional[list[str]] = None
+        self,
+        content: str,
+        topic: str,
+        tags: Optional[list[str]] = None,
+        ttl_days: Optional[int] = None,
     ) -> None:
-        """Immediately promote a critical finding to long-term memory."""
-        await self.memory.store(content, topic, tags or [self.role])
+        """Immediately promote a critical finding to long-term memory.
+
+        ttl_days: if set, the entry expires after this many days. Pass None
+        for permanent retention.
+        """
+        result = await self.memory.store(content, topic, tags or [self.role], ttl_days=ttl_days)
+        knowledge_id = result.get("id")
         await self.bus.publish(
             Event(
                 type=EventType.MEMORY_PROMOTED,
@@ -1117,6 +1162,8 @@ class BaseAgent(ABC):
             ),
             target="broadcast",
         )
+        if knowledge_id is not None:
+            await self._publish_classify_job(knowledge_id, topic, content, tags or [self.role])
 
     async def recall(
         self, query: str, semantic: bool = True, limit: int = 5
@@ -1124,6 +1171,141 @@ class BaseAgent(ABC):
         """Query long-term memory before starting a task. Results are auto-truncated."""
         results = await self.memory.search(query, semantic=semantic, limit=limit)
         return truncate_memory_entries(results)
+
+    # ── Memory TTL classification ─────────────────────────────────────────────
+
+    async def _publish_classify_job(
+        self,
+        knowledge_id: int,
+        topic: str,
+        content: str,
+        tags: list[str],
+    ) -> None:
+        """Push a classify job onto the shared memory:classify stream."""
+        try:
+            await self.bus._client.xadd(
+                MEMORY_CLASSIFY_STREAM,
+                {
+                    "id": str(knowledge_id),
+                    "topic": topic,
+                    "content": content[:400],
+                    "tags": json.dumps(tags),
+                    "agent": self.role,
+                },
+            )
+        except Exception as exc:
+            log.warning("memory.classify_publish_failed", id=knowledge_id, error=str(exc))
+
+    async def _classify_loop(self) -> None:
+        """
+        Background loop that consumes memory:classify jobs during idle time.
+        All agents share a single consumer group so each job is processed once.
+        """
+        try:
+            await self.bus._client.xgroup_create(
+                MEMORY_CLASSIFY_STREAM, MEMORY_CLASSIFY_GROUP, id="0", mkstream=True
+            )
+        except Exception as e:
+            if "BUSYGROUP" not in str(e):
+                log.warning("memory.classify_group_create_failed", error=str(e))
+
+        consumer = f"{self.role}_classifier"
+        while self._running:
+            try:
+                # Only process when this agent is idle
+                if self._active_tasks > 0:
+                    await asyncio.sleep(1)
+                    continue
+
+                results = await self.bus._client.xreadgroup(
+                    groupname=MEMORY_CLASSIFY_GROUP,
+                    consumername=consumer,
+                    streams={MEMORY_CLASSIFY_STREAM: ">"},
+                    count=3,
+                    block=2000,
+                )
+                if not results:
+                    continue
+
+                for _stream, messages in results:
+                    for entry_id, data in messages:
+                        try:
+                            await self._handle_classify_job(data)
+                        except Exception as exc:
+                            log.warning(
+                                "memory.classify_job_failed",
+                                entry_id=entry_id,
+                                error=str(exc),
+                            )
+                        finally:
+                            await self.bus._client.xack(
+                                MEMORY_CLASSIFY_STREAM, MEMORY_CLASSIFY_GROUP, entry_id
+                            )
+            except Exception as exc:
+                if self._running:
+                    log.warning("memory.classify_loop_error", error=str(exc))
+                    await asyncio.sleep(5)
+
+    async def _handle_classify_job(self, data: dict) -> None:
+        """Ask the LLM to assign a t-shirt size TTL to one knowledge row."""
+        knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
+        topic = (data.get(b"topic") or data.get("topic") or b"").decode() if isinstance(
+            data.get(b"topic") or data.get("topic"), bytes
+        ) else str(data.get(b"topic") or data.get("topic") or "")
+        content = (data.get(b"content") or data.get("content") or b"").decode() if isinstance(
+            data.get(b"content") or data.get("content"), bytes
+        ) else str(data.get(b"content") or data.get("content") or "")
+        tags_raw = data.get(b"tags") or data.get("tags") or b"[]"
+        tags = json.loads(tags_raw if isinstance(tags_raw, str) else tags_raw.decode())
+
+        sizes_str = ", ".join(f'"{s}"' for s in TTL_SIZE_NAMES)
+        prompt = (
+            f"You are classifying how long a memory should be retained.\n\n"
+            f"Topic: {topic}\n"
+            f"Tags: {', '.join(tags)}\n"
+            f"Content: {content[:300]}\n\n"
+            f"Choose exactly one retention size from: {sizes_str}\n\n"
+            f"Guidelines:\n"
+            f"  session (12h)  — ephemeral run artifacts, specific error traces\n"
+            f"  short   (24h)  — task-specific findings, temporary debug context\n"
+            f"  medium  (7d)   — research results, bug patterns, code analysis\n"
+            f"  long    (30d)  — routing patterns, failure/success templates\n"
+            f"  permanent      — user corrections, learned intents, architecture decisions\n\n"
+            f"Reply with only the size label, nothing else."
+        )
+
+        try:
+            response = await self.llm.ainvoke([SystemMessage(content=prompt)])
+            size = response.content.strip().lower().split()[0]
+            if size not in TTL_SIZE_NAMES:
+                size = "session"  # fallback
+        except Exception as exc:
+            log.warning("memory.classify_llm_failed", id=knowledge_id, error=str(exc))
+            size = "session"
+
+        await self.memory.set_expiry(knowledge_id, size)
+        log.info("memory.classified", id=knowledge_id, size=size, topic=topic)
+
+    async def _requeue_unclassified(self) -> None:
+        """
+        On startup, re-queue any knowledge rows that have no expires_at set
+        and are older than 1 minute — these were never classified, likely due
+        to a crash before the classify job was published.
+        """
+        try:
+            rows = await self.memory.get_unclassified(limit=50)
+            if not rows:
+                return
+            for row in rows:
+                await self._publish_classify_job(
+                    row["id"],
+                    row.get("topic", "general"),
+                    row.get("content", ""),
+                    row.get("tags") or [],
+                )
+            log.info("memory.requeued_unclassified", count=len(rows))
+        except Exception as exc:
+            log.warning("memory.requeue_failed", error=str(exc))
 
     async def search_tools(self, query: str, limit: int = 5) -> list[dict]:
         """
@@ -1381,6 +1563,59 @@ class BaseAgent(ABC):
         if ev is not None:
             self._clarification_answers[plan_id] = answer
             ev.set()
+
+    def _handle_knowledge_teach(self, event: "Event") -> None:
+        """Unblock any coroutine waiting on a knowledge gap resolution."""
+        task_id = event.payload.get("task_id", "")
+        source = event.payload.get("source", "")
+        ev = self._gap_events.get(task_id)
+        if ev is not None:
+            self._gap_sources[task_id] = source
+            ev.set()
+
+    async def raise_knowledge_gap(
+        self,
+        what: str,
+        task_id: str,
+        timeout: float = 86400.0,
+    ) -> str:
+        """
+        Signal that this agent lacks information needed to proceed.
+
+        Emits a knowledge.gap event (orchestrator freezes the plan and posts
+        to #knowledge-gaps in Discord), then suspends until the user supplies
+        a source via knowledge.teach.  Returns the source string the user
+        provided (URL, workspace path, or inline text).
+
+        timeout: seconds to wait before giving up (default 24 h).
+        """
+        ev = asyncio.Event()
+        self._gap_events[task_id] = ev
+        self._gap_sources.pop(task_id, None)
+
+        await self.bus.publish(
+            Event(
+                type=EventType.KNOWLEDGE_GAP,
+                source=self.role,
+                payload={"what": what, "task_id": task_id, "agent": self.role},
+                task_id=task_id,
+            ),
+            target="orchestrator",
+        )
+
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            return self._gap_sources.get(task_id, "")
+        except asyncio.TimeoutError:
+            log.warning(
+                "agent.knowledge_gap_timeout",
+                task_id=task_id,
+                what=what[:80],
+            )
+            return ""
+        finally:
+            self._gap_events.pop(task_id, None)
+            self._gap_sources.pop(task_id, None)
 
     async def _handle_plan_proposed(self, event: "Event") -> None:
         """

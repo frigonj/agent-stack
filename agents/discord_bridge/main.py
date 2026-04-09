@@ -37,6 +37,7 @@ Environment variables:
   DISCORD_CLAUDE_CHANNEL_ID         — optional (#claude → Claude API agent)
   DISCORD_CONTROL_CHANNEL_ID        — optional (#control → restart commands)
   DISCORD_USER_APPROVALS_CHANNEL_ID — optional (#user-approvals → user-escalated votes)
+  DISCORD_KNOWLEDGE_GAP_CHANNEL_ID  — optional (#knowledge-gap → agent knowledge gap escalations)
   CONTROL_HELPER_URL                — optional (default http://host.docker.internal:7799)
   DISCORD_GUILD_ID                  — optional (auto-detected)
 """
@@ -169,6 +170,7 @@ VISIBLE_EVENTS = {
     "discord.action",
     "memory.pruned",
     "plan.status",
+    "knowledge.gap",
 }
 
 # Extra events forwarded only when verbose mode is active
@@ -596,6 +598,7 @@ class DiscordBridgeClient(discord.Client):
         task_tracking_channel_id: str | None = None,
         votes_channel_id: str | None = None,
         approvals_channel_id: str | None = None,
+        knowledge_gap_channel_id: str | None = None,
         control_helper_url: str = "http://host.docker.internal:7799",
         guild_id: str | None = None,
         **kwargs,
@@ -627,6 +630,9 @@ class DiscordBridgeClient(discord.Client):
         self.approvals_channel_id = (
             approvals_channel_id  # #approvals — approval.required, vote escalations
         )
+        self.knowledge_gap_channel_id = (
+            knowledge_gap_channel_id  # #knowledge-gap — agent knowledge gap escalations
+        )
         self.control_helper_url = control_helper_url.rstrip("/")
         self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
@@ -653,6 +659,9 @@ class DiscordBridgeClient(discord.Client):
         # Per-vote guard: (plan_id, agent) → True — prevents a single agent's vote
         # from being appended to the embed twice if the event is redelivered.
         self._posted_votes: set[str] = set()
+        # Knowledge gap embeds: gap_embed_message_id → task_id
+        # Used to correlate a user's reply-to-embed with the right frozen task.
+        self._gap_messages: dict[int, str] = {}
 
     async def setup_hook(self) -> None:
         self.redis = await aioredis.from_url(
@@ -710,6 +719,11 @@ class DiscordBridgeClient(discord.Client):
             if not message.content:
                 return
             await self._handle_control_command(message)
+            return
+
+        # ── #knowledge-gap channel ────────────────────────────────────────────
+        if self.knowledge_gap_channel_id and channel_str == self.knowledge_gap_channel_id:
+            await self._handle_knowledge_gap_reply(message)
             return
 
         # ── #claude channel ───────────────────────────────────────────────────
@@ -952,6 +966,103 @@ class DiscordBridgeClient(discord.Client):
             session_id=session_id or "new",
         )
 
+    async def _handle_knowledge_gap_reply(self, message: discord.Message) -> None:
+        """
+        Handle a message in #knowledge-gap.
+
+        Resolution priority:
+        1. Reply-to-embed  — message.reference points to a known gap embed
+        2. teach <task_id> <source>  — explicit command form
+        3. Freeform in channel with open gaps  — if exactly one gap is open,
+           attribute it automatically; otherwise ask the user to reply to the embed.
+        """
+        content = message.content.strip() if message.content else ""
+        attachments = message.attachments
+
+        # ── Determine task_id ─────────────────────────────────────────────────
+        task_id = None
+
+        # 1. Reply-to-embed
+        if message.reference and message.reference.message_id:
+            task_id = self._gap_messages.get(message.reference.message_id)
+
+        # 2. Explicit "teach <task_id> <source>" form
+        if task_id is None and content.lower().startswith("teach "):
+            parts = content.split(None, 2)
+            if len(parts) >= 3:
+                task_id = parts[1]
+                content = parts[2]
+
+        # 3. Single open gap — auto-attribute
+        if task_id is None and len(self._gap_messages) == 1:
+            task_id = next(iter(self._gap_messages.values()))
+
+        if not task_id:
+            await message.reply(
+                "❓ Couldn't match this to an open knowledge gap. "
+                "Please **reply directly to the gap embed**, or use "
+                "`teach <task_id> <source>`."
+            )
+            return
+
+        # ── Determine source ──────────────────────────────────────────────────
+        source = ""
+        source_type = ""
+
+        if attachments:
+            # Discord CDN URLs are fetchable — treat as a URL source
+            source = attachments[0].url
+            source_type = "url"
+        elif content:
+            import re as _re
+            if _re.match(r"https?://", content.split()[0]):
+                source = content.split()[0]
+                source_type = "url"
+            elif content.startswith("/workspace/"):
+                source = content.strip()
+                source_type = "file"
+            else:
+                source = content
+                source_type = "text"
+
+        if not source:
+            await message.reply(
+                "❓ No source found. Please include a URL, a `/workspace/` path, or text."
+            )
+            return
+
+        # ── Emit knowledge.teach to orchestrator ──────────────────────────────
+        await self.redis.xadd(
+            "agents:orchestrator",
+            {
+                "event_id": str(uuid.uuid4()),
+                "type": "knowledge.teach",
+                "source": "discord_bridge",
+                "task_id": task_id,
+                "timestamp": str(time.time()),
+                "payload": json.dumps(
+                    {"task_id": task_id, "source": source, "source_type": source_type}
+                ),
+            },
+        )
+
+        # Clean up the gap entry
+        self._gap_messages = {
+            mid: tid for mid, tid in self._gap_messages.items() if tid != task_id
+        }
+
+        type_label = {"url": "URL", "file": "workspace file", "text": "inline text"}.get(
+            source_type, source_type
+        )
+        await message.reply(
+            f"✅ Got it — sending {type_label} to the agent and resuming task `{task_id}`."
+        )
+        log.info(
+            "discord_bridge.knowledge_gap_resolved",
+            task_id=task_id,
+            source_type=source_type,
+        )
+
     async def _handle_control_command(self, message: discord.Message) -> None:
         """Parse and dispatch a control channel command."""
         text = message.content.strip()
@@ -1122,6 +1233,44 @@ class DiscordBridgeClient(discord.Client):
                 "The orchestrator will reload the plan and continue from the last checkpoint."
             )
             log.info("discord_bridge.task_resume_requested", task_id=task_id)
+            return
+
+        # teach <task_id> <source>  — resolve a knowledge gap from the control channel
+        if len(parts) >= 3 and parts[0] == "teach":
+            task_id = parts[1]
+            source = parts[2]
+            import re as _re
+            if _re.match(r"https?://", source):
+                source_type = "url"
+            elif source.startswith("/workspace/"):
+                source_type = "file"
+            else:
+                source_type = "text"
+            await self.redis.xadd(
+                "agents:orchestrator",
+                {
+                    "event_id": str(uuid.uuid4()),
+                    "type": "knowledge.teach",
+                    "source": "discord_control",
+                    "task_id": task_id,
+                    "timestamp": str(time.time()),
+                    "payload": json.dumps(
+                        {"task_id": task_id, "source": source, "source_type": source_type}
+                    ),
+                },
+            )
+            # Clean up gap embed tracking if present
+            self._gap_messages = {
+                mid: tid for mid, tid in self._gap_messages.items() if tid != task_id
+            }
+            await message.reply(
+                f"✅ Teaching source sent for task `{task_id}`. Agent will resume shortly."
+            )
+            log.info(
+                "discord_bridge.knowledge_teach_sent",
+                task_id=task_id,
+                source_type=source_type,
+            )
             return
 
         # relaunch [mode] [svc]
@@ -1463,23 +1612,25 @@ class DiscordBridgeClient(discord.Client):
         elif event_type == "task.completed":
             result = payload.get("result", "(no output)")
             task_id = payload.get("task_id")
+            is_chat = payload.get("is_chat", False)
             embed = discord.Embed(
                 title=f"{icon} {source.replace('_', ' ').title()}",
                 description=result[:3800],
                 color=color,
             )
 
-            # Post completion to #task-tracking
-            tracking_ch = await self._get_task_tracking_channel()
-            if tracking_ch:
-                task_id_short = (task_id or "")[:8]
-                t_embed = discord.Embed(
-                    title="✅ Task Completed",
-                    description=result[:500],
-                    color=discord.Color.green(),
-                )
-                t_embed.set_footer(text=f"task {task_id_short} | {source}")
-                await tracking_ch.send(embed=t_embed)
+            # Post completion to #task-tracking (skip for simple chat responses)
+            if not is_chat:
+                tracking_ch = await self._get_task_tracking_channel()
+                if tracking_ch:
+                    task_id_short = (task_id or "")[:8]
+                    t_embed = discord.Embed(
+                        title="✅ Task Completed",
+                        description=result[:500],
+                        color=discord.Color.green(),
+                    )
+                    t_embed.set_footer(text=f"task {task_id_short} | {source}")
+                    await tracking_ch.send(embed=t_embed)
 
             # Try to reply to the original user message so it threads nicely
             origin = self._pending_messages.pop(task_id, None) if task_id else None
@@ -1609,6 +1760,54 @@ class DiscordBridgeClient(discord.Client):
 
         elif event_type == "discord.action":
             await self._execute_discord_action(payload, data.get("event_id", ""))
+
+        elif event_type == "knowledge.gap":
+            await self._post_knowledge_gap(payload)
+
+    async def _post_knowledge_gap(self, payload: dict) -> None:
+        """
+        Post a knowledge gap escalation embed to #knowledge-gap.
+        Stores the embed message_id → task_id so a user reply-to-embed
+        can be correlated back to the frozen task.
+        """
+        ch = await self._get_knowledge_gap_channel()
+        if not ch:
+            return
+
+        task_id = payload.get("task_id", "")
+        what = payload.get("what", "unknown")
+        agent = payload.get("agent", "unknown")
+
+        embed = discord.Embed(
+            title="❓ Agent needs information",
+            color=discord.Color.yellow(),
+        )
+        embed.add_field(name="Agent", value=f"`{agent}`", inline=True)
+        embed.add_field(name="Task ID", value=f"`{task_id}`", inline=True)
+        embed.add_field(name="What it needs", value=what[:1000], inline=False)
+        embed.add_field(
+            name="How to resolve",
+            value=(
+                "**Reply to this message** with one of:\n"
+                "• A URL — agent will fetch and learn from it\n"
+                "• A `/workspace/docs/` path — agent will read the file\n"
+                "• Plain text — injected directly as context\n\n"
+                f"Or use the control channel: `teach {task_id} <source>`"
+            ),
+            inline=False,
+        )
+
+        try:
+            msg = await ch.send(embed=embed)
+            self._gap_messages[msg.id] = task_id
+            log.info(
+                "discord_bridge.knowledge_gap_posted",
+                task_id=task_id,
+                agent=agent,
+                message_id=msg.id,
+            )
+        except Exception as exc:
+            log.warning("discord_bridge.knowledge_gap_post_failed", error=str(exc))
 
     async def _execute_discord_action(self, payload: dict, event_id: str) -> None:
         """
@@ -1916,6 +2115,18 @@ class DiscordBridgeClient(discord.Client):
             except Exception:
                 pass
         return await self._get_votes_channel()
+
+    async def _get_knowledge_gap_channel(self):
+        """Return the #knowledge-gap channel, falling back to #general."""
+        if self.knowledge_gap_channel_id:
+            try:
+                return await self.fetch_channel(int(self.knowledge_gap_channel_id))
+            except Exception:
+                pass
+        try:
+            return await self.fetch_channel(int(self.general_channel_id))
+        except Exception:
+            return None
 
     async def _post_plan_proposed(self, payload: dict) -> None:
         """Post a brief vote-initiated notice to #votes."""
@@ -2247,6 +2458,7 @@ def main() -> None:
     task_tracking_channel_id = os.environ.get("DISCORD_TASK_TRACKING_CHANNEL_ID")
     votes_channel_id = os.environ.get("DISCORD_VOTES_CHANNEL_ID")
     approvals_channel_id = os.environ.get("DISCORD_APPROVALS_CHANNEL_ID")
+    knowledge_gap_channel_id = os.environ.get("DISCORD_KNOWLEDGE_GAP_CHANNEL_ID")
     control_helper_url = os.environ.get(
         "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
     )
@@ -2271,6 +2483,7 @@ def main() -> None:
         task_tracking_channel_id=task_tracking_channel_id,
         votes_channel_id=votes_channel_id,
         approvals_channel_id=approvals_channel_id,
+        knowledge_gap_channel_id=knowledge_gap_channel_id,
         control_helper_url=control_helper_url,
         guild_id=guild_id,
         intents=intents,
@@ -2289,6 +2502,7 @@ def main() -> None:
         votes_channel=votes_channel_id or "(not configured — falling back to #logs)",
         approvals_channel=approvals_channel_id
         or "(not configured — falling back to #votes)",
+        knowledge_gap_channel=knowledge_gap_channel_id or "(not configured — falling back to #general)",
     )
     client.run(bot_token)
 

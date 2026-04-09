@@ -20,6 +20,7 @@ Zero Claude API calls — all LLM work uses local LM Studio (Qwen via LangChain)
 from __future__ import annotations
 
 import asyncio
+import html.parser
 import json
 import os
 import re
@@ -150,6 +151,72 @@ def _domain(url: str) -> str:
         return url
 
 
+# ── Direct URL fetch ──────────────────────────────────────────────────────────
+
+_FETCH_MAX_CHARS = 12_000  # ~3k tokens — enough for a doc page without blowing context
+_FETCH_TIMEOUT = 20.0
+
+
+class _TagStripper(html.parser.HTMLParser):
+    """Minimal HTML → plain-text converter using stdlib only."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in ("script", "style", "nav", "footer", "header"):
+            self._skip = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "nav", "footer", "header"):
+            self._skip = False
+        if tag in ("p", "div", "li", "h1", "h2", "h3", "h4", "br", "tr"):
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self._parts)
+        # Collapse runs of whitespace / blank lines
+        lines = [ln.strip() for ln in raw.splitlines()]
+        lines = [ln for ln in lines if ln]
+        return "\n".join(lines)
+
+
+async def _fetch_url(url: str) -> str:
+    """
+    Fetch a URL and return readable plain text, truncated to _FETCH_MAX_CHARS.
+    Returns an error string (never raises) so callers can continue gracefully.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; agent-stack-research/1.0; "
+            "+https://github.com/agent-stack)"
+        ),
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=_FETCH_TIMEOUT
+        ) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "html" in content_type:
+                stripper = _TagStripper()
+                stripper.feed(resp.text)
+                text = stripper.get_text()
+            else:
+                text = resp.text
+            return text[:_FETCH_MAX_CHARS]
+    except Exception as exc:
+        return f"[fetch error: {exc}]"
+
+
 # ── LLM helpers (all local — LM Studio / Qwen) ────────────────────────────────
 
 
@@ -259,6 +326,16 @@ _BUILD_KNOWLEDGE_PHRASES = (
     "build a database",
 )
 
+_FETCH_LEARN_PHRASES = (
+    "fetch and learn",
+    "fetch and store",
+    "read url",
+    "ingest url",
+    "learn from url",
+    "learn from link",
+    "learn from source",
+)
+
 
 class ResearchAgent(BaseAgent):
     _OWN_TOOLS = [
@@ -279,6 +356,12 @@ class ResearchAgent(BaseAgent):
             "Build a structured knowledge database on a topic by running deep multi-angle research and storing organised facts by subtopic",
             "event:task.assigned:research",
             ["knowledge", "database", "deep-research", "compile", "store", "topic"],
+        ),
+        (
+            "fetch-and-learn",
+            "Fetch a URL directly, extract its content, and store the key facts to the knowledge base",
+            "event:task.assigned:research",
+            ["fetch", "url", "ingest", "learn", "source", "link"],
         ),
     ]
 
@@ -391,9 +474,19 @@ class ResearchAgent(BaseAgent):
         log.info("research.task_received", task=task[:80])
 
         is_knowledge_build = any(p in task.lower() for p in _BUILD_KNOWLEDGE_PHRASES)
+        is_fetch_learn = any(p in task.lower() for p in _FETCH_LEARN_PHRASES)
+
+        # fetch-and-learn tasks carry the URL in the payload; fall back to
+        # extracting a URL-shaped token from the task string itself.
+        source_url = event.payload.get("source_url", "")
+        if not source_url and is_fetch_learn:
+            m = re.search(r"https?://\S+", task)
+            source_url = m.group(0) if m else ""
 
         try:
-            if is_knowledge_build:
+            if is_fetch_learn and source_url:
+                result = await self._fetch_and_learn(source_url, task_id)
+            elif is_knowledge_build:
                 result = await self._build_knowledge_db(task, task_id)
             else:
                 result = await self._research(task, task_id)
@@ -723,6 +816,75 @@ class ResearchAgent(BaseAgent):
         except Exception as exc:
             log.warning("research.subtopic_summary_failed", error=str(exc))
             return " ".join(f["fact"] for f in facts)
+
+    async def _fetch_and_learn(self, url: str, task_id: str) -> str:
+        """
+        Fetch a URL directly, extract plain text, ask the LLM to pull out key
+        facts, and store them in the knowledge base under the URL's domain.
+
+        Returns a summary of what was stored.
+        """
+        log.info("research.fetch_and_learn", url=url[:120])
+        text = await _fetch_url(url)
+
+        if text.startswith("[fetch error:"):
+            log.warning("research.fetch_failed", url=url[:120], error=text)
+            return f"Could not fetch {url}: {text}"
+
+        domain = _domain(url)
+
+        # Ask LLM to extract 3-8 key facts from the page content
+        extract_prompt = (
+            "You are extracting key facts from a web page for a knowledge base.\n"
+            "Read the content below and return a JSON array of concise fact strings "
+            "(3-8 facts, each under 120 characters). Include only information that is "
+            "specific, verifiable, and useful for answering future questions.\n"
+            "Return ONLY the JSON array, nothing else.\n\n"
+            f"Source: {url}\n\n"
+            f"Content:\n{text[:6000]}"
+        )
+        try:
+            resp = await self.llm_invoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=extract_prompt),
+                ]
+            )
+            facts = _parse_llm_json(resp.content)
+            if not isinstance(facts, list):
+                facts = []
+        except Exception as exc:
+            log.warning("research.fetch_learn_extract_failed", error=str(exc))
+            facts = []
+
+        if not facts:
+            # Fall back: store the truncated raw text as a single knowledge entry
+            await self.promote_memory(
+                f"[{domain}] Page content: {text[:500]}",
+                topic=domain,
+                tags=["fetched", domain],
+            )
+            return f"Fetched {url} but could not extract structured facts. Raw content stored."
+
+        # Store each fact individually
+        entries = [
+            {"topic": domain, "content": f"[{domain}] {fact}", "tags": ["fetched", domain]}
+            for fact in facts
+            if isinstance(fact, str) and fact.strip()
+        ]
+        for entry in entries:
+            await self.promote_memory(
+                entry["content"],
+                topic=entry["topic"],
+                tags=entry["tags"],
+            )
+
+        log.info("research.fetch_learn_stored", url=url[:80], facts=len(entries))
+        summary_lines = "\n".join(f"- {e['content']}" for e in entries[:5])
+        return (
+            f"Fetched {url} and stored {len(entries)} facts:\n{summary_lines}"
+            + ("\n…" if len(entries) > 5 else "")
+        )
 
     async def _decompose(self, question: str) -> list[str]:
         try:

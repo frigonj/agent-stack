@@ -920,6 +920,10 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_vote_user_result(event)
         elif event.type == EventType.AGENT_RESPONSE:
             await self._handle_agent_response(event)
+        elif event.type == EventType.KNOWLEDGE_GAP:
+            await self._handle_knowledge_gap(event)
+        elif event.type == EventType.KNOWLEDGE_TEACH:
+            await self._handle_knowledge_teach(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -1140,7 +1144,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 )
 
         await self._publish_reply(
-            reply, task_id, discord_message_id, original_task=task
+            reply, task_id, discord_message_id, original_task=task, is_chat=True
         )
         log.info("orchestrator.chat_replied", task=task[:60])
 
@@ -1186,7 +1190,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         ]
         response = await self.llm_invoke(messages)
         await self._publish_reply(
-            response.content, task_id, discord_message_id, original_task=task
+            response.content, task_id, discord_message_id, original_task=task, is_chat=True
         )
         log.info("orchestrator.clarify_asked", task=task[:60])
 
@@ -1295,6 +1299,160 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         )
         log.info("orchestrator.plan_resumed", task_id=task_id, phase=paused_at_phase)
         await self._dispatch_phase(plan, paused_at_phase)
+
+    # ── Knowledge gap lifecycle ───────────────────────────────────────────────
+
+    async def _handle_knowledge_gap(self, event: Event) -> None:
+        """
+        An agent couldn't proceed because it lacks information.
+        Freeze the plan (same mechanics as task.paused) and forward the gap
+        to Discord so the user can supply a source.
+        """
+        task_id = event.payload.get("task_id") or event.task_id
+        what = event.payload.get("what", "unknown")
+        agent = event.payload.get("agent", event.source)
+
+        plan = self._plans.pop(task_id, None)
+        if plan is not None:
+            current_phase = plan.current_phase()
+            plan_dict = plan.to_dict()
+            plan_dict["paused_at_phase"] = current_phase
+            await self.memory.upsert_plan(
+                task_id, plan.plan_id, plan.original_task, "knowledge_gap", plan_dict
+            )
+
+        await self.bus.publish(
+            Event(
+                type=EventType.KNOWLEDGE_GAP,
+                source="orchestrator",
+                payload={
+                    "task_id": task_id,
+                    "what": what,
+                    "agent": agent,
+                },
+                task_id=task_id,
+            ),
+            target="broadcast",
+        )
+        log.info(
+            "orchestrator.knowledge_gap",
+            task_id=task_id,
+            agent=agent,
+            what=what[:80],
+        )
+
+    async def _handle_knowledge_teach(self, event: Event) -> None:
+        """
+        User supplied a source to resolve a knowledge gap.
+        Route to the right agent (research for URLs, document_qa for workspace
+        files, direct resume for inline text), then resume the frozen plan.
+        """
+        task_id = event.payload.get("task_id", "")
+        source = event.payload.get("source", "").strip()
+        source_type = event.payload.get("source_type", "")
+
+        if not task_id:
+            log.warning("orchestrator.knowledge_teach_missing_task_id")
+            return
+
+        # Auto-detect source type when not supplied by bridge
+        if not source_type:
+            if re.match(r"https?://", source):
+                source_type = "url"
+            elif source.startswith("/workspace/"):
+                source_type = "file"
+            else:
+                source_type = "text"
+
+        log.info(
+            "orchestrator.knowledge_teach",
+            task_id=task_id,
+            source_type=source_type,
+            source=source[:80],
+        )
+
+        if source_type == "url":
+            # Dispatch research agent to fetch and store the URL, then resume
+            ingest_task_id = str(uuid.uuid4())
+            await self.bus.publish(
+                Event(
+                    type=EventType.TASK_ASSIGNED,
+                    source="orchestrator",
+                    payload={
+                        "task": f"fetch and learn from url {source}",
+                        "source_url": source,
+                        "task_id": ingest_task_id,
+                        "subtask_id": ingest_task_id,
+                        "parent_task_id": task_id,
+                        "discord_message_id": None,
+                    },
+                    task_id=ingest_task_id,
+                ),
+                target="research",
+            )
+            # Forward the teach event to the waiting agent (which suspended via
+            # raise_knowledge_gap) so it can resume once ingest completes.
+            # We do this after dispatching so the agent gets the source even if
+            # it woke up before the ingest finished (it can recall() afterwards).
+            await self.bus.publish(
+                Event(
+                    type=EventType.KNOWLEDGE_TEACH,
+                    source="orchestrator",
+                    payload={"task_id": task_id, "source": source},
+                    task_id=task_id,
+                ),
+                target="broadcast",
+            )
+
+        elif source_type == "file":
+            # Dispatch document_qa to read the workspace file, then resume
+            ingest_task_id = str(uuid.uuid4())
+            await self.bus.publish(
+                Event(
+                    type=EventType.TASK_ASSIGNED,
+                    source="orchestrator",
+                    payload={
+                        "task": f"Read and summarise the document at {source} and store key facts to memory",
+                        "task_id": ingest_task_id,
+                        "subtask_id": ingest_task_id,
+                        "parent_task_id": task_id,
+                        "discord_message_id": None,
+                    },
+                    task_id=ingest_task_id,
+                ),
+                target="document_qa",
+            )
+            await self.bus.publish(
+                Event(
+                    type=EventType.KNOWLEDGE_TEACH,
+                    source="orchestrator",
+                    payload={"task_id": task_id, "source": source},
+                    task_id=task_id,
+                ),
+                target="broadcast",
+            )
+
+        else:
+            # Inline text — inject directly and resume immediately
+            await self.bus.publish(
+                Event(
+                    type=EventType.KNOWLEDGE_TEACH,
+                    source="orchestrator",
+                    payload={"task_id": task_id, "source": source},
+                    task_id=task_id,
+                ),
+                target="broadcast",
+            )
+
+        # Reload and resume the frozen plan
+        await self._handle_task_resumed(
+            Event(
+                type=EventType.TASK_RESUMED,
+                source="orchestrator",
+                payload={"task_id": task_id},
+                task_id=task_id,
+            )
+        )
 
     # ── Task updated (user edited original Discord message) ───────────────────
 
@@ -2081,7 +2239,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # not currently assigned to an active plan.
         active_plan_agents: set[str] = set()
         for plan in self._plans.values():
-            if not plan.completed:
+            if not plan.all_complete():
                 active_plan_agents.update(s.agent for s in plan.steps)
 
         for agent in woken_for_vote:
@@ -3687,10 +3845,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         task_id: str,
         discord_message_id: str | None = None,
         original_task: str = "",
+        is_chat: bool = False,
     ) -> None:
         payload = {"result": result, "task_id": task_id}
         if discord_message_id:
             payload["discord_message_id"] = discord_message_id
+        if is_chat:
+            payload["is_chat"] = True
         await self.emit(EventType.TASK_COMPLETED, payload=payload, target="broadcast")
         if original_task:
             now = time.time()

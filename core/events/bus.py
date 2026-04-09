@@ -115,7 +115,8 @@ class EventType(str, Enum):
     DISCORD_ACTION_DONE = "discord.action.done"  # bridge confirms action completed
 
     # Memory lifecycle
-    MEMORY_PRUNED = "memory.pruned"  # long-term memory pruned; user warned
+    MEMORY_PRUNED = "memory.pruned"          # long-term memory pruned; user warned
+    MEMORY_CLASSIFY = "memory.classify"      # unclassified knowledge row needs TTL assigned
 
     # Plan execution lifecycle
     PLAN_STATUS = "plan.status"  # step/phase progress update → Discord
@@ -148,6 +149,10 @@ class EventType(str, Enum):
     )
     TASK_RESUMED = "task.resumed"  # user requested continuation from last checkpoint
     TASK_UPDATED = "task.updated"  # user edited the original Discord message while task is in-flight
+
+    # Knowledge gap lifecycle
+    KNOWLEDGE_GAP = "knowledge.gap"  # agent lacks info needed to complete a task
+    KNOWLEDGE_TEACH = "knowledge.teach"  # user supplies a source to resolve a gap
 
     # Context stream lifecycle
     CONTEXT_CREATED = (
