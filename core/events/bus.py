@@ -115,8 +115,8 @@ class EventType(str, Enum):
     DISCORD_ACTION_DONE = "discord.action.done"  # bridge confirms action completed
 
     # Memory lifecycle
-    MEMORY_PRUNED = "memory.pruned"          # long-term memory pruned; user warned
-    MEMORY_CLASSIFY = "memory.classify"      # unclassified knowledge row needs TTL assigned
+    MEMORY_PRUNED = "memory.pruned"  # long-term memory pruned; user warned
+    MEMORY_CLASSIFY = "memory.classify"  # unclassified knowledge row needs TTL assigned
 
     # Plan execution lifecycle
     PLAN_STATUS = "plan.status"  # step/phase progress update → Discord
