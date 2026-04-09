@@ -23,6 +23,24 @@ from psycopg_pool import AsyncConnectionPool
 
 log = structlog.get_logger()
 
+# ── TTL size tiers ────────────────────────────────────────────────────────────
+# Agents pick a t-shirt size; the background classifier writes expires_at.
+# NULL means no expiry (permanent).
+
+TTL_SIZES: dict[str, Optional[str]] = {
+    "session": "12 hours",
+    "short": "24 hours",
+    "medium": "7 days",
+    "long": "30 days",
+    "permanent": None,
+}
+
+TTL_SIZE_NAMES = list(TTL_SIZES.keys())  # ordered, for prompts
+
+# Stream key consumed by the classify background pass
+MEMORY_CLASSIFY_STREAM = "agents:memory:classify"
+MEMORY_CLASSIFY_GROUP = "memory_classify_group"
+
 # ── Embedding model (lazy-loaded, sentence-transformers already in container) ─
 
 _encoder = None
@@ -119,6 +137,7 @@ _SCHEMA = [
         content    TEXT NOT NULL,
         tags       JSONB NOT NULL DEFAULT '[]',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ DEFAULT NULL,
         embedding  vector(384)
     )
     """,
@@ -127,6 +146,9 @@ _SCHEMA = [
     CREATE INDEX IF NOT EXISTS idx_knowledge_fts ON knowledge
         USING GIN(to_tsvector('english', title || ' ' || content))
     """,
+    # expires_at column — added after initial schema; safe to re-run
+    "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_expires ON knowledge(expires_at) WHERE expires_at IS NOT NULL",
     # ── Open task queue ───────────────────────────────────────────────────
     # Used by the orchestrator think loop as a persistent, ordered work queue.
     # Tasks stored here are picked up on the next think cycle without any LLM call.
@@ -418,64 +440,90 @@ class LongTermMemory:
         topic: str,
         tags: Optional[list[str]] = None,
         kind: str = "finding",
+        ttl_days: Optional[int] = None,
     ) -> dict:
         [embedding] = await asyncio.to_thread(_embed_texts, [content])
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            await conn.execute(
+            cur = await conn.execute(
                 """
-                INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO knowledge (agent, topic, title, content, tags, embedding, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s,
+                        CASE WHEN %s IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
+                RETURNING id
             """,
-                (self._agent, topic, topic, content, json.dumps(tags or []), embedding),
+                (
+                    self._agent,
+                    topic,
+                    topic,
+                    content,
+                    json.dumps(tags or []),
+                    embedding,
+                    ttl_days,
+                    ttl_days,
+                ),
             )
-        log.info("memory.promoted", topic=topic, kind=kind)
-        return {"status": "stored"}
+            row = await cur.fetchone()
+        knowledge_id = row["id"]
+        log.info(
+            "memory.promoted",
+            topic=topic,
+            kind=kind,
+            ttl_days=ttl_days,
+            id=knowledge_id,
+        )
+        return {"status": "stored", "id": knowledge_id}
 
     async def batch_store(self, entries: list[dict]) -> dict:
         if not entries:
-            return {"status": "stored", "count": 0}
+            return {"status": "stored", "count": 0, "ids": []}
         texts = [e.get("content", "") for e in entries]
         embeddings = await asyncio.to_thread(_embed_texts, texts)
         pool = await self._get_pool()
+        ids: list[int] = []
         try:
             async with pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.executemany(
+                for i, e in enumerate(entries):
+                    ttl = e.get("ttl_days")
+                    cur = await conn.execute(
                         """
-                        INSERT INTO knowledge (agent, topic, title, content, tags, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                        [
-                            (
-                                self._agent,
-                                e.get("topic", "general"),
-                                e.get("topic", "general"),
-                                e.get("content", ""),
-                                json.dumps(e.get("tags") or []),
-                                embeddings[i],
-                            )
-                            for i, e in enumerate(entries)
-                        ],
+                        INSERT INTO knowledge (agent, topic, title, content, tags, embedding, expires_at)
+                        VALUES (%s, %s, %s, %s, %s, %s,
+                                CASE WHEN %s IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
+                        RETURNING id
+                        """,
+                        (
+                            self._agent,
+                            e.get("topic", "general"),
+                            e.get("topic", "general"),
+                            e.get("content", ""),
+                            json.dumps(e.get("tags") or []),
+                            embeddings[i],
+                            ttl,
+                            ttl,
+                        ),
                     )
+                    row = await cur.fetchone()
+                    ids.append(row["id"])
                 await conn.commit()
         except Exception as exc:
             log.error("memory.batch_store_failed", count=len(entries), error=str(exc))
             raise
         log.info("memory.batch_promoted", count=len(entries))
-        return {"status": "stored", "count": len(entries)}
+        return {"status": "stored", "count": len(entries), "ids": ids}
 
     # ── Recall / search ──────────────────────────────────────────────────────
 
     async def recall(self, query: str, limit: int = 5) -> list[dict]:
-        """Full-text search via PostgreSQL tsvector."""
+        """Full-text search via PostgreSQL tsvector. Excludes expired entries."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
                 """
-                SELECT id, agent, topic, title, content, tags, created_at
+                SELECT id, agent, topic, title, content, tags, created_at, expires_at
                 FROM knowledge
-                WHERE to_tsvector('english', title || ' ' || content)
+                WHERE (expires_at IS NULL OR expires_at > NOW())
+                  AND to_tsvector('english', title || ' ' || content)
                       @@ plainto_tsquery('english', %s)
                 ORDER BY ts_rank(
                     to_tsvector('english', title || ' ' || content),
@@ -499,15 +547,16 @@ class LongTermMemory:
     async def _vector_search_with_embedding(
         self, query: str, embedding: list[float], limit: int = 5
     ) -> list[dict]:
-        """Semantic search using a pre-computed embedding vector."""
+        """Semantic search using a pre-computed embedding vector. Excludes expired entries."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
                 """
-                SELECT id, agent, topic, title, content, tags, created_at,
+                SELECT id, agent, topic, title, content, tags, created_at, expires_at,
                        1 - (embedding <=> %s::vector) AS similarity
                 FROM knowledge
                 WHERE embedding IS NOT NULL
+                  AND (expires_at IS NULL OR expires_at > NOW())
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """,
@@ -553,13 +602,74 @@ class LongTermMemory:
         memory_results, tool_results = await asyncio.gather(memory_task, tools_task)
         return memory_results, tool_results
 
-    async def count(self) -> int:
-        """Return total number of knowledge entries across all agents."""
+    async def set_expiry(self, knowledge_id: int, size: str) -> bool:
+        """
+        Write expires_at for a knowledge row based on a t-shirt size label.
+        Returns True if the row was found and updated, False if it no longer exists.
+        Size must be one of TTL_SIZE_NAMES; 'permanent' sets expires_at to NULL.
+        """
+        interval = TTL_SIZES.get(size)
         pool = await self._get_pool()
         async with pool.connection() as conn:
-            cur = await conn.execute("SELECT COUNT(*) AS n FROM knowledge")
+            if interval is None:
+                cur = await conn.execute(
+                    "UPDATE knowledge SET expires_at = NULL WHERE id = %s RETURNING id",
+                    (knowledge_id,),
+                )
+            else:
+                cur = await conn.execute(
+                    "UPDATE knowledge SET expires_at = NOW() + %s::INTERVAL WHERE id = %s RETURNING id",
+                    (interval, knowledge_id),
+                )
+            row = await cur.fetchone()
+        updated = row is not None
+        log.debug("memory.expiry_set", id=knowledge_id, size=size, updated=updated)
+        return updated
+
+    async def get_unclassified(self, limit: int = 50) -> list[dict]:
+        """
+        Return knowledge rows that have never been classified (expires_at IS NULL
+        and created_at > 1 minute ago to avoid races with brand-new inserts).
+        Used by the startup sweep to re-queue rows that missed classification.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, agent, topic, content, tags, created_at
+                FROM knowledge
+                WHERE expires_at IS NULL
+                  AND created_at < NOW() - INTERVAL '1 minute'
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def count(self) -> int:
+        """Return number of non-expired knowledge entries across all agents."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge WHERE expires_at IS NULL OR expires_at > NOW()"
+            )
             row = await cur.fetchone()
         return row["n"] if row else 0
+
+    async def expire_knowledge(self) -> int:
+        """Delete knowledge entries whose expires_at has passed. Returns count deleted."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "DELETE FROM knowledge WHERE expires_at IS NOT NULL AND expires_at <= NOW() RETURNING id"
+            )
+            rows = await cur.fetchall()
+        deleted = len(rows)
+        if deleted:
+            log.info("memory.knowledge_expired", deleted=deleted)
+        return deleted
 
     async def prune(self, target: int) -> int:
         """
@@ -745,16 +855,25 @@ class LongTermMemory:
             )
             handoffs = len(await cur.fetchall())
 
-        total = tasks + plans + handoffs
+        # Expired knowledge entries (TTL-based)
+        knowledge = await self.expire_knowledge()
+
+        total = tasks + plans + handoffs + knowledge
         if total:
             log.info(
                 "memory.stale_cleanup",
                 tasks=tasks,
                 plans=plans,
                 handoffs=handoffs,
+                knowledge_expired=knowledge,
                 max_age_hours=max_age_hours,
             )
-        return {"tasks": tasks, "plans": plans, "handoffs": handoffs}
+        return {
+            "tasks": tasks,
+            "plans": plans,
+            "handoffs": handoffs,
+            "knowledge_expired": knowledge,
+        }
 
     async def close(self) -> None:
         if self._pool:
