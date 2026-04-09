@@ -99,16 +99,17 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
-      - DISCORD_TASK_CHANNEL_ID=${DISCORD_TASK_CHANNEL_ID}
-      - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}   # Optional — #claude channel
-      - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-} # Optional — #control channel
-      - DISCORD_LOG_CHANNEL_ID=${DISCORD_LOG_CHANNEL_ID:-}              # Optional — #agent-logs channel
-      - DISCORD_ERROR_LOG_CHANNEL_ID=${DISCORD_ERROR_LOG_CHANNEL_ID:-}  # Optional — #error-logs channel
-      - DISCORD_TASKS_CHANNEL_ID=${DISCORD_TASKS_CHANNEL_ID:-}          # Optional — #tasks-tracking channel
-      - DISCORD_VOTE_CHANNEL_ID=${DISCORD_VOTE_CHANNEL_ID:-}            # Optional — #agent-deliberation channel
-      - DISCORD_USER_APPROVALS_CHANNEL_ID=${DISCORD_USER_APPROVALS_CHANNEL_ID:-}   # Optional — #user-approvals channel
+      - DISCORD_GENERAL_CHANNEL_ID=${DISCORD_GENERAL_CHANNEL_ID}               # Required — #general
+      - DISCORD_INTAKE_CHANNEL_ID=${DISCORD_INTAKE_CHANNEL_ID:-}               # Optional — #intake
+      - DISCORD_CLAUDE_CHANNEL_ID=${DISCORD_CLAUDE_CHANNEL_ID:-}               # Optional — #claude
+      - DISCORD_CONTROL_CHANNEL_ID=${DISCORD_CONTROL_CHANNEL_ID:-}             # Optional — #control
+      - DISCORD_LOGS_CHANNEL_ID=${DISCORD_LOGS_CHANNEL_ID:-}                   # Optional — #logs
+      - DISCORD_ERRORS_CHANNEL_ID=${DISCORD_ERRORS_CHANNEL_ID:-}               # Optional — #errors
+      - DISCORD_TASK_TRACKING_CHANNEL_ID=${DISCORD_TASK_TRACKING_CHANNEL_ID:-} # Optional — #task-tracking
+      - DISCORD_VOTES_CHANNEL_ID=${DISCORD_VOTES_CHANNEL_ID:-}                 # Optional — #votes
+      - DISCORD_APPROVALS_CHANNEL_ID=${DISCORD_APPROVALS_CHANNEL_ID:-}         # Optional — #approvals
       - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
-      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}   # Optional — auto-detected from task channel
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}                                 # Optional — auto-detected from general channel
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./agents/discord_bridge:/app/agent   # live-reload: restart picks up code changes

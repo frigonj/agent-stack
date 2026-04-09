@@ -2,23 +2,17 @@ wing: agent_stack
 rooms:
 - name: agents
   description: Files from agents/
-- name: configuration
-  description: Files from config/
 - name: core
   description: Files from core/
-- name: docker
-  description: Files from docker/
 - name: emrys_src
   description: Files from emrys-src/
+- name: docker
+  description: Files from docker/
 - name: scripts
   description: Files from scripts/
 - name: testing
   description: Files from tests/
 - name: workspace
   description: Files from workspace/
-- name: research
-  description: Files from research/
-- name: documentation
-  description: Files from docs/
 - name: general
   description: Files that don't fit other rooms
