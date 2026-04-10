@@ -40,6 +40,7 @@ from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
 from core.context import truncate_task, truncate_context
+from core.eval.pipeline import EvalPipeline
 
 log = structlog.get_logger()
 
@@ -288,7 +289,7 @@ _CHAT_RE = re.compile(
     r"how does .{3,80} work\??|"
     r"explain .{3,80}|"
     r"what (is|was|happened to|did you do)\b"
-    r")",
+    r")[!.,?]*\s*$",  # must end here — greetings followed by a request fall through to LLM
     re.I,
 )
 
@@ -843,6 +844,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._pending_user_votes: dict[str, asyncio.Future] = {}
         # Last completed task_id — used to target memory expiry on retry
         self._last_task_id: str | None = None
+        # Passive eval pipeline — initialised lazily after memory/bus are ready
+        self._eval_pipeline: EvalPipeline | None = None
 
     _OWN_TOOLS = [
         (
@@ -899,6 +902,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
     async def on_startup(self) -> None:
         log.info("orchestrator.startup")
+        self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -966,6 +970,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_knowledge_teach(event)
         elif event.type == EventType.MEMORY_APPROVAL_REQUESTED:
             await self._handle_memory_approval_request(event)
+        elif event.type == EventType.EVAL_VERDICT:
+            await self._handle_eval_verdict(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -1486,6 +1492,34 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             agent=agent,
             what=what[:80],
         )
+
+    async def _handle_eval_verdict(self, event: Event) -> None:
+        """
+        User clicked 👍 or 👎 on an eval review in #eval-queue.
+        Persist the verdict to the eval_results table.
+        Also promote approved artifacts to the review_queue/approved/ directory.
+        """
+        eval_id = event.payload.get("eval_id")
+        verdict = event.payload.get("verdict")
+        feedback = event.payload.get("feedback", "")
+
+        if eval_id is None or verdict is None:
+            log.warning("orchestrator.eval_verdict_missing_fields", payload=event.payload)
+            return
+
+        try:
+            await self.memory.resolve_eval_result(
+                eval_id=int(eval_id),
+                verdict=bool(verdict),
+                feedback=feedback,
+            )
+            log.info(
+                "orchestrator.eval_verdict_recorded",
+                eval_id=eval_id,
+                verdict=verdict,
+            )
+        except Exception as exc:
+            log.warning("orchestrator.eval_verdict_failed", error=str(exc))
 
     async def _handle_memory_approval_request(self, event: Event) -> None:
         """
@@ -3611,7 +3645,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     discord_message_id=plan.discord_message_id,
                 )
                 self._plans.pop(plan.task_id, None)
-                await self._close_task_context(plan, success=True)
+                # Collect all step results for the eval pipeline
+                _eval_content = "\n\n".join(r for _, r in all_results if r)
+                await self._close_task_context(plan, success=True, synthesised_reply=_eval_content)
                 await self.memory.upsert_plan(
                     plan.task_id,
                     plan.plan_id,
@@ -3658,7 +3694,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
     # ── Context lifecycle ────────────────────────────────────────────────────
 
-    async def _close_task_context(self, plan: ExecutionPlan, success: bool) -> None:
+    async def _close_task_context(
+        self, plan: ExecutionPlan, success: bool, synthesised_reply: str = ""
+    ) -> None:
         """
         Archive the task context stream to long-term memory.
         Called on plan completion (success or failure).
@@ -3708,6 +3746,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             success=success,
             value_score=round(value_score, 2),
         )
+
+        # ── Fire eval pipeline as a background task (non-blocking) ───────
+        if self._eval_pipeline is not None:
+            asyncio.create_task(
+                self._eval_pipeline.run(plan, synthesised_reply or summary),
+                name=f"eval_{plan.task_id[:8]}",
+            )
 
     # ── Status events ────────────────────────────────────────────────────────
 

@@ -161,6 +161,10 @@ class EventType(str, Enum):
     MEMORY_APPROVAL_REQUESTED = "memory.approval_requested"
     MEMORY_APPROVAL_RESULT = "memory.approval_result"
 
+    # Passive eval pipeline
+    EVAL_REVIEW_NEEDED = "eval.review_needed"   # orchestrator → broadcast → discord_bridge
+    EVAL_VERDICT = "eval.verdict"               # discord_bridge → broadcast → orchestrator
+
     # Context stream lifecycle
     CONTEXT_CREATED = (
         "context.created"  # orchestrator announces new named context stream

@@ -356,6 +356,41 @@ _SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_pma_knowledge ON pending_memory_approvals(knowledge_id)",
     "CREATE INDEX IF NOT EXISTS idx_pma_result ON pending_memory_approvals(result, expires_at) WHERE result IS NULL",
+    # ── Eval results ──────────────────────────────────────────────────────
+    # One row per evaluation run against a training task output.
+    # Tier 1 = structural checks (rule-based), Tier 2 = local LLM judge,
+    # Tier 3 = external judge (Gemini Flash).
+    # user_verdict is set when the user thumbs-up/down from #eval-queue.
+    """
+    CREATE TABLE IF NOT EXISTS eval_results (
+        id              SERIAL PRIMARY KEY,
+        task_id         TEXT NOT NULL,
+        plan_id         TEXT NOT NULL DEFAULT '',
+        task_type       TEXT NOT NULL,              -- 'arch_doc' | 'research' | 'code_analysis' | ...
+        original_task   TEXT NOT NULL,
+        artifact_path   TEXT DEFAULT NULL,          -- path to output file if any
+        tier1_passed    BOOLEAN NOT NULL DEFAULT FALSE,
+        tier1_reasons   JSONB NOT NULL DEFAULT '[]',
+        tier2_score     FLOAT DEFAULT NULL,         -- 0-10, NULL if not run
+        tier2_breakdown JSONB DEFAULT NULL,         -- per-criterion scores
+        tier2_flags     JSONB NOT NULL DEFAULT '[]',
+        tier3_score     FLOAT DEFAULT NULL,         -- 0-10, NULL if not run
+        tier3_model     TEXT DEFAULT NULL,
+        final_score     FLOAT DEFAULT NULL,         -- resolved score after all tiers
+        review_status   TEXT NOT NULL DEFAULT 'pending',  -- 'pending'|'approved'|'rejected'|'auto_approved'
+        user_verdict    BOOLEAN DEFAULT NULL,       -- TRUE=thumbs up, FALSE=thumbs down
+        user_feedback   TEXT DEFAULT NULL,
+        plan_steps      INT NOT NULL DEFAULT 0,
+        plan_retries    INT NOT NULL DEFAULT 0,
+        approval_requested BOOLEAN NOT NULL DEFAULT FALSE,
+        agents_used     JSONB NOT NULL DEFAULT '[]',
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        reviewed_at     TIMESTAMPTZ DEFAULT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_eval_task ON eval_results(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_type ON eval_results(task_type, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_review ON eval_results(review_status, created_at DESC)",
 ]
 
 
@@ -1904,6 +1939,120 @@ class LongTermMemory:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [r for _, r in scored[:limit]]
+
+    # ── Eval results ─────────────────────────────────────────────────────────
+
+    async def save_eval_result(self, result: dict) -> int:
+        """
+        Insert a new eval result row. Returns the generated id.
+
+        Expected keys in result:
+          task_id, plan_id, task_type, original_task, artifact_path,
+          tier1_passed, tier1_reasons, tier2_score, tier2_breakdown, tier2_flags,
+          tier3_score, tier3_model, final_score, review_status,
+          plan_steps, plan_retries, approval_requested, agents_used
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO eval_results (
+                    task_id, plan_id, task_type, original_task, artifact_path,
+                    tier1_passed, tier1_reasons, tier2_score, tier2_breakdown, tier2_flags,
+                    tier3_score, tier3_model, final_score, review_status,
+                    plan_steps, plan_retries, approval_requested, agents_used
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                ) RETURNING id
+                """,
+                (
+                    result.get("task_id", ""),
+                    result.get("plan_id", ""),
+                    result.get("task_type", "unknown"),
+                    result.get("original_task", ""),
+                    result.get("artifact_path"),
+                    result.get("tier1_passed", False),
+                    json.dumps(result.get("tier1_reasons", [])),
+                    result.get("tier2_score"),
+                    json.dumps(result.get("tier2_breakdown")) if result.get("tier2_breakdown") else None,
+                    json.dumps(result.get("tier2_flags", [])),
+                    result.get("tier3_score"),
+                    result.get("tier3_model"),
+                    result.get("final_score"),
+                    result.get("review_status", "pending"),
+                    result.get("plan_steps", 0),
+                    result.get("plan_retries", 0),
+                    result.get("approval_requested", False),
+                    json.dumps(result.get("agents_used", [])),
+                ),
+            )
+            row = await cur.fetchone()
+            return row["id"] if row else -1
+
+    async def resolve_eval_result(
+        self,
+        eval_id: int,
+        verdict: bool,
+        feedback: str = "",
+    ) -> None:
+        """Record a user thumbs-up (True) / thumbs-down (False) on an eval result."""
+        pool = await self._get_pool()
+        status = "approved" if verdict else "rejected"
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE eval_results
+                SET user_verdict = %s, user_feedback = %s,
+                    review_status = %s, reviewed_at = NOW()
+                WHERE id = %s
+                """,
+                (verdict, feedback, status, eval_id),
+            )
+
+    async def get_pending_eval_reviews(self, limit: int = 20) -> list[dict]:
+        """Return eval results awaiting user review, newest first."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, task_id, task_type, original_task, artifact_path,
+                       tier1_passed, tier2_score, tier3_score, final_score,
+                       tier2_flags, plan_retries, approval_requested, created_at
+                FROM eval_results
+                WHERE review_status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return list(await cur.fetchall())
+
+    async def get_eval_stats(self, task_type: str | None = None) -> dict:
+        """Return aggregate eval stats, optionally filtered by task_type."""
+        pool = await self._get_pool()
+        type_filter = "WHERE task_type = %s" if task_type else ""
+        params = (task_type,) if task_type else ()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN tier1_passed THEN 1 ELSE 0 END) AS tier1_passed,
+                    ROUND(AVG(tier2_score)::numeric, 2) AS avg_tier2,
+                    ROUND(AVG(final_score)::numeric, 2) AS avg_final,
+                    SUM(CASE WHEN approval_requested THEN 1 ELSE 0 END) AS approval_interrupts,
+                    SUM(CASE WHEN user_verdict = TRUE THEN 1 ELSE 0 END) AS user_approved,
+                    SUM(CASE WHEN user_verdict = FALSE THEN 1 ELSE 0 END) AS user_rejected
+                FROM eval_results
+                {type_filter}
+                """,
+                params,
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else {}
 
     async def confirm_topic_pattern(
         self, category: str, keywords: list[str], confirmed_by: str = "user"

@@ -38,6 +38,7 @@ Environment variables:
   DISCORD_CONTROL_CHANNEL_ID        — optional (#control → restart commands)
   DISCORD_USER_APPROVALS_CHANNEL_ID — optional (#user-approvals → user-escalated votes)
   DISCORD_KNOWLEDGE_GAP_CHANNEL_ID  — optional (#knowledge-gap → agent knowledge gap escalations)
+  DISCORD_EVAL_QUEUE_CHANNEL_ID     — optional (#eval-queue → passive eval review requests)
   CONTROL_HELPER_URL                — optional (default http://host.docker.internal:7799)
   DISCORD_GUILD_ID                  — optional (auto-detected)
 """
@@ -650,6 +651,75 @@ class UserVoteView(discord.ui.View):
             )
 
 
+# ── Eval review UI ────────────────────────────────────────────────────────────
+
+
+class EvalReviewView(discord.ui.View):
+    """
+    Thumbs up / thumbs down buttons for eval review requests in #eval-queue.
+    On resolution, calls memory.resolve_eval_result() via a direct DB write.
+    Timeout = 7 days (eval reviews are low urgency).
+    """
+
+    def __init__(self, eval_id: int, redis_client: aioredis.Redis):
+        super().__init__(timeout=7 * 24 * 3600)
+        self.eval_id = eval_id
+        self.redis = redis_client
+        self._decided = False
+
+    async def _resolve(
+        self, interaction: discord.Interaction, verdict: bool, feedback: str = ""
+    ) -> None:
+        if self._decided:
+            await interaction.response.send_message("Already decided.", ephemeral=True)
+            return
+        self._decided = True
+
+        # Publish verdict to broadcast so any consumer can persist it
+        await self.redis.xadd(
+            "agents:broadcast",
+            {
+                "event_id": str(uuid.uuid4()),
+                "type": "eval.verdict",
+                "source": "discord_bridge",
+                "task_id": "",
+                "timestamp": str(time.time()),
+                "payload": json.dumps(
+                    {
+                        "eval_id": self.eval_id,
+                        "verdict": verdict,
+                        "feedback": feedback,
+                    }
+                ),
+            },
+        )
+
+        label = "👍 Marked as good" if verdict else "👎 Marked as bad"
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if embed:
+            embed.color = discord.Color.green() if verdict else discord.Color.red()
+            embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+            await interaction.message.edit(embed=embed, view=None)
+        await interaction.response.send_message(label, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Good output", style=discord.ButtonStyle.success, emoji="👍")
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, verdict=True)
+
+    @discord.ui.button(label="Bad output", style=discord.ButtonStyle.danger, emoji="👎")
+    async def reject(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, verdict=False)
+
+    async def on_timeout(self) -> None:
+        # Timed-out reviews stay 'pending' in the DB — no auto-deny
+        self._decided = True
+
+
 # ── Bridge client ─────────────────────────────────────────────────────────────
 
 
@@ -673,6 +743,7 @@ class DiscordBridgeClient(discord.Client):
         votes_channel_id: str | None = None,
         approvals_channel_id: str | None = None,
         knowledge_gap_channel_id: str | None = None,
+        eval_queue_channel_id: str | None = None,
         control_helper_url: str = "http://host.docker.internal:7799",
         guild_id: str | None = None,
         **kwargs,
@@ -706,6 +777,9 @@ class DiscordBridgeClient(discord.Client):
         )
         self.knowledge_gap_channel_id = (
             knowledge_gap_channel_id  # #knowledge-gap — agent knowledge gap escalations
+        )
+        self.eval_queue_channel_id = (
+            eval_queue_channel_id  # #eval-queue — passive eval review requests
         )
         self.control_helper_url = control_helper_url.rstrip("/")
         self.guild_id = int(guild_id) if guild_id else None
@@ -1865,6 +1939,9 @@ class DiscordBridgeClient(discord.Client):
         elif event_type == "knowledge.gap":
             await self._post_knowledge_gap(payload)
 
+        elif event_type == "eval.review_needed":
+            await self._post_eval_review(payload)
+
     async def _post_knowledge_gap(self, payload: dict) -> None:
         """
         Post a knowledge gap escalation embed to #knowledge-gap.
@@ -2229,6 +2306,79 @@ class DiscordBridgeClient(discord.Client):
         except Exception:
             return None
 
+    async def _get_eval_queue_channel(self):
+        """Return the #eval-queue channel, falling back to #general."""
+        if self.eval_queue_channel_id:
+            try:
+                return await self.fetch_channel(int(self.eval_queue_channel_id))
+            except Exception:
+                pass
+        try:
+            return await self.fetch_channel(int(self.general_channel_id))
+        except Exception:
+            return None
+
+    async def _post_eval_review(self, payload: dict) -> None:
+        """
+        Post an eval review request to #eval-queue with thumbs up/down buttons.
+        The user's reaction is relayed back to the DB via EvalReviewView.
+        """
+        ch = await self._get_eval_queue_channel()
+        if not ch:
+            return
+
+        eval_id = payload.get("eval_id", 0)
+        task_type = payload.get("task_type", "unknown")
+        original_task = payload.get("original_task", "")[:200]
+        final_score = payload.get("final_score")
+        tier1_passed = payload.get("tier1_passed", False)
+        tier1_reasons = payload.get("tier1_reasons", [])
+        tier2_flags = payload.get("tier2_flags", [])
+        artifact_path = payload.get("artifact_path")
+        approval_requested = payload.get("approval_requested", False)
+
+        score_str = f"{final_score:.1f}/10" if final_score is not None else "n/a"
+        t1_str = "✅ Pass" if tier1_passed else f"❌ Fail ({', '.join(tier1_reasons[:2])})"
+        color = (
+            discord.Color.green() if (final_score or 0) >= 8
+            else discord.Color.orange() if (final_score or 0) >= 5
+            else discord.Color.red()
+        )
+
+        embed = discord.Embed(
+            title=f"🔍 Eval Review — {task_type}",
+            description=f"**Task:** {original_task}",
+            color=color,
+        )
+        embed.add_field(name="Eval ID", value=f"`{eval_id}`", inline=True)
+        embed.add_field(name="Score", value=score_str, inline=True)
+        embed.add_field(name="Tier 1", value=t1_str, inline=True)
+        if tier2_flags:
+            embed.add_field(name="Flags", value=", ".join(tier2_flags[:5]), inline=False)
+        if artifact_path:
+            embed.add_field(name="Artifact", value=f"`{artifact_path}`", inline=False)
+        if approval_requested:
+            embed.add_field(
+                name="⚠️ Interrupted user",
+                value="Plan requested user approval mid-task",
+                inline=False,
+            )
+        embed.set_footer(text="👍 = good output  |  👎 = bad output  |  Optional: reply with feedback")
+
+        try:
+            msg = await ch.send(
+                embed=embed,
+                view=EvalReviewView(eval_id=eval_id, redis_client=self.redis),
+            )
+            log.info(
+                "discord_bridge.eval_review_posted",
+                eval_id=eval_id,
+                task_type=task_type,
+                message_id=msg.id,
+            )
+        except Exception as exc:
+            log.warning("discord_bridge.eval_review_post_failed", error=str(exc))
+
     async def _post_plan_proposed(self, payload: dict) -> None:
         """Post a brief vote-initiated notice to #votes."""
         ch = await self._get_votes_channel()
@@ -2560,6 +2710,7 @@ def main() -> None:
     votes_channel_id = os.environ.get("DISCORD_VOTES_CHANNEL_ID")
     approvals_channel_id = os.environ.get("DISCORD_APPROVALS_CHANNEL_ID")
     knowledge_gap_channel_id = os.environ.get("DISCORD_KNOWLEDGE_GAP_CHANNEL_ID")
+    eval_queue_channel_id = os.environ.get("DISCORD_EVAL_QUEUE_CHANNEL_ID")
     control_helper_url = os.environ.get(
         "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
     )
@@ -2585,6 +2736,7 @@ def main() -> None:
         votes_channel_id=votes_channel_id,
         approvals_channel_id=approvals_channel_id,
         knowledge_gap_channel_id=knowledge_gap_channel_id,
+        eval_queue_channel_id=eval_queue_channel_id,
         control_helper_url=control_helper_url,
         guild_id=guild_id,
         intents=intents,
@@ -2604,6 +2756,8 @@ def main() -> None:
         approvals_channel=approvals_channel_id
         or "(not configured — falling back to #votes)",
         knowledge_gap_channel=knowledge_gap_channel_id
+        or "(not configured — falling back to #general)",
+        eval_queue_channel=eval_queue_channel_id
         or "(not configured — falling back to #general)",
     )
     client.run(bot_token)
