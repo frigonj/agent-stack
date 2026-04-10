@@ -126,6 +126,10 @@ class BaseAgent(ABC):
         # Counts concurrently running event-handler tasks.
         # Status is only set to "idle" when this reaches zero.
         self._active_tasks: int = 0
+        # Mirror of the last _set_status() call — included in heartbeat payloads
+        self._current_status: str = "idle"
+        self._current_task: str = ""
+        self._status_since: float = time.time()
 
         # IDLE_TIMEOUT env var overrides the class-level default
         env_idle = os.environ.get("IDLE_TIMEOUT", "")
@@ -445,7 +449,14 @@ class BaseAgent(ABC):
             queue_depth = await self._queue_depth()
             await self.emit(
                 EventType.HEARTBEAT,
-                payload={"queue_depth": queue_depth, "active_tasks": self._active_tasks},
+                payload={
+                    "queue_depth": queue_depth,
+                    "active_tasks": self._active_tasks,
+                    "status": self._current_status,
+                    "current_task": self._current_task,
+                    "status_since": self._status_since,
+                    "status_age_s": round(time.time() - self._status_since, 1),
+                },
             )
 
             # Only run memory health check + think() when the queue is idle
@@ -584,12 +595,15 @@ class BaseAgent(ABC):
 
     async def _set_status(self, status: str, task: str = "") -> None:
         """Publish agent status to Redis for the control script to query."""
+        self._current_status = status
+        self._current_task = task
+        self._status_since = time.time()
         try:
             payload = json.dumps(
                 {
                     "status": status,
                     "task": task,
-                    "since": time.time(),
+                    "since": self._status_since,
                     "queue": await self._queue_depth(),
                 }
             )
