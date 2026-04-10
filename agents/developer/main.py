@@ -214,12 +214,6 @@ class DeveloperAgent(BaseAgent):
             max_steps=10,
         )
 
-        self.stage_finding(
-            content=f"Task: {task}\nOutcome: {analysis}",
-            topic="development",
-            tags=["code", "developer", "change"],
-        )
-
         await self.emit(
             EventType.TASK_COMPLETED,
             payload=_reply(analysis),

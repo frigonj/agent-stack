@@ -226,13 +226,6 @@ class CodeSearchAgent(BaseAgent):
             max_steps=4,
         )
 
-        # Stage findings for long-term promotion
-        self.stage_finding(
-            content=f"Task: {task}\nAnalysis: {analysis}",
-            topic="code_analysis",
-            tags=["code", "search"],
-        )
-
         await self.emit(
             EventType.TASK_COMPLETED,
             payload=_reply(analysis),

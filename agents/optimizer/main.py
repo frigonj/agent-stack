@@ -384,14 +384,16 @@ class OptimizerAgent(BaseAgent):
 
         suggestions = await self._analyse(run_result)
 
-        # Persist result to long-term memory
-        await self.memory.store(
-            content=f"Optimizer perf suite run {run_result['run_ts']}: "
-            f"passed={run_result.get('passed')} failed={run_result.get('failed')} "
-            f"suggestions={json.dumps(suggestions)}",
-            topic="optimizer_results",
-            tags=["optimizer", "perf", "suggestions"],
-        )
+        # Only promote to long-term memory when suggestions were actually produced —
+        # an empty run has no recall value.
+        if suggestions:
+            await self.promote_now(
+                content=f"Optimizer perf suite run {run_result['run_ts']}: "
+                f"passed={run_result.get('passed')} failed={run_result.get('failed')} "
+                f"suggestions={json.dumps(suggestions)}",
+                topic="optimizer_results",
+                tags=["optimizer", "perf", "suggestions"],
+            )
 
         self._prior_run = run_result
         self._last_run_ts = time.monotonic()

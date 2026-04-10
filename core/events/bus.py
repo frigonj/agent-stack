@@ -154,6 +154,13 @@ class EventType(str, Enum):
     KNOWLEDGE_GAP = "knowledge.gap"  # agent lacks info needed to complete a task
     KNOWLEDGE_TEACH = "knowledge.teach"  # user supplies a source to resolve a gap
 
+    # Memory approval lifecycle
+    # Fired when an agent wants to store a memory with TTL > 24h.
+    # The orchestrator routes this to Discord; the user approves/denies via reaction.
+    # On timeout (2 min) the entry defaults to "short" (24h).
+    MEMORY_APPROVAL_REQUESTED = "memory.approval_requested"
+    MEMORY_APPROVAL_RESULT = "memory.approval_result"
+
     # Context stream lifecycle
     CONTEXT_CREATED = (
         "context.created"  # orchestrator announces new named context stream

@@ -147,6 +147,10 @@ class BaseAgent(ABC):
         # task_id → source supplied by the user
         self._gap_sources: dict[str, str] = {}
 
+        # ── Pending memory approval requests ──────────────────────────────────
+        # approval_id → asyncio.Future[bool] (resolved when user responds or times out)
+        self._pending_memory_approvals: dict[str, asyncio.Future] = {}
+
         # ── Circuit breaker state ─────────────────────────────────────────────
         # Tracks consecutive LM Studio failures. After CIRCUIT_THRESHOLD failures
         # the circuit opens and llm_invoke() fails fast (or uses Claude fallback).
@@ -249,19 +253,6 @@ class BaseAgent(ABC):
                     except (asyncio.CancelledError, Exception):
                         pass
         self._handler_tasks.clear()
-
-        # Promote any staged findings to long-term memory and queue classify jobs
-        if self._findings:
-            result = await self.memory.batch_store(self._findings)
-            log.info("agent.promoted_findings", count=len(self._findings))
-            for i, knowledge_id in enumerate(result.get("ids", [])):
-                entry = self._findings[i]
-                await self._publish_classify_job(
-                    knowledge_id,
-                    entry.get("topic", "general"),
-                    entry.get("content", ""),
-                    entry.get("tags") or [self.role],
-                )
 
         await self.memory.close_session(
             summary=summary or f"{self.role} session ended cleanly"
@@ -568,6 +559,11 @@ class BaseAgent(ABC):
         if event.type == EventType.KNOWLEDGE_TEACH:
             await self.bus.ack(stream, self.group_name, entry_id)
             self._handle_knowledge_teach(event)
+            return
+
+        if event.type == EventType.MEMORY_APPROVAL_RESULT:
+            await self.bus.ack(stream, self.group_name, entry_id)
+            await self._handle_memory_approval_result(event)
             return
 
         self._active_tasks += 1
@@ -1154,12 +1150,15 @@ class BaseAgent(ABC):
         ttl_days: Optional[int] = None,
     ) -> None:
         """
-        Stage a finding for promotion to long-term memory on shutdown.
-        Use this instead of immediate store() for batching efficiency.
+        Record an ephemeral session note in the in-process scratch pad.
 
-        ttl_days: if set, the entry expires after this many days. Pass None
-        for permanent retention. Callers must explicitly decide — there is no
-        default TTL so that permanent storage remains a deliberate choice.
+        These are NOT promoted to long-term memory (Postgres) automatically.
+        They exist only for the lifetime of this agent process and are used
+        internally for cancel/retry — to know what to discard on user request.
+
+        To persist something to long-term memory, call promote_now() explicitly.
+        That should happen at: task completion (conclusive outcome), startup
+        seeding, or explicit user request — not on every task result.
         """
         self._findings.append(
             {
@@ -1283,8 +1282,43 @@ class BaseAgent(ABC):
                     log.warning("memory.classify_loop_error", error=str(exc))
                     await asyncio.sleep(5)
 
+    # ── TTL classification rules ──────────────────────────────────────────────
+    # Maps (topic, tag) patterns to sizes.  Checked in order; first match wins.
+    # Sizes > "short" (24h) require user approval before being committed.
+    _TTL_RULES: list[tuple[set[str], set[str], str]] = [
+        # (topic_keywords, tag_keywords, size)
+        ({"user_correction"}, set(), "permanent"),
+        ({"learned_intent"}, {"seed", "intent"}, "long"),
+        ({"learned_intent"}, set(), "medium"),
+        ({"task_failure"}, set(), "session"),
+        ({"task_success"}, set(), "short"),
+        ({"task_result"}, set(), "short"),
+        ({"architecture"}, set(), "permanent"),
+        ({"research"}, set(), "medium"),
+        ({"bug", "pattern"}, set(), "medium"),
+    ]
+
+    def _classify_ttl_by_rules(self, topic: str, tags: list[str]) -> str:
+        """
+        Assign a TTL size using deterministic rules rather than an LLM call.
+        Returns a TTL_SIZE_NAME string.  Falls back to "short" if no rule matches.
+        """
+        topic_lower = topic.lower()
+        tags_lower = {t.lower() for t in tags}
+        for topic_kws, tag_kws, size in self._TTL_RULES:
+            topic_match = not topic_kws or any(kw in topic_lower for kw in topic_kws)
+            tag_match = not tag_kws or bool(tag_kws & tags_lower)
+            if topic_match and tag_match:
+                return size
+        return "short"  # safe default — everything expires within 24h
+
     async def _handle_classify_job(self, data: dict) -> None:
-        """Ask the LLM to assign a t-shirt size TTL to one knowledge row."""
+        """
+        Assign a TTL size to one knowledge row using deterministic rules.
+
+        Sizes > short (> 24h) require user approval via Discord before being
+        committed.  On timeout (120s) the entry defaults to "short".
+        """
         knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
         topic = (
             (data.get(b"topic") or data.get("topic") or b"").decode()
@@ -1299,33 +1333,78 @@ class BaseAgent(ABC):
         tags_raw = data.get(b"tags") or data.get("tags") or b"[]"
         tags = json.loads(tags_raw if isinstance(tags_raw, str) else tags_raw.decode())
 
-        sizes_str = ", ".join(f'"{s}"' for s in TTL_SIZE_NAMES)
-        prompt = (
-            f"You are classifying how long a memory should be retained.\n\n"
-            f"Topic: {topic}\n"
-            f"Tags: {', '.join(tags)}\n"
-            f"Content: {content[:300]}\n\n"
-            f"Choose exactly one retention size from: {sizes_str}\n\n"
-            f"Guidelines:\n"
-            f"  session (12h)  — ephemeral run artifacts, specific error traces\n"
-            f"  short   (24h)  — task-specific findings, temporary debug context\n"
-            f"  medium  (7d)   — research results, bug patterns, code analysis\n"
-            f"  long    (30d)  — routing patterns, failure/success templates\n"
-            f"  permanent      — user corrections, learned intents, architecture decisions\n\n"
-            f"Reply with only the size label, nothing else."
-        )
+        size = self._classify_ttl_by_rules(topic, tags)
 
-        try:
-            response = await self.llm.ainvoke([SystemMessage(content=prompt)])
-            size = response.content.strip().lower().split()[0]
-            if size not in TTL_SIZE_NAMES:
-                size = "session"  # fallback
-        except Exception as exc:
-            log.warning("memory.classify_llm_failed", id=knowledge_id, error=str(exc))
-            size = "session"
+        # Sizes beyond "short" (> 24h) need user approval.
+        _APPROVAL_REQUIRED = {"medium", "long", "permanent"}
+        if size in _APPROVAL_REQUIRED:
+            approved = await self._request_memory_approval(
+                knowledge_id, topic, content, tags, size
+            )
+            if not approved:
+                size = "short"
+                log.info(
+                    "memory.approval_denied_or_timeout",
+                    id=knowledge_id,
+                    topic=topic,
+                    downgraded_to=size,
+                )
 
         await self.memory.set_expiry(knowledge_id, size)
         log.info("memory.classified", id=knowledge_id, size=size, topic=topic)
+
+    _MEMORY_APPROVAL_TIMEOUT = 120  # seconds to wait for user approval
+
+    async def _request_memory_approval(
+        self,
+        knowledge_id: int,
+        topic: str,
+        content: str,
+        tags: list[str],
+        proposed_size: str,
+    ) -> bool:
+        """
+        Publish a MEMORY_APPROVAL_REQUESTED event and wait up to
+        _MEMORY_APPROVAL_TIMEOUT seconds for a MEMORY_APPROVAL_RESULT event.
+        Returns True if approved, False if denied or timed out.
+        """
+        approval_id = f"mem_approval_{knowledge_id}"
+        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        self._pending_memory_approvals[approval_id] = future
+
+        ttl_labels = {"medium": "7 days", "long": "30 days", "permanent": "forever"}
+        label = ttl_labels.get(proposed_size, proposed_size)
+
+        try:
+            await self.emit(
+                EventType.MEMORY_APPROVAL_REQUESTED,
+                payload={
+                    "approval_id": approval_id,
+                    "knowledge_id": knowledge_id,
+                    "topic": topic,
+                    "content": content[:300],
+                    "tags": tags,
+                    "proposed_size": proposed_size,
+                    "proposed_label": label,
+                },
+                target="broadcast",
+            )
+            return await asyncio.wait_for(future, timeout=self._MEMORY_APPROVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.info(
+                "memory.approval_timeout", approval_id=approval_id, id=knowledge_id
+            )
+            return False
+        finally:
+            self._pending_memory_approvals.pop(approval_id, None)
+
+    async def _handle_memory_approval_result(self, event: Event) -> None:
+        """Resolve the pending approval future when the user responds."""
+        approval_id = event.payload.get("approval_id", "")
+        approved = bool(event.payload.get("approved", False))
+        future = self._pending_memory_approvals.get(approval_id)
+        if future and not future.done():
+            future.set_result(approved)
 
     async def _requeue_unclassified(self) -> None:
         """

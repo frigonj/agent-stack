@@ -977,18 +977,8 @@ class ExecutorAgent(BaseAgent):
             payload={"result": result[:2000], "task_id": task_id},
         )
 
-        # Stage findings for long-term memory
-        if any(
-            kw in task.lower()
-            for kw in ["bug", "error", "pattern", "found", "discovered", "improve"]
-        ):
-            self.stage_finding(
-                content=f"Executor task: {task}\nResult: {result[:500]}",
-                topic="execution_findings",
-                tags=["executor", "tool"],
-            )
-
-        # Mark self-modifications in memory immediately
+        # Self-modifications are promoted immediately — they represent a confirmed
+        # code change and are genuinely valuable for future recall.
         if any(
             kw in task.lower()
             for kw in ["modify", "update", "patch", "rewrite", "fix code"]

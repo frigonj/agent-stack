@@ -671,6 +671,30 @@ class LongTermMemory:
             log.info("memory.knowledge_expired", deleted=deleted)
         return deleted
 
+    async def expire_by_task_id(self, task_id: str) -> int:
+        """
+        Immediately expire all knowledge rows tagged with task_id.
+        Called when the user says 'try again' — the failed attempt's memories
+        should not influence the retry.  Returns the number of rows expired.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                UPDATE knowledge
+                SET expires_at = NOW()
+                WHERE tags @> %s::jsonb
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                RETURNING id
+                """,
+                (json.dumps([task_id]),),
+            )
+            rows = await cur.fetchall()
+        expired = len(rows)
+        if expired:
+            log.info("memory.task_expired", task_id=task_id, expired=expired)
+        return expired
+
     async def prune(self, target: int) -> int:
         """
         Delete the oldest knowledge entries until count <= target.

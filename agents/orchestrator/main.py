@@ -301,6 +301,23 @@ _CLARIFY_RE = re.compile(
     re.I,
 )
 
+# Tier-0: cancel — user wants to drop the current conversation/task entirely.
+_CANCEL_RE = re.compile(
+    r"^\s*(never\s?mind|nevermind|forget\s*(it|that|about\s*it)?|"
+    r"cancel(\s+that)?|drop\s+(it|that)|ignore\s+(that|it)|"
+    r"don'?t\s+bother(\s+with\s+that)?|skip\s+(it|that)|"
+    r"abort(\s+that)?|stop(\s+that)?|leave\s+it)\s*[.!]?\s*$",
+    re.I,
+)
+
+# Tier-0: retry — user wants to discard the last attempt and try again.
+_RETRY_RE = re.compile(
+    r"^\s*(please\s+)?(try\s+again|retry|redo(\s+that)?|"
+    r"do\s+it\s+again|give\s+it\s+another\s+(try|shot|go)|"
+    r"try\s+once\s+more|one\s+more\s+try|try\s+that\s+again)\s*[.!]?\s*$",
+    re.I,
+)
+
 
 # ── Seed intent examples ──────────────────────────────────────────────────────
 # Canonical labelled examples stored to PostgreSQL on first startup.
@@ -348,6 +365,27 @@ _SEED_INTENTS: list[tuple[str, str]] = [
     ("fix the bug", "clarify"),
     ("add more logging", "clarify"),
     ("deploy it", "clarify"),
+    # ── cancel ────────────────────────────────────────────────────────────────
+    ("nevermind", "cancel"),
+    ("never mind", "cancel"),
+    ("forget it", "cancel"),
+    ("cancel that", "cancel"),
+    ("drop it", "cancel"),
+    ("don't bother", "cancel"),
+    ("abort", "cancel"),
+    ("stop that", "cancel"),
+    ("ignore that", "cancel"),
+    ("leave it", "cancel"),
+    # ── retry ─────────────────────────────────────────────────────────────────
+    ("try again", "retry"),
+    ("please try again", "retry"),
+    ("retry", "retry"),
+    ("give it another try", "retry"),
+    ("try once more", "retry"),
+    ("one more try", "retry"),
+    ("try that again", "retry"),
+    ("redo that", "retry"),
+    ("do it again", "retry"),
 ]
 
 
@@ -792,7 +830,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._plans: dict[str, ExecutionPlan] = {}
         # Discord action tracking: task_id → {pending, results, discord_message_id, parent_task}
         self._pending_discord: dict[str, dict] = {}
-        # Short-term conversation window — tuples of (task, result, timestamp)
+        # Short-term conversation window — tuples of (task, result, timestamp, task_id)
         self._conversation: deque = deque(maxlen=10)
         # Learned intent examples: list of {"text": ..., "intent": ...}
         # Loaded from long-term memory on startup and augmented at runtime.
@@ -803,6 +841,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._active_votes: dict[str, VoteState] = {}
         # Pending user-escalated votes: vote_id → Future[bool]
         self._pending_user_votes: dict[str, asyncio.Future] = {}
+        # Last completed task_id — used to target memory expiry on retry
+        self._last_task_id: str | None = None
 
     _OWN_TOOLS = [
         (
@@ -924,6 +964,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self._handle_knowledge_gap(event)
         elif event.type == EventType.KNOWLEDGE_TEACH:
             await self._handle_knowledge_teach(event)
+        elif event.type == EventType.MEMORY_APPROVAL_REQUESTED:
+            await self._handle_memory_approval_request(event)
         elif event.type == EventType.AGENT_STARTED:
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
@@ -942,7 +984,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         intent = await self._classify_intent(task)
         log.info("orchestrator.intent", intent=intent, task=task[:60])
 
-        if intent == "chat":
+        if intent == "cancel":
+            await self._respond_cancel(task, task_id, discord_message_id)
+        elif intent == "retry":
+            await self._respond_retry(task, task_id, discord_message_id)
+        elif intent == "chat":
             session = await self._get_or_create_chat_session(task, hint_session_id)
             # Publish incoming message to the chat context stream
             await self.bus.publish_to_context(
@@ -994,12 +1040,19 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
     async def _classify_intent(self, task: str) -> str:
         """
-        Returns 'chat', 'clarify', or 'task'.
+        Returns 'chat', 'clarify', 'task', 'cancel', or 'retry'.
 
+        Tier 0 — cancel/retry signals (highest priority, no LLM).
         Tier 1 — fast keyword patterns (no LLM).
         Tier 2 — LLM classifier with a minimal prompt (fallback for ambiguous input).
         """
         t = task.strip()
+
+        # Tier 0: cancel/retry — must be checked before everything else
+        if _CANCEL_RE.match(t):
+            return "cancel"
+        if _RETRY_RE.match(t):
+            return "retry"
 
         # Fast: clearly conversational
         if _CHAT_RE.match(t):
@@ -1040,10 +1093,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         messages = [
             SystemMessage(
                 content=(
-                    "Classify the user message into exactly one word: chat, task, or clarify.\n"
+                    "Classify the user message into exactly one word: chat, task, clarify, cancel, or retry.\n"
                     "chat    — conversational; no action needed (questions, greetings, status).\n"
                     "task    — clear, actionable work that can be delegated to specialist agents.\n"
                     "clarify — actionable in principle but too vague or ambiguous to execute safely.\n"
+                    "cancel  — user wants to drop/forget the current request or conversation thread.\n"
+                    "retry   — user wants to discard the last attempt and try again from scratch.\n"
                     "IMPORTANT: use the conversation context to resolve any references ('the tool', 'it', 'that').\n"
                     "If the reference resolves via context, classify as 'task' not 'clarify'.\n"
                     "Reply with exactly one word."
@@ -1054,7 +1109,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         try:
             response = await self.llm_invoke(messages)
             word = response.content.strip().lower().split()[0]
-            if word in ("chat", "task", "clarify"):
+            if word in ("chat", "task", "clarify", "cancel", "retry"):
                 # Persist so the same pattern is recognised instantly next time
                 await self._store_learned_intent(t, word)
                 return word
@@ -1062,6 +1117,91 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             log.warning("orchestrator.classify_failed", error=str(exc))
 
         return "task"  # safe fallback — always attempt to help
+
+    # ── Cancel / retry ────────────────────────────────────────────────────────
+
+    async def _respond_cancel(
+        self,
+        task: str,
+        task_id: str,
+        discord_message_id: str | None,
+    ) -> None:
+        """User said nevermind / cancel. Drop staged findings, clear conversation."""
+        # Discard any in-memory findings staged since the last task — they're
+        # for an attempt the user wants to forget.
+        before = len(self._findings)
+        self._findings = [
+            f
+            for f in self._findings
+            if f.get("topic") not in ("task_failure", "task_success", "task_result")
+        ]
+        dropped = before - len(self._findings)
+
+        self._conversation.clear()
+        log.info("orchestrator.cancel", dropped_findings=dropped)
+        await self._publish_reply(
+            "Got it, dropping that. Let me know when you're ready.",
+            task_id,
+            discord_message_id,
+            is_chat=True,
+        )
+
+    async def _respond_retry(
+        self,
+        task: str,
+        task_id: str,
+        discord_message_id: str | None,
+    ) -> None:
+        """
+        User said 'try again'. Expire memories from the last attempt so they
+        don't bias the retry, drop staged findings for that attempt, then
+        re-route the last real task.
+        """
+        # Expire DB memories tagged with the last task_id
+        if self._last_task_id:
+            expired = await self.memory.expire_by_task_id(self._last_task_id)
+            log.info(
+                "orchestrator.retry_memory_expired",
+                task_id=self._last_task_id,
+                expired=expired,
+            )
+
+        # Drop in-memory findings for the failed attempt
+        self._findings = [
+            f
+            for f in self._findings
+            if f.get("topic") not in ("task_failure", "task_success", "task_result")
+        ]
+
+        # Recover the last real task from conversation history
+        last_task: str | None = None
+        last_discord_msg: str | None = None
+        if self._conversation:
+            entry = self._conversation[-1]
+            last_task = entry[0]
+            # entry[3] is the task_id stored in _publish_reply; entry may be old 3-tuple
+            last_discord_msg = discord_message_id
+
+        if not last_task:
+            await self._publish_reply(
+                "Nothing to retry — I don't have a previous task in this session.",
+                task_id,
+                discord_message_id,
+                is_chat=True,
+            )
+            return
+
+        self._conversation.clear()
+        log.info("orchestrator.retry", original_task=last_task[:80])
+        await self._publish_reply(
+            f"Retrying: *{last_task[:120]}*",
+            task_id,
+            discord_message_id,
+            is_chat=True,
+        )
+        asyncio.create_task(
+            self._run_task(last_task, task_id, discord_message_id=last_discord_msg)
+        )
 
     # Phrases that indicate the user is correcting a previous agent action.
     _CORRECTION_PHRASES = re.compile(
@@ -1087,19 +1227,21 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             if self._conversation:
                 last = self._conversation[-1]
                 prior = f"Prior: You='{last[0][:120]}' Me='{last[1][:120]}'"
-            self.stage_finding(
+            # User corrections are immediately promoted — they're high-value
+            # behavioural guidance that must survive session boundaries.
+            await self.promote_now(
                 content=f"USER CORRECTION: '{task[:300]}' {prior}",
                 topic="user_correction",
                 tags=["correction", "feedback", "orchestrator"],
             )
-            log.info("orchestrator.user_correction_staged", task=task[:80])
+            log.info("orchestrator.user_correction_promoted", task=task[:80])
 
         conversation_context = ""
         if self._conversation:
             now = time.time()
             lines = [
-                f"  [{i + 1}] ({int((now - ts) / 60)}m ago) You: {t[:150]}\n       Me: {r[:150]}"
-                for i, (t, r, ts) in enumerate(self._conversation)
+                f"  [{i + 1}] ({int((now - entry[2]) / 60)}m ago) You: {entry[0][:150]}\n       Me: {entry[1][:150]}"
+                for i, entry in enumerate(self._conversation)
             ]
             conversation_context = "\n\nRecent conversation:\n" + "\n".join(lines)
 
@@ -1343,6 +1485,48 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             task_id=task_id,
             agent=agent,
             what=what[:80],
+        )
+
+    async def _handle_memory_approval_request(self, event: Event) -> None:
+        """
+        An agent wants to store a memory longer than 24h.
+        Forward to Discord so the user can approve (✅) or deny (❌).
+        The approval_id is embedded in the payload so the discord bridge
+        can emit MEMORY_APPROVAL_RESULT when the user reacts.
+        """
+        approval_id = event.payload.get("approval_id", "")
+        topic = event.payload.get("topic", "unknown")
+        content = event.payload.get("content", "")[:200]
+        proposed_label = event.payload.get("proposed_label", "?")
+        agent = event.source
+
+        msg = (
+            f"🧠 **Memory approval needed**\n"
+            f"Agent **{agent}** wants to store a memory for **{proposed_label}**.\n"
+            f"Topic: `{topic}`\n"
+            f"Content: {content}\n\n"
+            f"React ✅ to approve or ❌ to deny (auto-denies in 2 min)."
+        )
+
+        # Reuse TASK_COMPLETED broadcast so the discord bridge picks it up
+        # and renders a message with reaction buttons.
+        await self.emit(
+            EventType.TASK_COMPLETED,
+            payload={
+                "result": msg,
+                "task_id": approval_id,
+                "is_chat": True,
+                "memory_approval": True,
+                "approval_id": approval_id,
+            },
+            target="broadcast",
+        )
+        log.info(
+            "orchestrator.memory_approval_requested",
+            approval_id=approval_id,
+            agent=agent,
+            topic=topic,
+            proposed=proposed_label,
         )
 
     async def _handle_knowledge_teach(self, event: Event) -> None:
@@ -3395,17 +3579,6 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             await self.memory.upsert_plan(
                 plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict()
             )
-            # ── Feedback loop: persist failure pattern so agents learn from it ──
-            for s in exhausted:
-                self.stage_finding(
-                    content=(
-                        f"FAILURE: task='{s.task[:200]}' agent={s.agent} "
-                        f"depth={s.depth} error='{s.result[:300]}'\n"
-                        f"Parent task: {plan.original_task[:200]}"
-                    ),
-                    topic="task_failure",
-                    tags=["failure", s.agent, "feedback"],
-                )
             await self._shutdown_plan_agents(plan)
         else:
             # Phase succeeded
@@ -3446,11 +3619,14 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     "completed",
                     plan.to_dict(),
                 )
-                # ── Feedback loop: record successful plan as a reusable pattern ──
+                # ── Promote routing pattern to long-term memory on success ──
+                # This is one of the three legitimate LT write points: task completion
+                # with a conclusive outcome. Captures which agent sequence solved this
+                # class of task for faster routing in future sessions.
                 agent_sequence = " → ".join(
                     dict.fromkeys(s.agent for s in plan.steps if s.status == "done")
                 )
-                self.stage_finding(
+                await self.promote_now(
                     content=(
                         f"SUCCESS: task='{plan.original_task[:200]}' "
                         f"agents={agent_sequence} phases={plan.max_phase()}"
@@ -3866,7 +4042,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             ):
                 self._conversation.clear()
                 log.info("orchestrator.conversation_reset", reason="idle_timeout")
-            self._conversation.append((original_task, result[:300], now))
+            self._conversation.append((original_task, result[:300], now, task_id))
+            self._last_task_id = task_id
 
     # ── Proactive think loop ─────────────────────────────────────────────────
 

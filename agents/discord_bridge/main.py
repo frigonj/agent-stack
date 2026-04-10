@@ -254,6 +254,70 @@ class ApprovalView(discord.ui.View):
             await bus.set_approval(self.approval_id, "denied", ex=60)
 
 
+# ── Memory retention approval UI ─────────────────────────────────────────────
+
+
+class MemoryApprovalView(discord.ui.View):
+    """
+    Approve / Deny buttons for memory retention requests (TTL > 24h).
+    On resolution, publishes MEMORY_APPROVAL_RESULT to the event bus so the
+    waiting coroutine in base_agent._request_memory_approval() can unblock.
+    Timeout = 120s to match _MEMORY_APPROVAL_TIMEOUT in base_agent.
+    """
+
+    def __init__(self, approval_id: str, redis_client: aioredis.Redis):
+        super().__init__(timeout=120)
+        self.approval_id = approval_id
+        self.redis = redis_client
+        self._decided = False
+
+    async def _resolve(self, interaction: discord.Interaction, approved: bool) -> None:
+        if self._decided:
+            await interaction.response.send_message("Already decided.", ephemeral=True)
+            return
+        self._decided = True
+
+        from core.events.bus import Event, EventBus, EventType
+
+        bus = EventBus.__new__(EventBus)
+        bus._client = self.redis
+        await bus.publish(
+            Event(
+                type=EventType.MEMORY_APPROVAL_RESULT,
+                source="discord_bridge",
+                payload={"approval_id": self.approval_id, "approved": approved},
+            ),
+            target="broadcast",
+        )
+
+        color = discord.Color.green() if approved else discord.Color.red()
+        label = "✅ Approved" if approved else "❌ Denied"
+        embed = interaction.message.embeds[0]
+        embed.color = color
+        embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, approved=True)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, approved=False)
+
+    async def on_timeout(self) -> None:
+        # Timeout = deny; the agent already defaults to "short" on timeout
+        if not self._decided:
+            self._decided = True
+
+
 # ── Allowlist approval UI (one-time / permanent / deny) ─────────────────────
 
 
@@ -1631,6 +1695,22 @@ class DiscordBridgeClient(discord.Client):
                 await tracking_ch.send(embed=embed)
 
         elif event_type == "task.completed":
+            # Memory approval requests piggyback on task.completed — intercept early
+            if payload.get("memory_approval"):
+                approval_id = payload.get("approval_id", "")
+                topic = payload.get("topic", "")
+                approvals_ch = await self._get_approvals_channel()
+                target_ch = approvals_ch or channel
+                embed = discord.Embed(
+                    title="🧠 Memory Retention Approval",
+                    description=payload.get("result", ""),
+                    color=discord.Color.blurple(),
+                )
+                embed.set_footer(text="Auto-denies in 2 minutes")
+                view = MemoryApprovalView(approval_id, self.redis)
+                await target_ch.send(embed=embed, view=view)
+                return
+
             result = payload.get("result", "(no output)")
             task_id = payload.get("task_id")
             is_chat = payload.get("is_chat", False)

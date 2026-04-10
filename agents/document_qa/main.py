@@ -291,11 +291,6 @@ class DocumentQAAgent(BaseAgent):
             max_steps=3,
         )
 
-        self.stage_finding(
-            content=f"Q: {task}\nA: {answer}",
-            topic="document_qa",
-            tags=["qa", "document"],
-        )
         return answer
 
     # ── PDF reading handler ───────────────────────────────────────────────────
@@ -362,12 +357,6 @@ class DocumentQAAgent(BaseAgent):
         # Extract LaTeX block if present and compile
         compile_result = await self._extract_and_compile_latex(
             arch_text, "architecture"
-        )
-
-        self.stage_finding(
-            content=f"Architecture review: {arch_text[:800]}",
-            topic="architecture",
-            tags=["architecture", "document", "agent-stack"],
         )
 
         # Sync to Google Drive whenever a review produces a fresh PDF
