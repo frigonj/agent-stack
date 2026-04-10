@@ -278,31 +278,41 @@ class AllowlistApprovalView(discord.ui.View):
             return
         self._decided = True
 
-        from core.events.bus import EventBus
+        # Defer immediately so Discord doesn't time out the interaction (3 s window).
+        await interaction.response.defer()
 
-        bus = EventBus.__new__(EventBus)
-        bus._client = self.redis
-        await bus.set_approval(self.approval_id, decision, ex=600)
+        try:
+            from core.events.bus import EventBus
 
-        if decision == "approved_permanent":
-            label = "♾️ Approved permanently"
-            color = discord.Color.green()
-        elif decision == "approved":
-            label = "✅ Approved once"
-            color = discord.Color.blurple()
-        else:
-            label = "❌ Denied"
-            color = discord.Color.red()
+            bus = EventBus.__new__(EventBus)
+            bus._client = self.redis
+            await bus.set_approval(self.approval_id, decision, ex=600)
 
-        embed = interaction.message.embeds[0]
-        embed.color = color
-        embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+            if decision == "approved_permanent":
+                label = "♾️ Approved permanently"
+                color = discord.Color.green()
+            elif decision == "approved":
+                label = "✅ Approved once"
+                color = discord.Color.blurple()
+            else:
+                label = "❌ Denied"
+                color = discord.Color.red()
 
-        for item in self.children:
-            item.disabled = True  # type: ignore[attr-defined]
+            embed = interaction.message.embeds[0]
+            embed.color = color
+            embed.set_footer(text=f"{label} by {interaction.user.display_name}")
 
-        await interaction.response.edit_message(embed=embed, view=self)
-        self.stop()
+            for item in self.children:
+                item.disabled = True  # type: ignore[attr-defined]
+
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception:
+            logger.exception(
+                "AllowlistApprovalView._resolve failed (approval_id=%s)",
+                self.approval_id,
+            )
+        finally:
+            self.stop()
 
     @discord.ui.button(label="Once", style=discord.ButtonStyle.primary, emoji="✅")
     async def approve_once(

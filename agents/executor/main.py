@@ -497,6 +497,9 @@ REQUIRES_APPROVAL (Discord gate — will pause for user confirmation):
 
 Prefer AUTO_APPROVED — operate autonomously. Escalate only for truly destructive operations.
 
+Do NOT use `sudo` — the executor runs as root inside Docker, sudo is unnecessary and breaks command routing.
+To install system packages: run `apt-get install -y <package>` directly (will trigger Discord approval gate).
+
 ## Container names
 agent_orchestrator, agent_executor, agent_document_qa, agent_code_search,
 agent_discord_bridge, agent_claude_code, agent_developer, agent_research, agent_optimizer
@@ -1170,6 +1173,11 @@ class ExecutorAgent(BaseAgent):
         except ValueError as e:
             return f"Error parsing command: {e}"
 
+        # Strip leading `sudo` — executor already runs as root inside Docker.
+        # Keeping `sudo` as base_cmd causes the trust-tier lookup to miss entirely.
+        if parts and parts[0] == "sudo":
+            parts = parts[1:]
+            cmd = " ".join(shlex.quote(p) for p in parts)
         base_cmd = parts[0] if parts else ""
 
         # pip list/show/freeze/check are read-only — treat as AUTO_APPROVED

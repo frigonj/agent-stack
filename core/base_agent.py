@@ -1067,16 +1067,19 @@ class BaseAgent(ABC):
                     # get_message() is non-blocking on async redis-py and returns
                     # None immediately, causing a busy-spin. Use listen() with
                     # asyncio.wait_for() to actually block until a message arrives.
+                    # Cap wait at _LLM_LOCK_POLL seconds so stale locks (where the
+                    # holder crashed without publishing a release) are retried
+                    # promptly rather than hanging for the full TTL.
                     async def _wait_for_release():
                         async for msg in pubsub.listen():
                             if msg["type"] == "message":
                                 return
 
                     await asyncio.wait_for(
-                        _wait_for_release(), timeout=float(self._LLM_LOCK_TTL)
+                        _wait_for_release(), timeout=float(self._LLM_LOCK_POLL)
                     )
                 except asyncio.TimeoutError:
-                    pass  # Lock TTL expired; retry acquisition
+                    pass  # Poll interval elapsed; retry acquisition
                 finally:
                     await pubsub.unsubscribe(notify_chan)
                     await pubsub.aclose()
