@@ -1312,12 +1312,65 @@ class BaseAgent(ABC):
                 return size
         return "short"  # safe default — everything expires within 24h
 
+    async def _classify_ttl_with_history(
+        self, topic: str, tags: list[str], content: str
+    ) -> str:
+        """
+        Classify TTL size, consulting past approval decisions first.
+
+        If we find similar past decisions with high confidence (≥ 3 votes,
+        approval rate ≥ 75% or ≤ 25%), use that as the size instead of the
+        static rule table.  Falls back to _classify_ttl_by_rules on no history.
+        """
+        try:
+            past = await self.memory.find_similar_approval_decisions(
+                topic, content, limit=10
+            )
+        except Exception:
+            past = []
+
+        if past:
+            # Filter to high-similarity hits (similarity > 0.7 if available)
+            relevant = [r for r in past if r.get("similarity", 0) > 0.7]
+            if len(relevant) >= 3:
+                approved_count = sum(1 for r in relevant if r["approved"])
+                approval_rate = approved_count / len(relevant)
+                # Strong approval signal → use the most common proposed_size
+                if approval_rate >= 0.75:
+                    sizes = [r["proposed_size"] for r in relevant if r["approved"]]
+                    if sizes:
+                        from collections import Counter
+
+                        inferred_size = Counter(sizes).most_common(1)[0][0]
+                        log.info(
+                            "memory.ttl_from_history",
+                            topic=topic,
+                            inferred_size=inferred_size,
+                            approval_rate=round(approval_rate, 2),
+                            sample=len(relevant),
+                        )
+                        return inferred_size
+                # Strong denial signal → always short
+                elif approval_rate <= 0.25:
+                    log.info(
+                        "memory.ttl_denied_by_history",
+                        topic=topic,
+                        approval_rate=round(approval_rate, 2),
+                        sample=len(relevant),
+                    )
+                    return "short"
+
+        return self._classify_ttl_by_rules(topic, tags)
+
     async def _handle_classify_job(self, data: dict) -> None:
         """
-        Assign a TTL size to one knowledge row using deterministic rules.
+        Assign a TTL size to one knowledge row.
 
-        Sizes > short (> 24h) require user approval via Discord before being
-        committed.  On timeout (120s) the entry defaults to "short".
+        Checks past approval decisions first (learned patterns), then falls
+        back to deterministic rules.  Sizes > short (> 24h) require user
+        approval via Discord before being committed.  On timeout (120s) the
+        entry defaults to "short".  Every decision is recorded so the system
+        learns over time.
         """
         knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
         topic = (
@@ -1333,13 +1386,22 @@ class BaseAgent(ABC):
         tags_raw = data.get(b"tags") or data.get("tags") or b"[]"
         tags = json.loads(tags_raw if isinstance(tags_raw, str) else tags_raw.decode())
 
-        size = self._classify_ttl_by_rules(topic, tags)
+        size = await self._classify_ttl_with_history(topic, tags, content)
 
         # Sizes beyond "short" (> 24h) need user approval.
         _APPROVAL_REQUIRED = {"medium", "long", "permanent"}
         if size in _APPROVAL_REQUIRED:
             approved = await self._request_memory_approval(
                 knowledge_id, topic, content, tags, size
+            )
+            # Record the decision regardless of outcome
+            await self.memory.record_approval_decision(
+                agent=self.role,
+                topic=topic,
+                tags=tags,
+                content=content,
+                proposed_size=size,
+                approved=approved,
             )
             if not approved:
                 size = "short"

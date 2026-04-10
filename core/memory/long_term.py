@@ -302,6 +302,34 @@ _SCHEMA = [
     # paused status is enforced at application level; column additions are
     # safe to re-run (IF NOT EXISTS / IF NOT EXISTS equivalent via ADD COLUMN IF NOT EXISTS).
     "ALTER TABLE active_plans ADD COLUMN IF NOT EXISTS paused_at_phase INT DEFAULT NULL",
+    # ── content_hash deduplication on knowledge ────────────────────────────
+    # SHA-256 of (agent || topic || content).  Upsert on conflict refreshes the
+    # row in-place instead of creating a duplicate entry.
+    "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS content_hash TEXT DEFAULT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_content_hash ON knowledge(content_hash) WHERE content_hash IS NOT NULL",
+    # ── Memory approval decisions ──────────────────────────────────────────
+    # Stores every approve/deny decision the user makes on a memory retention
+    # request.  Used to bias future TTL classification so agents learn what is
+    # and is not worth keeping long-term.
+    """
+    CREATE TABLE IF NOT EXISTS memory_approval_decisions (
+        id            SERIAL PRIMARY KEY,
+        agent         TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        tags          JSONB NOT NULL DEFAULT '[]',
+        content       TEXT NOT NULL,
+        proposed_size TEXT NOT NULL,
+        approved      BOOLEAN NOT NULL,
+        decided_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        embedding     vector(384)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_mad_agent ON memory_approval_decisions(agent)",
+    "CREATE INDEX IF NOT EXISTS idx_mad_approved ON memory_approval_decisions(approved, proposed_size)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_mad_fts ON memory_approval_decisions
+        USING GIN(to_tsvector('english', topic || ' ' || content))
+    """,
 ]
 
 
@@ -442,16 +470,35 @@ class LongTermMemory:
         kind: str = "finding",
         ttl_days: Optional[int] = None,
     ) -> dict:
+        """
+        Upsert a knowledge entry.
+
+        Uses a SHA-256(agent||topic||content) hash to detect duplicates.
+        On collision: updates tags, refreshes embedding, resets expires_at,
+        and bumps updated_at instead of inserting a second row.
+        """
+        content_hash = hashlib.sha256(
+            f"{self._agent}||{topic}||{content}".encode()
+        ).hexdigest()
         [embedding] = await asyncio.to_thread(_embed_texts, [content])
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
                 """
-                INSERT INTO knowledge (agent, topic, title, content, tags, embedding, expires_at)
+                INSERT INTO knowledge
+                    (agent, topic, title, content, tags, embedding, expires_at, content_hash)
                 VALUES (%s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s::INTEGER IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
+                        CASE WHEN %s::INTEGER IS NOT NULL
+                             THEN NOW() + (%s || ' days')::INTERVAL
+                             ELSE NULL END,
+                        %s)
+                ON CONFLICT (content_hash) WHERE content_hash IS NOT NULL
+                DO UPDATE SET
+                    tags       = EXCLUDED.tags,
+                    embedding  = EXCLUDED.embedding,
+                    expires_at = EXCLUDED.expires_at
                 RETURNING id
-            """,
+                """,
                 (
                     self._agent,
                     topic,
@@ -461,6 +508,7 @@ class LongTermMemory:
                     embedding,
                     ttl_days,
                     ttl_days,
+                    content_hash,
                 ),
             )
             row = await cur.fetchone()
@@ -473,6 +521,90 @@ class LongTermMemory:
             id=knowledge_id,
         )
         return {"status": "stored", "id": knowledge_id}
+
+    async def record_approval_decision(
+        self,
+        agent: str,
+        topic: str,
+        tags: list[str],
+        content: str,
+        proposed_size: str,
+        approved: bool,
+    ) -> None:
+        """
+        Persist a memory approval/denial decision so agents can learn over time
+        what qualifies as long-term knowledge.
+        """
+        [embedding] = await asyncio.to_thread(
+            _embed_texts, [f"{topic} {content[:200]}"]
+        )
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO memory_approval_decisions
+                    (agent, topic, tags, content, proposed_size, approved, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    agent,
+                    topic,
+                    json.dumps(tags),
+                    content[:500],
+                    proposed_size,
+                    approved,
+                    embedding,
+                ),
+            )
+        log.info(
+            "memory.approval_decision_recorded",
+            agent=agent,
+            topic=topic,
+            proposed_size=proposed_size,
+            approved=approved,
+        )
+
+    async def find_similar_approval_decisions(
+        self, topic: str, content: str, limit: int = 5
+    ) -> list[dict]:
+        """
+        Return past approval decisions semantically similar to the given topic+content.
+        Used by _classify_ttl_by_rules to apply learned patterns before falling back to defaults.
+        """
+        query_text = f"{topic} {content[:200]}"
+        [embedding] = await asyncio.to_thread(_embed_texts, [query_text])
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            if embedding is not None:
+                cur = await conn.execute(
+                    """
+                    SELECT topic, tags, proposed_size, approved,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM memory_approval_decisions
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (embedding, embedding, limit),
+                )
+            else:
+                cur = await conn.execute(
+                    """
+                    SELECT topic, tags, proposed_size, approved,
+                           ts_rank(
+                               to_tsvector('english', topic || ' ' || content),
+                               plainto_tsquery('english', %s)
+                           ) AS similarity
+                    FROM memory_approval_decisions
+                    WHERE to_tsvector('english', topic || ' ' || content)
+                          @@ plainto_tsquery('english', %s)
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                    """,
+                    (query_text, query_text, limit),
+                )
+            rows = await cur.fetchall()
+        return list(rows)
 
     async def batch_store(self, entries: list[dict]) -> dict:
         if not entries:
