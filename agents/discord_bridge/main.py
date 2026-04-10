@@ -290,14 +290,14 @@ class MemoryApprovalView(discord.ui.View):
             target="broadcast",
         )
 
-        color = discord.Color.green() if approved else discord.Color.red()
         label = "✅ Approved" if approved else "❌ Denied"
-        embed = interaction.message.embeds[0]
-        embed.color = color
-        embed.set_footer(text=f"{label} by {interaction.user.display_name}")
-        for item in self.children:
-            item.disabled = True  # type: ignore[attr-defined]
-        await interaction.response.edit_message(embed=embed, view=self)
+        topic = (
+            interaction.message.embeds[0].title if interaction.message.embeds else ""
+        )
+        await interaction.message.delete()
+        await interaction.response.send_message(
+            f"{label} memory retention for **{topic}**", ephemeral=True
+        )
         self.stop()
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
