@@ -1190,7 +1190,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         ]
         response = await self.llm_invoke(messages)
         await self._publish_reply(
-            response.content, task_id, discord_message_id, original_task=task, is_chat=True
+            response.content,
+            task_id,
+            discord_message_id,
+            original_task=task,
+            is_chat=True,
         )
         log.info("orchestrator.clarify_asked", task=task[:60])
 
@@ -1494,7 +1498,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         )
         await self._emit_plan_status(
             plan,
-            f"✏️ Task updated by user — replanning with amended instructions.",
+            "✏️ Task updated by user — replanning with amended instructions.",
         )
         log.info(
             "orchestrator.task_updated",
@@ -4207,8 +4211,6 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             "popular games/shows, cultural moments, internet humour. "
             "Include topic name, why it's trending, and estimated audience size."
         )
-        research_id = str(uuid.uuid4())
-
         plan = ExecutionPlan(
             plan_id=str(uuid.uuid4()),
             task_id=task_id,

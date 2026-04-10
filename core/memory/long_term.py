@@ -449,7 +449,7 @@ class LongTermMemory:
                 """
                 INSERT INTO knowledge (agent, topic, title, content, tags, embedding, expires_at)
                 VALUES (%s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
+                        CASE WHEN %s::INTEGER IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
                 RETURNING id
             """,
                 (
@@ -489,7 +489,7 @@ class LongTermMemory:
                         """
                         INSERT INTO knowledge (agent, topic, title, content, tags, embedding, expires_at)
                         VALUES (%s, %s, %s, %s, %s, %s,
-                                CASE WHEN %s IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
+                                CASE WHEN %s::INTEGER IS NOT NULL THEN NOW() + (%s || ' days')::INTERVAL ELSE NULL END)
                         RETURNING id
                         """,
                         (

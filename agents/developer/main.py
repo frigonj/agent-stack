@@ -176,7 +176,7 @@ class DeveloperAgent(BaseAgent):
             )
 
         system_msg = SYSTEM_PROMPT + tools_ctx
-        budget = await self._budget_content_chars(system_msg, f"Task: {task}")
+        await self._budget_content_chars(system_msg, f"Task: {task}")
 
         messages = [
             SystemMessage(content=system_msg),

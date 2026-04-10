@@ -722,7 +722,10 @@ class DiscordBridgeClient(discord.Client):
             return
 
         # ── #knowledge-gap channel ────────────────────────────────────────────
-        if self.knowledge_gap_channel_id and channel_str == self.knowledge_gap_channel_id:
+        if (
+            self.knowledge_gap_channel_id
+            and channel_str == self.knowledge_gap_channel_id
+        ):
             await self._handle_knowledge_gap_reply(message)
             return
 
@@ -1015,6 +1018,7 @@ class DiscordBridgeClient(discord.Client):
             source_type = "url"
         elif content:
             import re as _re
+
             if _re.match(r"https?://", content.split()[0]):
                 source = content.split()[0]
                 source_type = "url"
@@ -1051,9 +1055,11 @@ class DiscordBridgeClient(discord.Client):
             mid: tid for mid, tid in self._gap_messages.items() if tid != task_id
         }
 
-        type_label = {"url": "URL", "file": "workspace file", "text": "inline text"}.get(
-            source_type, source_type
-        )
+        type_label = {
+            "url": "URL",
+            "file": "workspace file",
+            "text": "inline text",
+        }.get(source_type, source_type)
         await message.reply(
             f"✅ Got it — sending {type_label} to the agent and resuming task `{task_id}`."
         )
@@ -1240,6 +1246,7 @@ class DiscordBridgeClient(discord.Client):
             task_id = parts[1]
             source = parts[2]
             import re as _re
+
             if _re.match(r"https?://", source):
                 source_type = "url"
             elif source.startswith("/workspace/"):
@@ -1255,7 +1262,11 @@ class DiscordBridgeClient(discord.Client):
                     "task_id": task_id,
                     "timestamp": str(time.time()),
                     "payload": json.dumps(
-                        {"task_id": task_id, "source": source, "source_type": source_type}
+                        {
+                            "task_id": task_id,
+                            "source": source,
+                            "source_type": source_type,
+                        }
                     ),
                 },
             )
@@ -2502,7 +2513,8 @@ def main() -> None:
         votes_channel=votes_channel_id or "(not configured — falling back to #logs)",
         approvals_channel=approvals_channel_id
         or "(not configured — falling back to #votes)",
-        knowledge_gap_channel=knowledge_gap_channel_id or "(not configured — falling back to #general)",
+        knowledge_gap_channel=knowledge_gap_channel_id
+        or "(not configured — falling back to #general)",
     )
     client.run(bot_token)
 

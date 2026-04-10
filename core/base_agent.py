@@ -441,14 +441,20 @@ class BaseAgent(ABC):
             if not self._running:
                 break
 
+            # Heartbeat: confirms the agent is alive regardless of queue state
+            queue_depth = await self._queue_depth()
+            await self.emit(
+                EventType.HEARTBEAT,
+                payload={"queue_depth": queue_depth, "active_tasks": self._active_tasks},
+            )
+
             # Only run memory health check + think() when the queue is idle
             if not await self._queue_is_idle():
-                depth = await self._queue_depth()
                 log.debug(
                     "agent.think_skipped_busy",
                     role=self.role,
-                    queue_depth=depth,
-                    reason=f"{depth} message(s) pending in agents:{self.role}",
+                    queue_depth=queue_depth,
+                    reason=f"{queue_depth} message(s) pending in agents:{self.role}",
                 )
                 continue
 
@@ -791,10 +797,18 @@ class BaseAgent(ABC):
                     action=prefix,
                     payload=payload[:80],
                 )
+                await self.emit(
+                    EventType.AGENT_TOOL_CALL,
+                    payload={"step": step, "action": prefix, "input": payload[:200]},
+                )
                 try:
                     obs = await action_handler(prefix, payload)
                 except Exception as exc:
                     obs = f"Error executing {prefix}: {exc}"
+                await self.emit(
+                    EventType.AGENT_TOOL_RESULT,
+                    payload={"step": step, "action": prefix, "output": obs[:200]},
+                )
                 obs_parts.append(f"{prefix}: {payload}\nOBSERVATION: {obs}")
                 if self._ERROR_OBS_RE.search(obs):
                     step_had_error = True
@@ -1152,7 +1166,9 @@ class BaseAgent(ABC):
         ttl_days: if set, the entry expires after this many days. Pass None
         for permanent retention.
         """
-        result = await self.memory.store(content, topic, tags or [self.role], ttl_days=ttl_days)
+        result = await self.memory.store(
+            content, topic, tags or [self.role], ttl_days=ttl_days
+        )
         knowledge_id = result.get("id")
         await self.bus.publish(
             Event(
@@ -1163,7 +1179,9 @@ class BaseAgent(ABC):
             target="broadcast",
         )
         if knowledge_id is not None:
-            await self._publish_classify_job(knowledge_id, topic, content, tags or [self.role])
+            await self._publish_classify_job(
+                knowledge_id, topic, content, tags or [self.role]
+            )
 
     async def recall(
         self, query: str, semantic: bool = True, limit: int = 5
@@ -1194,7 +1212,9 @@ class BaseAgent(ABC):
                 },
             )
         except Exception as exc:
-            log.warning("memory.classify_publish_failed", id=knowledge_id, error=str(exc))
+            log.warning(
+                "memory.classify_publish_failed", id=knowledge_id, error=str(exc)
+            )
 
     async def _classify_loop(self) -> None:
         """
@@ -1249,12 +1269,16 @@ class BaseAgent(ABC):
     async def _handle_classify_job(self, data: dict) -> None:
         """Ask the LLM to assign a t-shirt size TTL to one knowledge row."""
         knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
-        topic = (data.get(b"topic") or data.get("topic") or b"").decode() if isinstance(
-            data.get(b"topic") or data.get("topic"), bytes
-        ) else str(data.get(b"topic") or data.get("topic") or "")
-        content = (data.get(b"content") or data.get("content") or b"").decode() if isinstance(
-            data.get(b"content") or data.get("content"), bytes
-        ) else str(data.get(b"content") or data.get("content") or "")
+        topic = (
+            (data.get(b"topic") or data.get("topic") or b"").decode()
+            if isinstance(data.get(b"topic") or data.get("topic"), bytes)
+            else str(data.get(b"topic") or data.get("topic") or "")
+        )
+        content = (
+            (data.get(b"content") or data.get("content") or b"").decode()
+            if isinstance(data.get(b"content") or data.get("content"), bytes)
+            else str(data.get(b"content") or data.get("content") or "")
+        )
         tags_raw = data.get(b"tags") or data.get("tags") or b"[]"
         tags = json.loads(tags_raw if isinstance(tags_raw, str) else tags_raw.decode())
 

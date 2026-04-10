@@ -21,6 +21,10 @@ Run:
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.memory.long_term import LongTermMemory
 import json
 import time
 import uuid
@@ -146,7 +150,7 @@ async def test_semantic_search_latency(perf_baseline, update_perf):
     for i in range(20):
         query = queries[i % len(queries)]
         t0 = time.perf_counter()
-        results = await mem.search(query, semantic=True, limit=5)
+        await mem.search(query, semantic=True, limit=5)
         latencies_ms.append((time.perf_counter() - t0) * 1000)
 
     mean_ms = mean(latencies_ms)

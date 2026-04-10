@@ -15,5 +15,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "httpx>=0.27.0"
 
 COPY agents/discord_bridge/ ./agent/
+COPY core/ ./core/
 
 CMD ["python", "-m", "agent.main"]

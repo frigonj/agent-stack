@@ -19,7 +19,6 @@ Zero Claude API calls — all LLM work uses local LM Studio (Qwen via LangChain)
 
 from __future__ import annotations
 
-import asyncio
 import html.parser
 import json
 import os
@@ -850,7 +849,7 @@ class ResearchAgent(BaseAgent):
                     HumanMessage(content=extract_prompt),
                 ]
             )
-            facts = _parse_llm_json(resp.content)
+            facts = _parse_json_from_llm(resp.content)
             if not isinstance(facts, list):
                 facts = []
         except Exception as exc:
@@ -868,7 +867,11 @@ class ResearchAgent(BaseAgent):
 
         # Store each fact individually
         entries = [
-            {"topic": domain, "content": f"[{domain}] {fact}", "tags": ["fetched", domain]}
+            {
+                "topic": domain,
+                "content": f"[{domain}] {fact}",
+                "tags": ["fetched", domain],
+            }
             for fact in facts
             if isinstance(fact, str) and fact.strip()
         ]
@@ -881,9 +884,8 @@ class ResearchAgent(BaseAgent):
 
         log.info("research.fetch_learn_stored", url=url[:80], facts=len(entries))
         summary_lines = "\n".join(f"- {e['content']}" for e in entries[:5])
-        return (
-            f"Fetched {url} and stored {len(entries)} facts:\n{summary_lines}"
-            + ("\n…" if len(entries) > 5 else "")
+        return f"Fetched {url} and stored {len(entries)} facts:\n{summary_lines}" + (
+            "\n…" if len(entries) > 5 else ""
         )
 
     async def _decompose(self, question: str) -> list[str]:
@@ -1042,6 +1044,4 @@ def _compute_confidence(facts: list[dict]) -> list[dict]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from core.config import Settings
-
     run_agent(ResearchAgent(Settings()))
