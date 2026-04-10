@@ -260,13 +260,13 @@ class ApprovalView(discord.ui.View):
 class MemoryApprovalView(discord.ui.View):
     """
     Approve / Deny buttons for memory retention requests (TTL > 24h).
-    On resolution, publishes MEMORY_APPROVAL_RESULT to the event bus so the
-    waiting coroutine in base_agent._request_memory_approval() can unblock.
-    Timeout = 120s to match _MEMORY_APPROVAL_TIMEOUT in base_agent.
+    On resolution, publishes MEMORY_APPROVAL_RESULT to the event bus.
+    Timeout = 48h; if the bot restarts before a decision the DB row
+    handles expiry independently via _approval_poll_loop().
     """
 
     def __init__(self, approval_id: str, redis_client: aioredis.Redis):
-        super().__init__(timeout=120)
+        super().__init__(timeout=48 * 3600)
         self.approval_id = approval_id
         self.redis = redis_client
         self._decided = False
@@ -1706,7 +1706,7 @@ class DiscordBridgeClient(discord.Client):
                     description=payload.get("result", ""),
                     color=discord.Color.blurple(),
                 )
-                embed.set_footer(text="Auto-denies in 2 minutes")
+                embed.set_footer(text="Auto-denies in 48 hours if no response")
                 view = MemoryApprovalView(approval_id, self.redis)
                 await target_ch.send(embed=embed, view=view)
                 return

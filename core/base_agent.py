@@ -147,10 +147,6 @@ class BaseAgent(ABC):
         # task_id → source supplied by the user
         self._gap_sources: dict[str, str] = {}
 
-        # ── Pending memory approval requests ──────────────────────────────────
-        # approval_id → asyncio.Future[bool] (resolved when user responds or times out)
-        self._pending_memory_approvals: dict[str, asyncio.Future] = {}
-
         # ── Circuit breaker state ─────────────────────────────────────────────
         # Tracks consecutive LM Studio failures. After CIRCUIT_THRESHOLD failures
         # the circuit opens and llm_invoke() fails fast (or uses Claude fallback).
@@ -217,6 +213,7 @@ class BaseAgent(ABC):
             self._think_loop(),
             self._idle_watchdog_loop(),
             self._classify_loop(),
+            self._approval_poll_loop(),
         )
 
     async def stop(self, summary: Optional[str] = None) -> None:
@@ -1366,11 +1363,12 @@ class BaseAgent(ABC):
         """
         Assign a TTL size to one knowledge row.
 
-        Checks past approval decisions first (learned patterns), then falls
-        back to deterministic rules.  Sizes > short (> 24h) require user
-        approval via Discord before being committed.  On timeout (120s) the
-        entry defaults to "short".  Every decision is recorded so the system
-        learns over time.
+        - Checks past approval decisions first (learned patterns), then falls
+          back to deterministic rules.
+        - Sizes > short (> 24h) require user approval via Discord.  Instead of
+          blocking, we persist the request to pending_memory_approvals and return
+          immediately.  _approval_poll_loop() finalises the decision asynchronously.
+        - Short-classified rows are committed immediately (no approval needed).
         """
         knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
         topic = (
@@ -1388,34 +1386,17 @@ class BaseAgent(ABC):
 
         size = await self._classify_ttl_with_history(topic, tags, content)
 
-        # Sizes beyond "short" (> 24h) need user approval.
         _APPROVAL_REQUIRED = {"medium", "long", "permanent"}
         if size in _APPROVAL_REQUIRED:
-            approved = await self._request_memory_approval(
+            await self._request_memory_approval(
                 knowledge_id, topic, content, tags, size
             )
-            # Record the decision regardless of outcome
-            await self.memory.record_approval_decision(
-                agent=self.role,
-                topic=topic,
-                tags=tags,
-                content=content,
-                proposed_size=size,
-                approved=approved,
-            )
-            if not approved:
-                size = "short"
-                log.info(
-                    "memory.approval_denied_or_timeout",
-                    id=knowledge_id,
-                    topic=topic,
-                    downgraded_to=size,
-                )
+            # Return without setting expiry — poll loop will finalise once user decides
+            return
 
+        # Short / session: commit immediately, no approval needed
         await self.memory.set_expiry(knowledge_id, size)
         log.info("memory.classified", id=knowledge_id, size=size, topic=topic)
-
-    _MEMORY_APPROVAL_TIMEOUT = 120  # seconds to wait for user approval
 
     async def _request_memory_approval(
         self,
@@ -1424,55 +1405,155 @@ class BaseAgent(ABC):
         content: str,
         tags: list[str],
         proposed_size: str,
-    ) -> bool:
+    ) -> None:
         """
-        Publish a MEMORY_APPROVAL_REQUESTED event and wait up to
-        _MEMORY_APPROVAL_TIMEOUT seconds for a MEMORY_APPROVAL_RESULT event.
-        Returns True if approved, False if denied or timed out.
+        Persist the approval request to Postgres and publish a Discord embed.
+        Returns immediately — finalisation happens in _approval_poll_loop().
+        Deduplicates: if a live pending row already exists for this knowledge_id,
+        no new embed is sent.
         """
         approval_id = f"mem_approval_{knowledge_id}"
-        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
-        self._pending_memory_approvals[approval_id] = future
+        inserted = await self.memory.insert_pending_approval(
+            approval_id=approval_id,
+            knowledge_id=knowledge_id,
+            agent=self.role,
+            topic=topic,
+            tags=tags,
+            content=content,
+            proposed_size=proposed_size,
+        )
+        if not inserted:
+            log.debug("memory.approval_already_pending", id=knowledge_id)
+            return  # duplicate — embed already in Discord
 
         ttl_labels = {"medium": "7 days", "long": "30 days", "permanent": "forever"}
         label = ttl_labels.get(proposed_size, proposed_size)
 
-        try:
-            await self.emit(
-                EventType.MEMORY_APPROVAL_REQUESTED,
-                payload={
-                    "approval_id": approval_id,
-                    "knowledge_id": knowledge_id,
-                    "topic": topic,
-                    "content": content[:300],
-                    "tags": tags,
-                    "proposed_size": proposed_size,
-                    "proposed_label": label,
-                },
-                target="broadcast",
-            )
-            return await asyncio.wait_for(future, timeout=self._MEMORY_APPROVAL_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.info(
-                "memory.approval_timeout", approval_id=approval_id, id=knowledge_id
-            )
-            return False
-        finally:
-            self._pending_memory_approvals.pop(approval_id, None)
+        await self.emit(
+            EventType.MEMORY_APPROVAL_REQUESTED,
+            payload={
+                "approval_id": approval_id,
+                "knowledge_id": knowledge_id,
+                "topic": topic,
+                "content": content[:300],
+                "tags": tags,
+                "proposed_size": proposed_size,
+                "proposed_label": label,
+            },
+            target="broadcast",
+        )
+        log.info(
+            "memory.approval_requested",
+            id=knowledge_id,
+            topic=topic,
+            proposed_size=proposed_size,
+        )
 
     async def _handle_memory_approval_result(self, event: Event) -> None:
-        """Resolve the pending approval future when the user responds."""
+        """
+        Called when the user clicks ✅/❌ in Discord.
+        Resolves the pending_memory_approvals row, then applies set_expiry
+        and records the decision — all in one place.
+        """
         approval_id = event.payload.get("approval_id", "")
         approved = bool(event.payload.get("approved", False))
-        future = self._pending_memory_approvals.get(approval_id)
-        if future and not future.done():
-            future.set_result(approved)
+        await self._finalise_approval(approval_id, approved)
+
+    async def _finalise_approval(self, approval_id: str, approved: bool) -> None:
+        """
+        Shared path for both user-clicked and timed-out approvals.
+        Marks the DB row, applies set_expiry, records the decision.
+        """
+        row = await self.memory.resolve_pending_approval(approval_id, approved)
+        if row is None:
+            return  # already resolved or not found
+
+        knowledge_id = row["knowledge_id"]
+        topic = row["topic"]
+        tags = row["tags"] if isinstance(row["tags"], list) else json.loads(row["tags"])
+        content = row["content"]
+        proposed_size = row["proposed_size"]
+
+        final_size = proposed_size if approved else "short"
+        if not approved:
+            log.info(
+                "memory.approval_denied",
+                id=knowledge_id,
+                topic=topic,
+                downgraded_to=final_size,
+            )
+
+        await self.memory.set_expiry(knowledge_id, final_size)
+        await self.memory.record_approval_decision(
+            agent=self.role,
+            topic=topic,
+            tags=tags,
+            content=content,
+            proposed_size=proposed_size,
+            approved=approved,
+        )
+        await self.memory.delete_pending_approval(approval_id)
+        log.info(
+            "memory.approval_finalised",
+            id=knowledge_id,
+            approved=approved,
+            size=final_size,
+        )
+
+    # Seconds between poll loop iterations — checks for user decisions and timeouts
+    _APPROVAL_POLL_INTERVAL = 60
+
+    async def _approval_poll_loop(self) -> None:
+        """
+        Background loop that finalises pending memory approvals.
+
+        Runs every _APPROVAL_POLL_INTERVAL seconds and handles two cases:
+        1. User clicked ✅/❌ → MEMORY_APPROVAL_RESULT event already updated
+           the DB row; _finalise_approval() picks it up via resolve_pending_approval.
+           (Actually handled immediately in _handle_memory_approval_result — this
+            loop is the fallback for process-restart scenarios.)
+        2. 48h window elapsed → get_expired_pending_approvals() deletes the rows
+           and returns them; we treat all as denied (downgrade to short).
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._APPROVAL_POLL_INTERVAL)
+                expired = await self.memory.get_expired_pending_approvals()
+                for row in expired:
+                    log.info(
+                        "memory.approval_expired",
+                        approval_id=row["approval_id"],
+                        id=row["knowledge_id"],
+                    )
+                    final_size = "short"
+                    await self.memory.set_expiry(row["knowledge_id"], final_size)
+                    tags = (
+                        row["tags"]
+                        if isinstance(row["tags"], list)
+                        else json.loads(row["tags"])
+                    )
+                    await self.memory.record_approval_decision(
+                        agent=row["agent"],
+                        topic=row["topic"],
+                        tags=tags,
+                        content=row["content"],
+                        proposed_size=row["proposed_size"],
+                        approved=False,
+                    )
+                    log.info(
+                        "memory.approval_timeout_finalised",
+                        id=row["knowledge_id"],
+                        downgraded_to=final_size,
+                    )
+            except Exception as exc:
+                if self._running:
+                    log.warning("memory.approval_poll_error", error=str(exc))
 
     async def _requeue_unclassified(self) -> None:
         """
-        On startup, re-queue any knowledge rows that have no expires_at set
-        and are older than 1 minute — these were never classified, likely due
-        to a crash before the classify job was published.
+        On startup, re-queue knowledge rows that were never classified (classified_at IS NULL,
+        no live pending approval).  Safe to re-run: get_unclassified excludes rows that already
+        have a pending approval in flight.
         """
         try:
             rows = await self.memory.get_unclassified(limit=50)

@@ -330,6 +330,32 @@ _SCHEMA = [
     CREATE INDEX IF NOT EXISTS idx_mad_fts ON memory_approval_decisions
         USING GIN(to_tsvector('english', topic || ' ' || content))
     """,
+    # ── classified_at on knowledge ─────────────────────────────────────────
+    # Tracks when a row's TTL was last assigned.  get_unclassified() uses this
+    # instead of expires_at IS NULL so permanent rows (expires_at = NULL) are
+    # never re-queued for classification on restart.
+    "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS classified_at TIMESTAMPTZ DEFAULT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_classified ON knowledge(classified_at) WHERE classified_at IS NULL",
+    # ── Pending memory approvals ───────────────────────────────────────────
+    # One row per in-flight approval request.  Inserted before the Discord
+    # embed is sent; deleted (or marked decided) after the user responds or
+    # the 48-hour window expires.  Survives container restarts.
+    """
+    CREATE TABLE IF NOT EXISTS pending_memory_approvals (
+        approval_id   TEXT PRIMARY KEY,
+        knowledge_id  INTEGER NOT NULL,
+        agent         TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        tags          JSONB NOT NULL DEFAULT '[]',
+        content       TEXT NOT NULL,
+        proposed_size TEXT NOT NULL,
+        requested_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at    TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '48 hours',
+        result        BOOLEAN DEFAULT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pma_knowledge ON pending_memory_approvals(knowledge_id)",
+    "CREATE INDEX IF NOT EXISTS idx_pma_result ON pending_memory_approvals(result, expires_at) WHERE result IS NULL",
 ]
 
 
@@ -737,6 +763,8 @@ class LongTermMemory:
     async def set_expiry(self, knowledge_id: int, size: str) -> bool:
         """
         Write expires_at for a knowledge row based on a t-shirt size label.
+        Also stamps classified_at = NOW() so the row is never re-queued for
+        classification on restart (even when size='permanent', expires_at=NULL).
         Returns True if the row was found and updated, False if it no longer exists.
         Size must be one of TTL_SIZE_NAMES; 'permanent' sets expires_at to NULL.
         """
@@ -745,12 +773,12 @@ class LongTermMemory:
         async with pool.connection() as conn:
             if interval is None:
                 cur = await conn.execute(
-                    "UPDATE knowledge SET expires_at = NULL WHERE id = %s RETURNING id",
+                    "UPDATE knowledge SET expires_at = NULL, classified_at = NOW() WHERE id = %s RETURNING id",
                     (knowledge_id,),
                 )
             else:
                 cur = await conn.execute(
-                    "UPDATE knowledge SET expires_at = NOW() + %s::INTERVAL WHERE id = %s RETURNING id",
+                    "UPDATE knowledge SET expires_at = NOW() + %s::INTERVAL, classified_at = NOW() WHERE id = %s RETURNING id",
                     (interval, knowledge_id),
                 )
             row = await cur.fetchone()
@@ -760,25 +788,118 @@ class LongTermMemory:
 
     async def get_unclassified(self, limit: int = 50) -> list[dict]:
         """
-        Return knowledge rows that have never been classified (expires_at IS NULL
-        and created_at > 1 minute ago to avoid races with brand-new inserts).
-        Used by the startup sweep to re-queue rows that missed classification.
+        Return knowledge rows that have never been classified.
+        Uses classified_at IS NULL (not expires_at IS NULL) so permanent rows
+        with expires_at = NULL are not incorrectly re-queued on restart.
+        Excludes rows that already have a pending approval in-flight.
         """
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
                 """
-                SELECT id, agent, topic, content, tags, created_at
-                FROM knowledge
-                WHERE expires_at IS NULL
-                  AND created_at < NOW() - INTERVAL '1 minute'
-                ORDER BY created_at ASC
+                SELECT k.id, k.agent, k.topic, k.content, k.tags, k.created_at
+                FROM knowledge k
+                WHERE k.classified_at IS NULL
+                  AND k.created_at < NOW() - INTERVAL '1 minute'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pending_memory_approvals p
+                      WHERE p.knowledge_id = k.id
+                        AND p.result IS NULL
+                        AND p.expires_at > NOW()
+                  )
+                ORDER BY k.created_at ASC
                 LIMIT %s
                 """,
                 (limit,),
             )
             rows = await cur.fetchall()
         return list(rows)
+
+    async def insert_pending_approval(
+        self,
+        approval_id: str,
+        knowledge_id: int,
+        agent: str,
+        topic: str,
+        tags: list[str],
+        content: str,
+        proposed_size: str,
+    ) -> bool:
+        """
+        Insert a pending approval row.  Returns False if one already exists
+        for this knowledge_id (prevents duplicate Discord embeds).
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT approval_id FROM pending_memory_approvals WHERE knowledge_id = %s AND result IS NULL AND expires_at > NOW()",
+                (knowledge_id,),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                return False
+            await conn.execute(
+                """
+                INSERT INTO pending_memory_approvals
+                    (approval_id, knowledge_id, agent, topic, tags, content, proposed_size)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (approval_id) DO NOTHING
+                """,
+                (
+                    approval_id,
+                    knowledge_id,
+                    agent,
+                    topic,
+                    json.dumps(tags),
+                    content[:500],
+                    proposed_size,
+                ),
+            )
+        return True
+
+    async def resolve_pending_approval(
+        self, approval_id: str, approved: bool
+    ) -> dict | None:
+        """
+        Mark a pending approval as decided.  Returns the full row so the caller
+        can apply set_expiry and record_approval_decision.  Returns None if the
+        approval_id is not found or already decided.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                UPDATE pending_memory_approvals
+                SET result = %s
+                WHERE approval_id = %s AND result IS NULL
+                RETURNING knowledge_id, agent, topic, tags, content, proposed_size
+                """,
+                (approved, approval_id),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_expired_pending_approvals(self) -> list[dict]:
+        """Return pending approval rows whose 48h window has elapsed."""
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                DELETE FROM pending_memory_approvals
+                WHERE result IS NULL AND expires_at <= NOW()
+                RETURNING approval_id, knowledge_id, agent, topic, tags, content, proposed_size
+                """,
+            )
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def delete_pending_approval(self, approval_id: str) -> None:
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "DELETE FROM pending_memory_approvals WHERE approval_id = %s",
+                (approval_id,),
+            )
 
     async def count(self) -> int:
         """Return number of non-expired knowledge entries across all agents."""
