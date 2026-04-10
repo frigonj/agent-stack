@@ -29,7 +29,13 @@ import anthropic
 import redis.asyncio as aioredis
 import structlog
 
-from core.context import truncate_task
+
+def truncate_task(task: str, max_chars: int = 4_000) -> str:
+    if not task or len(task) <= max_chars:
+        return task
+    removed = len(task) - max_chars
+    return task[:max_chars] + f"\n[…{removed:,} chars omitted from task]"
+
 
 log = structlog.get_logger()
 
