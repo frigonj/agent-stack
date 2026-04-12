@@ -1181,14 +1181,28 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             if f.get("topic") not in ("task_failure", "task_success", "task_result")
         ]
 
-        # Recover the last real task from conversation history
+        # Recover the last real task from conversation history, falling back to
+        # Redis for cross-restart persistence (conversation is in-memory only).
         last_task: str | None = None
-        last_discord_msg: str | None = None
+        last_discord_msg: str | None = discord_message_id
         if self._conversation:
             entry = self._conversation[-1]
             last_task = entry[0]
-            # entry[3] is the task_id stored in _publish_reply; entry may be old 3-tuple
-            last_discord_msg = discord_message_id
+        else:
+            try:
+                raw = await self.bus._client.get(self._LAST_TASK_KEY)
+                if raw:
+                    stored = json.loads(raw)
+                    last_task = stored.get("task")
+                    # Use the stored discord_message_id only if caller didn't provide one
+                    if not last_discord_msg:
+                        last_discord_msg = stored.get("discord_message_id") or None
+                    log.info(
+                        "orchestrator.retry_recovered_from_redis",
+                        task=last_task[:60] if last_task else "",
+                    )
+            except Exception as exc:
+                log.warning("orchestrator.last_task_recover_failed", error=str(exc))
 
         if not last_task:
             await self._publish_reply(
@@ -4144,6 +4158,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             response.content, task_id, discord_message_id, original_task=original_task
         )
 
+    _LAST_TASK_KEY = "orchestrator:last_task"  # Redis key for restart recovery
+    _LAST_TASK_TTL = 3600 * 6  # 6 hours — stale after that, retry makes no sense
+
     async def _publish_reply(
         self,
         result: str,
@@ -4169,6 +4186,22 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 log.info("orchestrator.conversation_reset", reason="idle_timeout")
             self._conversation.append((original_task, result[:300], now, task_id))
             self._last_task_id = task_id
+            # Persist last real task to Redis so it survives a container restart
+            try:
+                await self.bus._client.setex(
+                    self._LAST_TASK_KEY,
+                    self._LAST_TASK_TTL,
+                    json.dumps(
+                        {
+                            "task": original_task[:500],
+                            "task_id": task_id,
+                            "discord_message_id": discord_message_id or "",
+                            "ts": now,
+                        }
+                    ),
+                )
+            except Exception as exc:
+                log.warning("orchestrator.last_task_persist_failed", error=str(exc))
 
     # ── Proactive think loop ─────────────────────────────────────────────────
 

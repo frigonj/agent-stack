@@ -1533,6 +1533,25 @@ class DiscordBridgeClient(discord.Client):
             if "BUSYGROUP" not in str(e):
                 raise
 
+        # Drain stale PEL entries (messages delivered to a previous incarnation
+        # of this consumer but never ACKed, e.g. after a crash or restart).
+        # Without this drain, XREADGROUP with ">" returns nothing until the PEL
+        # is cleared, causing the bridge to silently lag behind indefinitely.
+        try:
+            result = await self.redis.xautoclaim(
+                stream, group, consumer, min_idle_time=0, start_id="0-0"
+            )
+            claimed = result[1] if result and len(result) > 1 else []
+            if claimed:
+                stale_ids = [e[0] for e in claimed if e]
+                await self.redis.xack(stream, group, *stale_ids)
+                log.info(
+                    "discord_bridge.broadcast_pel_drained",
+                    count=len(stale_ids),
+                )
+        except Exception as exc:
+            log.debug("discord_bridge.broadcast_pel_drain_skipped", error=str(exc))
+
         # Default channel for broadcast events is #logs; fall back to
         # #general only if no log channel is configured.
         channel_id = int(self.logs_channel_id or self.general_channel_id)
