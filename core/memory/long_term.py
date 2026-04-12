@@ -1363,7 +1363,7 @@ class LongTermMemory:
                 INSERT INTO tools (name, description, owner_agent, invocation, tags, created_by,
                                    embedding, intent, content_hash, validated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s IS NOT NULL THEN NOW() ELSE NULL END)
+                        CASE WHEN %s::text IS NOT NULL THEN NOW() ELSE NULL END)
                 ON CONFLICT (name) DO UPDATE SET
                     description  = EXCLUDED.description,
                     owner_agent  = EXCLUDED.owner_agent,

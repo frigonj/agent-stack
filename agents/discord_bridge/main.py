@@ -870,6 +870,7 @@ class DiscordBridgeClient(discord.Client):
         self._logs_channel = None
         self._errors_channel = None
         self._task_tracking_channel = None
+        self._votes_channel = None
         # Pending relaunch confirmations: message_id → (mode, svc, expires_at)
         self._relaunch_pending: dict[int, tuple[str, str | None, float]] = {}
         # Deduplication: recently-dispatched event_ids (capped at 2000 entries)
@@ -2372,13 +2373,19 @@ class DiscordBridgeClient(discord.Client):
 
     async def _get_votes_channel(self):
         """Return the #votes channel, falling back to #logs, then #general."""
+        if self._votes_channel is not None:
+            return self._votes_channel
         for cid in filter(None, [self.votes_channel_id, self.logs_channel_id]):
             try:
-                return await self.fetch_channel(int(cid))
+                ch = await self.fetch_channel(int(cid))
+                self._votes_channel = ch
+                return ch
             except Exception:
                 pass
         try:
-            return await self.fetch_channel(int(self.general_channel_id))
+            ch = await self.fetch_channel(int(self.general_channel_id))
+            self._votes_channel = ch
+            return ch
         except Exception:
             return None
 

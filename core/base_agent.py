@@ -215,6 +215,7 @@ class BaseAgent(ABC):
             self._classify_loop(),
             self._approval_poll_loop(),
             self._expiry_review_loop(),
+            self._llm_lock_watchdog_loop(),
         )
 
     async def stop(self, summary: Optional[str] = None) -> None:
@@ -494,6 +495,48 @@ class BaseAgent(ABC):
                 self._stop_event.set()
                 return
 
+    async def _llm_lock_watchdog_loop(self) -> None:
+        """
+        Periodically check whether llm:lock is held without a live heartbeat.
+
+        This catches the case where the lock holder crashed or got stuck *after*
+        acquiring the lock but *before* (or without) starting the heartbeat task,
+        meaning no waiter ever sees the stale condition. Any live agent running
+        this loop will clear the orphaned lock within one check interval.
+
+        Check interval is _LLM_LOCK_HEARTBEAT_TTL so we only act after the
+        heartbeat would naturally have expired.
+        """
+        check_interval = float(self._LLM_LOCK_HEARTBEAT_TTL)
+        while self._running:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=check_interval
+                )
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            try:
+                lock_val = await self.bus._client.get(self._LLM_LOCK_KEY)
+                if lock_val is None:
+                    continue
+                heartbeat = await self.bus._client.get(self._LLM_LOCK_HEARTBEAT_KEY)
+                if heartbeat is None:
+                    log.warning(
+                        "agent.llm_lock_stale_watchdog",
+                        role=self.role,
+                        holder=lock_val,
+                        action="force_expiring",
+                    )
+                    await self.bus._client.delete(self._LLM_LOCK_KEY)
+                    await self.bus._client.publish(
+                        f"{self._LLM_LOCK_KEY}:released", "released"
+                    )
+            except Exception as exc:
+                log.debug("agent.llm_lock_watchdog_error", error=str(exc))
+
     async def _event_loop(self) -> None:
         async for stream, entry_id, event in self.bus.consume(
             role=self.role,
@@ -626,6 +669,9 @@ class BaseAgent(ABC):
     _LLM_LOCK_KEY = "llm:lock"
     _LLM_LOCK_TTL = 120  # seconds — auto-releases if agent crashes mid-call
     _LLM_LOCK_POLL = 1.5  # seconds between acquire attempts
+    _LLM_LOCK_HEARTBEAT_KEY = "llm:heartbeat"
+    _LLM_LOCK_HEARTBEAT_TTL = 15  # seconds — holder must refresh this while in flight
+    _LLM_LOCK_HEARTBEAT_INTERVAL = 5  # seconds between heartbeat refreshes
     _MODEL_CTX_CACHE_TTL = 300  # re-fetch context limit after 5 min (model may reload)
 
     async def _get_model_context_limit(self) -> int:
@@ -1077,10 +1123,51 @@ class BaseAgent(ABC):
                 finally:
                     await pubsub.unsubscribe(notify_chan)
                     await pubsub.aclose()
+
+                # After each poll cycle, check if the holder's heartbeat has
+                # expired. A missing heartbeat means the holder acquired the
+                # lock but is not actively calling LM Studio (crashed mid-call
+                # or stuck before the HTTP request). Force-expire the lock so
+                # the queue can advance without waiting the full 120s TTL.
+                heartbeat = await self.bus._client.get(self._LLM_LOCK_HEARTBEAT_KEY)
+                if heartbeat is None:
+                    current_holder = await self.bus._client.get(self._LLM_LOCK_KEY)
+                    if current_holder is not None:
+                        log.warning(
+                            "agent.llm_lock_stale",
+                            role=self.role,
+                            holder=current_holder,
+                            action="force_expiring",
+                        )
+                        await self.bus._client.delete(self._LLM_LOCK_KEY)
+                        await self.bus._client.publish(notify_chan, "released")
         except Exception:
             # Clean up queue entry if we never acquired the lock
             await self.bus._client.zrem(queue_key, member)
             raise
+
+        # Heartbeat task: refresh llm:heartbeat every _LLM_LOCK_HEARTBEAT_INTERVAL
+        # seconds while the LLM call is in flight. Waiters treat a missing
+        # heartbeat as proof the holder is not actively using LM Studio and
+        # will force-expire the lock after one poll cycle.
+        heartbeat_stop = asyncio.Event()
+
+        async def _heartbeat_loop():
+            while not heartbeat_stop.is_set():
+                await self.bus._client.set(
+                    self._LLM_LOCK_HEARTBEAT_KEY,
+                    lock_value,
+                    ex=self._LLM_LOCK_HEARTBEAT_TTL,
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(heartbeat_stop.wait()),
+                        timeout=float(self._LLM_LOCK_HEARTBEAT_INTERVAL),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        heartbeat_task = asyncio.ensure_future(_heartbeat_loop())
 
         try:
             try:
@@ -1131,6 +1218,14 @@ class BaseAgent(ABC):
                 )
             raise
         finally:
+            # Stop heartbeat task and delete the heartbeat key
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            await self.bus._client.delete(self._LLM_LOCK_HEARTBEAT_KEY)
             # Remove from queue and release lock, then wake up waiters
             await self.bus._client.zrem(queue_key, member)
             current = await self.bus._client.get(self._LLM_LOCK_KEY)
