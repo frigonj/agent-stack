@@ -844,6 +844,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         self._pending_user_votes: dict[str, asyncio.Future] = {}
         # Last completed task_id — used to target memory expiry on retry
         self._last_task_id: str | None = None
+        # Pending planner clarification: set when planner asks user a question,
+        # cleared when the user replies.  Tuple of (task, task_id, discord_message_id).
+        self._pending_clarification: tuple[str, str, str | None] | None = None
         # Passive eval pipeline — initialised lazily after memory/bus are ready
         self._eval_pipeline: EvalPipeline | None = None
 
@@ -988,6 +991,44 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         # session_id may be provided by the discord bridge after local classification
         hint_session_id = event.payload.get("session_id")
         log.info("orchestrator.task_received", task=task[:80], task_id=task_id)
+
+        # If the planner asked for clarification on a previous task, treat the
+        # next incoming message as the user's answer and resume that task with
+        # the answer injected as context — unless the user is cancelling.
+        if self._pending_clarification:
+            orig_task, orig_task_id, orig_discord_msg = self._pending_clarification
+            # Cancel clears the pending clarification without resuming.
+            if task.strip().lower() in ("cancel", "nevermind", "never mind", "stop"):
+                self._pending_clarification = None
+                await self._publish_reply(
+                    "Cancelled.", task_id, discord_message_id, is_chat=True
+                )
+                return
+            self._pending_clarification = None
+            clarification_ctx = f"\n\nUser clarification: {task}"
+            log.info(
+                "orchestrator.clarification_answered",
+                original_task=orig_task[:80],
+                answer=task[:80],
+            )
+            async def _resume_with_clarification() -> None:
+                try:
+                    await self._run_task(
+                        orig_task,
+                        orig_task_id,
+                        discord_message_id=orig_discord_msg or discord_message_id,
+                        retry_context=clarification_ctx,
+                    )
+                except Exception as exc:
+                    log.error("orchestrator.clarification_resume_error", error=str(exc))
+                    await self._publish_reply(
+                        f"⚠️ Error resuming task: {exc}",
+                        orig_task_id,
+                        orig_discord_msg or discord_message_id,
+                        original_task=orig_task,
+                    )
+            asyncio.create_task(_resume_with_clarification())
+            return
 
         intent = await self._classify_intent(task)
         log.info("orchestrator.intent", intent=intent, task=task[:60])
@@ -1174,6 +1215,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 expired=expired,
             )
 
+        # Capture failure summary before wiping findings so we can pass it to
+        # the retry as retry_context (prevents the planner from repeating the
+        # same broken route on the next attempt).
+        failure_summary = ""
+        for f in self._findings:
+            if f.get("topic") in ("task_failure", "task_result", "task_success"):
+                content = f.get("content", "")
+                if content:
+                    failure_summary = content[:400]
+                    break
+
         # Drop in-memory findings for the failed attempt
         self._findings = [
             f
@@ -1215,6 +1267,11 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
         self._conversation.clear()
         log.info("orchestrator.retry", original_task=last_task[:80])
+
+        retry_note = ""
+        if failure_summary:
+            retry_note = f"\n\n[Previous attempt failed: {failure_summary}]\nUse a different approach — avoid the same route."
+
         await self._publish_reply(
             f"Retrying: *{last_task[:120]}*",
             task_id,
@@ -1222,7 +1279,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             is_chat=True,
         )
         asyncio.create_task(
-            self._run_task(last_task, task_id, discord_message_id=last_discord_msg)
+            self._run_task(
+                last_task,
+                task_id,
+                discord_message_id=last_discord_msg,
+                retry_context=retry_note,
+            )
         )
 
     # Phrases that indicate the user is correcting a previous agent action.
@@ -3011,10 +3073,13 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                     raw = raw[4:]
             data = json.loads(raw)
 
-            # Planner is asking for clarification
+            # Planner is asking for clarification — suspend the task and wait
+            # for the user's reply before building the plan.
             if "clarify" in data and task_id:
                 question = str(data["clarify"])
                 log.info("orchestrator.planner_clarify", question=question[:100])
+                # Save pending state so _handle_task can resume on the next message.
+                self._pending_clarification = (task, task_id, discord_message_id)
                 await self._publish_reply(
                     question, task_id, discord_message_id, original_task=task
                 )
