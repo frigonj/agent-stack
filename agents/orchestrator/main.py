@@ -3221,10 +3221,18 @@ When context contains "User clarification:" after a proposal was made:
         # This avoids serial 20-30s startup delays that would stall the event loop.
         specialist_steps = [s for s in steps if s.agent not in ("discord", "direct")]
         if specialist_steps:
-            start_results = await asyncio.gather(
-                *[self._ensure_agent_running(s.agent, plan) for s in specialist_steps]
+            unique_agents = list(dict.fromkeys(s.agent for s in specialist_steps))
+            start_map = dict(
+                zip(
+                    unique_agents,
+                    await asyncio.gather(
+                        *[self._ensure_agent_running(a, plan) for a in unique_agents]
+                    ),
+                )
             )
-            for step, ok in zip(specialist_steps, start_results):
+            for step, ok in zip(
+                specialist_steps, [start_map[s.agent] for s in specialist_steps]
+            ):
                 if not ok:
                     step.status = "failed"
                     step.result = f"Failed to start agent container: {step.agent}"
@@ -3790,12 +3798,16 @@ When context contains "User clarification:" after a proposal was made:
                     for s in plan.steps
                     if s.status == "done" and s.result
                 ]
+                all_step_tasks = [
+                    s.task[:200] for s in plan.steps if s.status == "done"
+                ]
                 await self._synthesise_and_reply(
                     original_task=plan.original_task,
                     raw_results=all_results or [("orchestrator", "Task completed.")],
                     task_id=plan.task_id,
                     context=plan.context,
                     discord_message_id=plan.discord_message_id,
+                    step_tasks=all_step_tasks or None,
                 )
                 self._plans.pop(plan.task_id, None)
                 # Collect all step results for the eval pipeline
@@ -4072,6 +4084,40 @@ When context contains "User clarification:" after a proposal was made:
                         plan, f"❌ Failed to start `{container}`: {err[:200]}"
                     )
                 return False
+            # docker start exits 0 as soon as the process launches, even if it
+            # immediately crashes.  Give it a moment then confirm it's still up.
+            await asyncio.sleep(1)
+            try:
+                inspect_proc = await asyncio.create_subprocess_exec(
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    container,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                inspect_out, _ = await asyncio.wait_for(
+                    inspect_proc.communicate(), timeout=10
+                )
+                still_running = inspect_out.decode().strip() == "true"
+            except Exception:
+                still_running = False
+
+            if not still_running:
+                err = "container exited immediately after start"
+                log.error(
+                    "orchestrator.agent_start_failed",
+                    agent=agent,
+                    container=container,
+                    error=err,
+                )
+                if plan:
+                    await self._emit_plan_status(
+                        plan, f"❌ `{container}` started but exited immediately"
+                    )
+                return False
+
             log.info("orchestrator.agent_started", agent=agent, container=container)
             if plan:
                 await self._emit_plan_status(plan, f"✅ `{container}` started")
@@ -4170,6 +4216,7 @@ When context contains "User clarification:" after a proposal was made:
         task_id: str,
         context: str = "",
         discord_message_id: str | None = None,
+        step_tasks: list[str] | None = None,
     ) -> None:
         """Pass-through for single clean results; LLM synthesis for command output or multiple."""
         # Merch bot: intercept research results and run merch synthesis
@@ -4198,10 +4245,17 @@ When context contains "User clarification:" after a proposal was made:
                 return
 
         summary_system = (
-            "You are a concise assistant. Summarise the gathered information into a clear reply. "
+            "You are a concise assistant. Summarise what was accomplished into a clear reply for the user. "
+            "Be specific: mention files created, commands run, repos initialised, URLs if present. "
+            "End with a brief note on what comes next. "
             "Interpret command output plainly. If nothing useful was found, say so honestly."
         )
-        fixed = f"Task: {original_task}\n\nInformation gathered:\n"
+        steps_section = ""
+        if step_tasks:
+            steps_section = "\n\nSteps that were executed:\n" + "\n".join(
+                f"  • {t}" for t in step_tasks
+            )
+        fixed = f"Task: {original_task}{steps_section}\n\nResults gathered:\n"
         budget = await self._budget_content_chars(summary_system, fixed)
         raw_combined = "\n\n".join(f"[{src}]: {res}" for src, res in raw_results)
         combined = raw_combined[:budget]
