@@ -392,6 +392,23 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_eval_task ON eval_results(task_id)",
     "CREATE INDEX IF NOT EXISTS idx_eval_type ON eval_results(task_type, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_eval_review ON eval_results(review_status, created_at DESC)",
+    # ── Brave Search quota ledger ────────────────────────────────────────────
+    # One row per approved search batch. Tracks approved vs actual spend so
+    # the quota dashboard is accurate even if a task is interrupted mid-run.
+    """
+    CREATE TABLE IF NOT EXISTS brave_quota (
+        id              SERIAL PRIMARY KEY,
+        task_id         TEXT NOT NULL,
+        approved_reqs   INT NOT NULL,           -- how many requests the user approved
+        actual_reqs     INT NOT NULL DEFAULT 0, -- filled in after the search completes
+        query_summary   TEXT NOT NULL DEFAULT '',
+        approved_by     TEXT NOT NULL DEFAULT 'user',
+        approved_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at    TIMESTAMPTZ DEFAULT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_brave_quota_task ON brave_quota(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_brave_quota_date ON brave_quota(approved_at DESC)",
 ]
 
 

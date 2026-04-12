@@ -159,6 +159,7 @@ VISIBLE_EVENTS = {
     "task.created",
     "task.failed",
     "approval.required",
+    "brave.search_approval_required",
     "claude.escalation",
     "system.error",
     "plan.proposed",
@@ -390,6 +391,74 @@ class AllowlistApprovalView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         await self._resolve(interaction, "approved_permanent")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, "denied")
+
+    async def on_timeout(self) -> None:
+        if not self._decided:
+            from core.events.bus import EventBus
+
+            bus = EventBus.__new__(EventBus)
+            bus._client = self.redis
+            await bus.set_approval(self.approval_id, "denied", ex=60)
+
+
+# ── Brave Search quota approval UI ───────────────────────────────────────────
+
+
+class BraveSearchApprovalView(discord.ui.View):
+    """
+    Approve / Deny button for Brave Search API quota requests.
+    The embed shows the planned queries, request count, and running monthly cost.
+    On approval the research agent's wait_for_approval() unblocks and Brave is called.
+    On deny or timeout the agent falls back to Wikipedia-only.
+    """
+
+    def __init__(self, approval_id: str, redis_client: aioredis.Redis):
+        super().__init__(timeout=300)
+        self.approval_id = approval_id
+        self.redis = redis_client
+        self._decided = False
+
+    async def _resolve(self, interaction: discord.Interaction, decision: str) -> None:
+        if self._decided:
+            await interaction.response.send_message("Already decided.", ephemeral=True)
+            return
+        self._decided = True
+        await interaction.response.defer()
+        try:
+            from core.events.bus import EventBus
+
+            bus = EventBus.__new__(EventBus)
+            bus._client = self.redis
+            await bus.set_approval(self.approval_id, decision, ex=600)
+
+            label = "✅ Approved" if decision == "approved" else "❌ Denied"
+            color = discord.Color.green() if decision == "approved" else discord.Color.red()
+
+            embed = interaction.message.embeds[0]
+            embed.color = color
+            embed.set_footer(text=f"{label} by {interaction.user.display_name}")
+            for item in self.children:
+                item.disabled = True  # type: ignore[attr-defined]
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception:
+            logger.exception(
+                "BraveSearchApprovalView._resolve failed (approval_id=%s)",
+                self.approval_id,
+            )
+        finally:
+            self.stop()
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._resolve(interaction, "approved")
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
     async def deny(
@@ -1866,6 +1935,10 @@ class DiscordBridgeClient(discord.Client):
             approvals_ch = await self._get_approvals_channel()
             await self._post_approval(payload, approvals_ch or channel, source, icon)
 
+        elif event_type == "brave.search_approval_required":
+            approvals_ch = await self._get_approvals_channel()
+            await self._post_brave_search_approval(payload, approvals_ch or channel)
+
         elif event_type == "claude.escalation":
             await self._post_claude_escalation(payload, source, icon)
 
@@ -2660,6 +2733,56 @@ class DiscordBridgeClient(discord.Client):
             embed.set_footer(text="No response within 5 minutes = auto-denied")
             view = ApprovalView(approval_id, self.redis)
 
+        await channel.send(embed=embed, view=view)
+
+    async def _post_brave_search_approval(self, payload: dict, channel) -> None:
+        """Post a Brave Search quota approval embed."""
+        approval_id      = payload.get("approval_id", "")
+        purpose          = payload.get("purpose", "")
+        queries          = payload.get("queries", [])
+        n_requests       = payload.get("n_requests", len(queries))
+        monthly_used     = payload.get("monthly_used", 0)
+        monthly_cost     = payload.get("monthly_cost_usd", 0.0)
+        projected_total  = payload.get("projected_monthly", monthly_used + n_requests)
+        projected_cost   = payload.get("projected_cost_usd", 0.0)
+
+        cost_this_search = round(n_requests / 1000 * 5.0, 4)
+
+        query_list = "\n".join(f"• {q}" for q in queries[:10])
+        if len(queries) > 10:
+            query_list += f"\n…and {len(queries) - 10} more"
+
+        embed = discord.Embed(
+            title="🔍 Brave Search Requested",
+            description=(
+                f"**Research task:** {purpose[:300]}\n\n"
+                f"The research agent wants to fire **{n_requests} Brave API request(s)** "
+                f"for live web results."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Planned queries",
+            value=f"```{query_list[:900]}```",
+            inline=False,
+        )
+        embed.add_field(
+            name="Cost for this search",
+            value=f"`${cost_this_search:.4f}` ({n_requests} req × $5.00/1k)",
+            inline=True,
+        )
+        embed.add_field(
+            name="Monthly running total",
+            value=f"`{monthly_used}` reqs · `${monthly_cost:.4f}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Projected after approval",
+            value=f"`{projected_total}` reqs · `${projected_cost:.4f}`",
+            inline=True,
+        )
+        embed.set_footer(text="No response within 5 minutes = auto-denied (falls back to Wikipedia only)")
+        view = BraveSearchApprovalView(approval_id, self.redis)
         await channel.send(embed=embed, view=view)
 
     async def _post_claude_escalation(

@@ -161,6 +161,9 @@ class EventType(str, Enum):
     MEMORY_APPROVAL_REQUESTED = "memory.approval_requested"
     MEMORY_APPROVAL_RESULT = "memory.approval_result"
 
+    # Brave Search quota gate
+    BRAVE_SEARCH_APPROVAL_REQUIRED = "brave.search_approval_required"
+
     # Passive eval pipeline
     EVAL_REVIEW_NEEDED = (
         "eval.review_needed"  # orchestrator → broadcast → discord_bridge

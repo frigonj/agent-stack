@@ -1,24 +1,31 @@
 """
 agents/research/main.py
 ────────────────────────
-Research agent — multi-source internet research with staged evidence accumulation.
+Research agent — multi-source research with staged evidence accumulation.
+
+Sources (in priority order):
+  1. Wikipedia offline dump  — encyclopaedic / background facts, zero latency, no bot filters
+  2. Brave Search API        — current events, releases, live documentation
+  3. Direct URL fetch        — when a specific URL is provided
 
 Loop per task:
-  1. Decompose the question into N sub-queries (LLM)
-  2. For each sub-query: search SearXNG → store raw snippets in ctx:research:{id}
-  3. Extract single-sentence facts from each snippet (LLM)
-  4. Cross-source consensus check: fact is reliable if ≥ MIN_SOURCES_FOR_CONSENSUS
+  1. Wikipedia pre-pass: look up each sub-query title directly in the local dump
+  2. Decompose the question into N sub-queries (LLM)
+  3. For each sub-query: Wikipedia lookup → Brave search → store raw snippets
+  4. Extract single-sentence facts from each snippet (LLM)
+  5. Cross-source consensus check: fact is reliable if ≥ MIN_SOURCES_FOR_CONSENSUS
      independent domains agree
-  5. Gap / conflict detection → generate follow-up sub-queries
-  6. Repeat up to max_search_iterations
-  7. Synthesise final answer (LLM) → commit confident sources to Postgres
-  8. Return result to orchestrator
+  6. Gap / conflict detection → generate follow-up sub-queries
+  7. Repeat up to max_search_iterations
+  8. Synthesise final answer (LLM) → commit confident sources to Postgres
+  9. Return result to orchestrator
 
 Zero Claude API calls — all LLM work uses local LM Studio (Qwen via LangChain).
 """
 
 from __future__ import annotations
 
+import asyncio
 import html.parser
 import json
 import os
@@ -32,26 +39,22 @@ import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.base_agent import BaseAgent, run_agent
+from core.brave_quota import record_actual_usage, request_search_approval
 from core.config import Settings
 from core.context import truncate_task
 from core.events.bus import Event, EventType
+from core.wiki import wiki_lookup, wiki_search_titles
 
 log = structlog.get_logger()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 MAX_SEARCH_ITERATIONS = int(os.getenv("MAX_SEARCH_ITERATIONS", "3"))
 MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "8"))
 MIN_SOURCES_FOR_CONSENSUS = 3  # ≥3 independent domains → fact is reliable
 CONFIDENCE_COMMIT_THRESHOLD = 0.75  # facts above this go to Postgres
-
-# Engine sets tried in order. If the first set returns 0 results (bot-blocked),
-# fall through to the next set so we always get something back.
-_SEARCH_ENGINE_SETS = [
-    "bing,duckduckgo,brave",  # primary: Google disabled (HTML parser broken)
-    "wikipedia,mojeek,qwant",  # fallback: no Brave overlap, bot-detection-resistant
-]
 
 SYSTEM_PROMPT = """You are a research specialist in a multi-agent AI stack. You receive \
 internet search results and reason across multiple sources to produce accurate, well-sourced \
@@ -93,7 +96,103 @@ and note the discrepancy so the orchestrator can update memory.
 Route non-research tasks back via the orchestrator. Do not attempt to run commands.
 """
 
-# ── SearXNG helpers ───────────────────────────────────────────────────────────
+# ── Wikipedia helpers ─────────────────────────────────────────────────────────
+
+
+async def _wiki_search(query: str) -> list[dict]:
+    """
+    Search the offline Wikipedia dump.  Returns result dicts in the same shape
+    as Brave results so the fact-extraction pipeline can treat them uniformly.
+
+    Strategy:
+      1. Direct title lookup (exact match after normalisation)
+      2. If miss: fuzzy title scan for articles containing all query words,
+         then fetch the best match
+    """
+    # Try exact title lookup first
+    result = await wiki_lookup(query)
+    if result is None:
+        # Fuzzy: find candidate titles, take the first match
+        candidates = await wiki_search_titles(query, max_results=3)
+        for candidate in candidates:
+            result = await wiki_lookup(candidate)
+            if result:
+                break
+
+    if result is None:
+        log.debug("wiki.no_match", query=query[:60])
+        return []
+
+    # Split the article into ~400-char chunks so they feed naturally into
+    # the per-snippet fact extraction step
+    chunks = [
+        result.text[i : i + 400].strip()
+        for i in range(0, min(len(result.text), 3200), 400)
+        if result.text[i : i + 400].strip()
+    ]
+    hits = [
+        {
+            "url": result.url,
+            "title": result.title + (f" (via {result.redirect_followed})" if result.redirect_followed else ""),
+            "content": chunk,
+            "engine": "wikipedia_offline",
+        }
+        for chunk in chunks
+    ]
+    log.info("wiki.match", query=query[:60], title=result.title, chunks=len(hits))
+    return hits
+
+
+# ── Brave Search API ──────────────────────────────────────────────────────────
+
+
+async def _brave_search(
+    client: httpx.AsyncClient,
+    query: str,
+    num_results: int = MAX_RESULTS_PER_QUERY,
+) -> list[dict]:
+    """
+    Call the Brave Search API and return result dicts.
+    Returns [] gracefully on any error or if BRAVE_API_KEY is not set.
+    """
+    if not BRAVE_API_KEY:
+        log.debug("brave.no_api_key", query=query[:60])
+        return []
+    try:
+        resp = await client.get(
+            BRAVE_SEARCH_URL,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": BRAVE_API_KEY,
+            },
+            params={
+                "q": query,
+                "count": num_results,
+                "search_lang": "en",
+                "result_filter": "web",
+                "extra_snippets": "1",
+            },
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        web_results = data.get("web", {}).get("results", [])[:num_results]
+        hits = [
+            {
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "content": r.get("description", "") or r.get("extra_snippets", [""])[0],
+                "engine": "brave",
+            }
+            for r in web_results
+            if r.get("url")
+        ]
+        log.info("brave.search_done", query=query[:60], hits=len(hits))
+        return hits
+    except Exception as exc:
+        log.warning("brave.search_failed", query=query[:60], error=str(exc))
+        return []
 
 
 async def _search(
@@ -102,45 +201,15 @@ async def _search(
     num_results: int = MAX_RESULTS_PER_QUERY,
 ) -> list[dict]:
     """
-    Hit SearXNG JSON API and return a list of result dicts.
-    Each result has: url, title, content (snippet), engine.
-    Returns [] on any error so the loop can continue gracefully.
+    Combined search: Wikipedia offline first, then Brave for live results.
+    Wikipedia hits are prepended so the fact-extraction loop sees encyclopaedic
+    context before web snippets.
     """
-    # Primary engines: broad coverage.  If SearXNG blocks or returns 0 hits,
-    # retry with a different engine set (Wikipedia + Brave + Mojeek) as fallback.
-    for engines in _SEARCH_ENGINE_SETS:
-        try:
-            resp = await client.get(
-                f"{SEARXNG_URL}/search",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "engines": engines,
-                    "language": "en",
-                    "safesearch": "0",
-                },
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])[:num_results]
-            if results:
-                log.info(
-                    "research.search_done",
-                    query=query[:60],
-                    hits=len(results),
-                    engines=engines,
-                )
-                return results
-            log.debug("research.search_empty", query=query[:60], engines=engines)
-        except Exception as exc:
-            log.warning(
-                "research.search_failed",
-                query=query[:60],
-                engines=engines,
-                error=str(exc),
-            )
-    return []
+    wiki_hits, brave_hits = await asyncio.gather(
+        _wiki_search(query),
+        _brave_search(client, query, num_results),
+    )
+    return wiki_hits + brave_hits
 
 
 def _domain(url: str) -> str:
@@ -560,6 +629,27 @@ class ResearchAgent(BaseAgent):
                 if not sub_queries:
                     sub_queries = [question]
 
+            # ── Step 2: Brave quota gate ──────────────────────────────────────
+            # Estimate total Brave requests: sub_queries × remaining iterations.
+            # Wikipedia runs offline and is never counted.
+            brave_enabled = bool(BRAVE_API_KEY)
+            brave_ledger_id: Optional[int] = None
+            brave_actual_count = 0
+
+            if brave_enabled:
+                remaining_iters = MAX_SEARCH_ITERATIONS - start_iteration + 1
+                anticipated = len(sub_queries) * remaining_iters
+                approved, brave_ledger_id = await request_search_approval(
+                    self.bus,
+                    self.memory,
+                    task_id,
+                    sub_queries * remaining_iters,  # flat list for the embed
+                    question[:200],
+                )
+                if not approved:
+                    log.info("research.brave_denied", task_id=task_id)
+                    brave_enabled = False  # fall back to Wikipedia-only
+
             for iteration in range(start_iteration, MAX_SEARCH_ITERATIONS + 1):
                 log.info(
                     "research.iteration_start",
@@ -570,7 +660,14 @@ class ResearchAgent(BaseAgent):
                 new_facts: list[dict] = []
 
                 for sub_q in sub_queries:
-                    results = await _search(http, sub_q)
+                    # Wikipedia is always free — run unconditionally
+                    wiki_hits = await _wiki_search(sub_q)
+                    # Brave only if approved
+                    brave_hits: list[dict] = []
+                    if brave_enabled:
+                        brave_hits = await _brave_search(http, sub_q)
+                        brave_actual_count += 1
+                    results = wiki_hits + brave_hits
                     for hit in results:
                         url = hit.get("url", "")
                         snippet = hit.get("content", hit.get("snippet", ""))
@@ -670,7 +767,11 @@ class ResearchAgent(BaseAgent):
                         break
                     sub_queries = follow_ups
 
-        # ── Synthesise ────────────────────────────────────────────────────────
+        # ── Record actual Brave usage ──────────────────────────��──────────────
+        if brave_ledger_id is not None:
+            await record_actual_usage(self.memory, brave_ledger_id, brave_actual_count)
+
+        # ── Synthesise ──────────────────────��────────────────────────────────��
         confident_facts = _compute_confidence(all_facts)
         answer = await self._synthesise(question, confident_facts)
 

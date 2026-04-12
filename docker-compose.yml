@@ -230,25 +230,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ─── SearXNG (self-hosted meta-search, used by research agent) ──────────────
-  searxng:
-    image: searxng/searxng:latest
-    container_name: agent_searxng
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./docker/searxng:/etc/searxng:ro   # pre-baked settings.yml — no runtime setup needed
-    environment:
-      - SEARXNG_BASE_URL=http://searxng:8080
-      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY:-changeme-replace-in-prod}
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-
   # ─── Research Agent (ephemeral — spun up by orchestrator on demand) ──────────
   research:
     build:
@@ -263,8 +244,6 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      searxng:
-        condition: service_healthy
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://agent:agent@postgres:5432/agentmem
@@ -273,7 +252,8 @@ services:
       - AGENT_ROLE=research
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HF_TOKEN=${HF_TOKEN:-}
-      - SEARXNG_URL=http://searxng:8080
+      - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - WIKI_DIR=/workspace/wiki
       - IDLE_TIMEOUT=${AGENT_IDLE_TIMEOUT:-600}
     volumes:
       - ./agents/research:/app/agent
