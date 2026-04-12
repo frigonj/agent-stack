@@ -186,16 +186,19 @@ _SCHEMA = [
     # Executor is the primary owner/runner but any agent may contribute.
     """
     CREATE TABLE IF NOT EXISTS tools (
-        id          SERIAL PRIMARY KEY,
-        name        TEXT UNIQUE NOT NULL,
-        description TEXT NOT NULL,
-        owner_agent TEXT NOT NULL DEFAULT 'executor',
-        invocation  TEXT NOT NULL,
-        tags        JSONB NOT NULL DEFAULT '[]',
-        usage_count INT  NOT NULL DEFAULT 0,
-        created_by  TEXT NOT NULL DEFAULT 'system',
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        embedding   vector(384)
+        id           SERIAL PRIMARY KEY,
+        name         TEXT UNIQUE NOT NULL,
+        description  TEXT NOT NULL,
+        owner_agent  TEXT NOT NULL DEFAULT 'executor',
+        invocation   TEXT NOT NULL,
+        tags         JSONB NOT NULL DEFAULT '[]',
+        usage_count  INT  NOT NULL DEFAULT 0,
+        created_by   TEXT NOT NULL DEFAULT 'system',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        embedding    vector(384),
+        intent       TEXT,
+        content_hash TEXT,
+        validated_at TIMESTAMPTZ
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_tools_owner ON tools(owner_agent)",
@@ -203,6 +206,10 @@ _SCHEMA = [
     CREATE INDEX IF NOT EXISTS idx_tools_fts ON tools
         USING GIN(to_tsvector('english', name || ' ' || description))
     """,
+    # Migrations — safe to run on every startup (ADD COLUMN IF NOT EXISTS is idempotent)
+    "ALTER TABLE tools ADD COLUMN IF NOT EXISTS intent TEXT",
+    "ALTER TABLE tools ADD COLUMN IF NOT EXISTS content_hash TEXT",
+    "ALTER TABLE tools ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ",
     # ── Context snapshots ─────────────────────────────────────────────────
     # Unified store for task, chat session, and plan summaries.
     # Serves both long-term recall ("what happened in session X?") and
@@ -1334,24 +1341,41 @@ class LongTermMemory:
         invocation: str,
         tags: Optional[list[str]] = None,
         created_by: str = "system",
+        intent: Optional[str] = None,
+        content_hash: Optional[str] = None,
     ) -> None:
         """
         Add or update a tool in the shared registry.
         Upserts on name so re-registering on startup refreshes the embedding.
+
+        intent:       Natural-language description of what problem this tool solves.
+                      Used by agents to verify a script matches the current task before running.
+        content_hash: SHA-256 of the script body at registration time.
+                      Drift detection: if the live file hash differs, the script was modified
+                      after registration and must be re-validated before use.
         """
-        [embedding] = await asyncio.to_thread(_embed_texts, [description])
+        embed_text = f"{description}. {intent}" if intent else description
+        [embedding] = await asyncio.to_thread(_embed_texts, [embed_text])
         pool = await self._get_pool()
         async with pool.connection() as conn:
             await conn.execute(
                 """
-                INSERT INTO tools (name, description, owner_agent, invocation, tags, created_by, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO tools (name, description, owner_agent, invocation, tags, created_by,
+                                   embedding, intent, content_hash, validated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        CASE WHEN %s IS NOT NULL THEN NOW() ELSE NULL END)
                 ON CONFLICT (name) DO UPDATE SET
-                    description = EXCLUDED.description,
-                    owner_agent = EXCLUDED.owner_agent,
-                    invocation  = EXCLUDED.invocation,
-                    tags        = EXCLUDED.tags,
-                    embedding   = EXCLUDED.embedding
+                    description  = EXCLUDED.description,
+                    owner_agent  = EXCLUDED.owner_agent,
+                    invocation   = EXCLUDED.invocation,
+                    tags         = EXCLUDED.tags,
+                    embedding    = EXCLUDED.embedding,
+                    intent       = COALESCE(EXCLUDED.intent, tools.intent),
+                    content_hash = COALESCE(EXCLUDED.content_hash, tools.content_hash),
+                    validated_at = CASE
+                        WHEN EXCLUDED.content_hash IS NOT NULL THEN NOW()
+                        ELSE tools.validated_at
+                    END
                 """,
                 (
                     name,
@@ -1361,9 +1385,17 @@ class LongTermMemory:
                     json.dumps(tags or []),
                     created_by,
                     embedding,
+                    intent,
+                    content_hash,
+                    content_hash,  # second reference for the CASE expression
                 ),
             )
-        log.debug("memory.tool_registered", name=name, owner=owner_agent)
+        log.debug(
+            "memory.tool_registered",
+            name=name,
+            owner=owner_agent,
+            has_intent=bool(intent),
+        )
 
     async def search_tools(self, query: str, limit: int = 5) -> list[dict]:
         """
@@ -1384,6 +1416,7 @@ class LongTermMemory:
                 cur = await conn.execute(
                     """
                     SELECT name, description, owner_agent, invocation, tags, usage_count,
+                           intent, content_hash, validated_at,
                            1 - (embedding <=> %s::vector) AS similarity
                     FROM tools
                     WHERE embedding IS NOT NULL
@@ -1396,6 +1429,7 @@ class LongTermMemory:
                 cur = await conn.execute(
                     """
                     SELECT name, description, owner_agent, invocation, tags, usage_count,
+                           intent, content_hash, validated_at,
                            ts_rank(
                                to_tsvector('english', name || ' ' || description),
                                plainto_tsquery('english', %s)
@@ -1417,7 +1451,8 @@ class LongTermMemory:
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT name, description, owner_agent, invocation, tags, usage_count "
+                "SELECT name, description, owner_agent, invocation, tags, usage_count, "
+                "intent, content_hash, validated_at "
                 "FROM tools WHERE name = %s",
                 (name,),
             )

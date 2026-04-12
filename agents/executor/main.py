@@ -13,6 +13,7 @@ Approval gates:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import shlex
 import uuid
@@ -470,15 +471,36 @@ After a successful fix, register it in the tool registry so other agents benefit
 (or delegate: ask orchestrator to call memory.register_tool)
 
 ## Tool-building
-After solving a new class of problem, save a reusable script:
+After solving a new class of problem, save a reusable script.
+Use this EXACT header format — all fields are required for registry indexing:
   CMD: tee /workspace/tools/<descriptive-name>.sh << 'EOF'
   #!/bin/bash
-  # Description: <what this does>
-  <command>
+  # Description: <one-line summary of what the script does>
+  # Intent:      <the task or problem class this was created to solve>
+  # Created-for: <original task text, verbatim>
+  # Created-by:  executor
+  # Tags:        <comma-separated tags>
+  <command(s)>
   EOF
   CMD: chmod +x /workspace/tools/<descriptive-name>.sh
 
 Name clearly: check-redis-streams.sh, tail-agent-logs.sh, restart-all-agents.sh.
+
+## Script write + run protocol (MANDATORY)
+After ANY tee write to a .sh file you MUST verify before running:
+  CMD: cat /workspace/tools/<script>.sh
+  OBSERVATION: <file content — must be non-empty and start with #!/bin/bash>
+  CMD: bash /workspace/tools/<script>.sh
+
+If the cat shows an empty file or missing shebang, the write failed.
+Rewrite with tee — do NOT run an invalid script.
+If the script content does not match what you intended to write, rewrite it before running.
+
+## Before running any existing script
+Always confirm the script's intent matches the current task:
+  CMD: cat /workspace/tools/<script>.sh
+Read the # Intent: and # Description: lines. If the script does something different
+from what you need, do NOT run it — write a new script instead.
 
 ## Command trust tiers
 SAFE (instant, no log):
@@ -689,11 +711,15 @@ class ExecutorAgent(BaseAgent):
 
             #!/bin/bash
             # Description: What this script does (used as the registry description)
-            # Usage: ./script-name.sh [arg1] [arg2]      (optional, appended to desc)
-            # Tags: tag1, tag2, tag3                       (optional)
+            # Intent:      The task or problem class this was created to solve
+            # Created-for: <original task text>
+            # Created-by:  executor | claude_code_agent | developer
+            # Usage:       ./script-name.sh [arg1] [arg2]  (optional)
+            # Tags:        tag1, tag2, tag3                 (optional)
 
         Idempotent — register_tool() upserts on name, so re-scanning on restart
         refreshes descriptions without creating duplicates.
+        Invalid scripts (empty or missing shebang) are skipped and logged.
 
         Returns the number of scripts discovered and registered.
         """
@@ -703,14 +729,24 @@ class ExecutorAgent(BaseAgent):
         count = 0
         for script in sorted(TOOLS_DIR.glob("*.sh")):
             try:
-                lines = script.read_text(errors="ignore").splitlines()
+                body = script.read_text(errors="ignore")
+                lines = body.splitlines()
             except Exception as exc:
                 log.warning(
                     "executor.scan_tool_read_error", path=str(script), error=str(exc)
                 )
                 continue
 
+            # Skip invalid scripts — empty or missing shebang
+            ok, reason = self._script_is_valid(str(script))
+            if not ok:
+                log.warning(
+                    "executor.scan_tool_invalid", script=script.name, reason=reason
+                )
+                continue
+
             description = ""
+            intent = ""
             usage = ""
             tags: list[str] = ["workspace-tool", "script"]
 
@@ -718,6 +754,12 @@ class ExecutorAgent(BaseAgent):
                 stripped = line.strip()
                 if stripped.startswith("# Description:"):
                     description = stripped[len("# Description:") :].strip()
+                elif stripped.startswith("# Intent:"):
+                    intent = stripped[len("# Intent:") :].strip()
+                elif stripped.startswith("# Created-for:"):
+                    # Use as fallback intent if no explicit Intent: line
+                    if not intent:
+                        intent = stripped[len("# Created-for:") :].strip()
                 elif stripped.startswith("# Usage:"):
                     usage = stripped[len("# Usage:") :].strip()
                 elif stripped.startswith("# Tags:"):
@@ -735,15 +777,28 @@ class ExecutorAgent(BaseAgent):
             if usage:
                 description = f"{description}. Usage: {usage}"
 
+            # Compute content hash for drift detection
+            content_hash = hashlib.sha256(body.encode()).hexdigest()
+
             # Tool name = script stem (e.g. check-agent-logs → check-agent-logs)
             tool_name = script.stem[:60]
             invocation = f"shell:{script}"
 
             await self.memory.register_tool(
-                tool_name, description, "executor", invocation, tags, "workspace-scan"
+                tool_name,
+                description,
+                "executor",
+                invocation,
+                tags,
+                "workspace-scan",
+                intent=intent or None,
+                content_hash=content_hash,
             )
             log.debug(
-                "executor.workspace_tool_registered", name=tool_name, script=script.name
+                "executor.workspace_tool_registered",
+                name=tool_name,
+                script=script.name,
+                has_intent=bool(intent),
             )
             count += 1
 
@@ -908,15 +963,35 @@ class ExecutorAgent(BaseAgent):
                 )
                 if shell_hit:
                     cmd = shell_hit["invocation"][6:]  # strip "shell:" prefix
-                    log.info(
-                        "executor.tool_registry_hit",
-                        tool=shell_hit["name"],
-                        sim=round(shell_hit.get("similarity", 0), 3),
-                    )
-                    await self.memory.increment_tool_usage(shell_hit["name"])
-                    result = await self._run_command(
-                        cmd, task, task_id, timeout=timeout
-                    )
+                    registered_hash = shell_hit.get("content_hash")
+                    ok, reason = self._script_is_valid(cmd, registered_hash)
+                    if not ok:
+                        log.warning(
+                            "executor.tool_registry_invalid",
+                            tool=shell_hit["name"],
+                            reason=reason,
+                        )
+                        result = (
+                            f"Registry tool '{shell_hit['name']}' failed validation: {reason}. "
+                            "Read and rewrite the script before running."
+                        )
+                    else:
+                        if reason.startswith("DRIFT"):
+                            log.warning(
+                                "executor.tool_hash_drift",
+                                tool=shell_hit["name"],
+                                reason=reason,
+                            )
+                        log.info(
+                            "executor.tool_registry_hit",
+                            tool=shell_hit["name"],
+                            sim=round(shell_hit.get("similarity", 0), 3),
+                            intent=shell_hit.get("intent", "")[:60],
+                        )
+                        await self.memory.increment_tool_usage(shell_hit["name"])
+                        result = await self._run_command(
+                            cmd, task, task_id, timeout=timeout
+                        )
                 else:
                     # ── 4. Try capability registry (no LLM) ───────────────────
                     cached_cmd = await self.memory.lookup_capability(task)
@@ -1014,10 +1089,45 @@ class ExecutorAgent(BaseAgent):
 
     # ── Local toolset ────────────────────────────────────────────────────────
 
+    def _script_is_valid(
+        self, path: str, registered_hash: str | None = None
+    ) -> tuple[bool, str]:
+        """
+        Return (ok, reason) for a shell script.
+        A valid script must be non-empty and start with a shebang line.
+
+        If registered_hash is provided (from the tool registry), also checks
+        whether the live file matches what was registered. A mismatch means the
+        script was modified after registration — surfaced as a warning in the
+        reason string so the caller can decide whether to re-validate.
+        """
+        try:
+            p = Path(path)
+            if not p.exists():
+                return False, f"script not found: {path}"
+            content = p.read_text(errors="replace")
+            stripped = content.strip()
+            if not stripped:
+                return False, f"script is empty: {path}"
+            if not stripped.startswith("#!"):
+                return False, f"script missing shebang: {path}"
+            if registered_hash:
+                live_hash = hashlib.sha256(content.encode()).hexdigest()
+                if live_hash != registered_hash:
+                    return True, (
+                        f"DRIFT: script content has changed since registration "
+                        f"(registered={registered_hash[:12]}, live={live_hash[:12]}). "
+                        "Verify the script still matches its registered intent before running."
+                    )
+            return True, "ok"
+        except Exception as exc:
+            return False, f"script read error: {exc}"
+
     def _find_local_tool(self, task: str) -> str | None:
         """
         Scan /workspace/tools/ for a script whose filename keywords overlap
         with the task keywords. Returns the script path if a good match is found.
+        Only returns scripts that pass _script_is_valid.
         """
         if not TOOLS_DIR.exists():
             return None
@@ -1040,14 +1150,24 @@ class ExecutorAgent(BaseAgent):
             )
             score = len(task_words & name_words)
             if score >= 2 and score > best_score:
-                best_score = score
-                best_path = str(script)
+                ok, reason = self._script_is_valid(str(script))
+                if ok:
+                    best_score = score
+                    best_path = str(script)
+                else:
+                    log.warning(
+                        "executor.local_tool_invalid",
+                        script=str(script),
+                        reason=reason,
+                    )
         return best_path
 
     def _maybe_save_tool(self, task: str, cmd: str) -> None:
         """
         Save a successful LLM-generated command as a named tool script for
         future reuse without LLM. Only saves non-trivial multi-token commands.
+        Writes a structured header so the script is self-describing and
+        parseable by _scan_workspace_tools for intent + hash registration.
         """
         if len(cmd.split()) < 3:
             return  # too simple to be worth a script
@@ -1065,10 +1185,23 @@ class ExecutorAgent(BaseAgent):
             script_path = TOOLS_DIR / f"{name}.sh"
             if script_path.exists():
                 return  # never overwrite existing tools
-            content = f"#!/bin/bash\n# Generated from task: {task[:120]}\n{cmd}\n"
+            content = (
+                f"#!/bin/bash\n"
+                f"# Description: {task[:120]}\n"
+                f"# Intent: Automate: {task[:200]}\n"
+                f"# Created-for: {task[:200]}\n"
+                f"# Created-by: executor\n"
+                f"{cmd}\n"
+            )
             script_path.write_text(content)
             script_path.chmod(0o755)
-            log.info("executor.tool_saved", script=str(script_path), cmd=cmd[:80])
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            log.info(
+                "executor.tool_saved",
+                script=str(script_path),
+                cmd=cmd[:80],
+                hash=content_hash[:12],
+            )
         except Exception as exc:
             log.debug("executor.tool_save_failed", error=str(exc))
 
@@ -1182,6 +1315,24 @@ class ExecutorAgent(BaseAgent):
             cmd = " ".join(shlex.quote(p) for p in parts)
         base_cmd = parts[0] if parts else ""
 
+        # Validate script content before running bash/sh against a file path.
+        # Catches empty or shebang-less scripts that would silently do nothing.
+        if base_cmd in ("bash", "sh") and len(parts) >= 2:
+            script_arg = parts[1]
+            if script_arg.endswith(".sh") and not script_arg.startswith("-"):
+                ok, reason = self._script_is_valid(script_arg)
+                if not ok:
+                    log.warning(
+                        "executor.invalid_script_blocked",
+                        cmd=cmd,
+                        reason=reason,
+                    )
+                    return (
+                        f"Script validation failed — {reason}. "
+                        "The script must be non-empty and start with a shebang (#!/bin/bash). "
+                        "Read the file first, then rewrite it with the correct content before running."
+                    )
+
         # pip list/show/freeze/check are read-only — treat as AUTO_APPROVED
         pip_read_only = (
             base_cmd in ("pip", "pip3")
@@ -1246,6 +1397,41 @@ class ExecutorAgent(BaseAgent):
                     return await self._run_command(
                         alt_cmd, task, task_id, timeout, _recovery=True
                     )
+
+            # After a successful tee write to a .sh file, read back and verify
+            # the script has real content. Empty heredocs silently produce empty
+            # files — catching this here surfaces the problem before the agent
+            # tries to run the script.
+            if code == 0 and base_cmd == "tee" and not _recovery:
+                sh_target = next(
+                    (
+                        p
+                        for p in parts[1:]
+                        if p.endswith(".sh") and not p.startswith("-")
+                    ),
+                    None,
+                )
+                if sh_target:
+                    ok, reason = self._script_is_valid(sh_target)
+                    if not ok:
+                        log.warning(
+                            "executor.tee_write_empty",
+                            path=sh_target,
+                            reason=reason,
+                        )
+                        output += (
+                            f"\n[WARN] Write verification failed — {reason}. "
+                            "The file exists but is empty or missing a shebang. "
+                            "Rewrite it using: tee <path> << 'EOF' ... EOF"
+                        )
+                    else:
+                        try:
+                            verified_content = Path(sh_target).read_text(
+                                errors="replace"
+                            )
+                            output += f"\n[VERIFY] Script written successfully ({len(verified_content)} bytes):\n{verified_content[:500]}"
+                        except Exception:
+                            pass
 
             return truncate_command_output(output)
 
