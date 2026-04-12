@@ -481,29 +481,14 @@ async def _handle_event(
     try:
         result = await run_task(client, task)
     except (anthropic.APIConnectionError, anthropic.InternalServerError) as exc:
-        # API is down — set flag, emit error, don't crash the agent
+        # API is down — set flag and fall through to emit a failed TASK_COMPLETED
+        # so the orchestrator can mark the step failed and trigger the retry cycle.
         _API_UNAVAILABLE = True
         log.error("claude_code_agent.api_down", error=str(exc))
-        await redis.xadd(
-            "agents:broadcast",
-            {
-                "event_id": str(uuid.uuid4()),
-                "type": "system.error",
-                "source": "claude_code_agent",
-                "task_id": task_id,
-                "timestamp": str(time.time()),
-                "payload": json.dumps(
-                    {
-                        "error": f"Claude API unavailable: {exc}. Agent will self-recover when API returns.",
-                        "task": task[:200],
-                        "task_id": task_id,
-                    }
-                ),
-            },
-            maxlen=10_000,
-            approximate=True,
-        )
-        return
+        result = f"Agent error: Claude API unavailable: {exc}"
+    except Exception as exc:
+        log.exception("claude_code_agent.task_failed", error=str(exc))
+        result = f"Agent error: {exc}"
 
     log.info("claude_code_agent.task_done", task_id=task_id, result_len=len(result))
 

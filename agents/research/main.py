@@ -43,7 +43,12 @@ from core.brave_quota import record_actual_usage, request_search_approval
 from core.config import Settings
 from core.context import truncate_task
 from core.events.bus import Event, EventType
-from core.wiki import is_in_wiki, wiki_awareness_context, wiki_lookup, wiki_search_titles
+from core.wiki import (
+    is_in_wiki,
+    wiki_awareness_context,
+    wiki_lookup,
+    wiki_search_titles,
+)
 
 log = structlog.get_logger()
 

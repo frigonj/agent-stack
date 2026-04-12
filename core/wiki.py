@@ -62,6 +62,7 @@ WIKI_DIR = Path(os.getenv("WIKI_DIR", "/workspace/wiki"))
 
 # ── Bloom filter ──────────────────────────────────────────────────────────────
 
+
 class _BloomFilter:
     """
     Minimal bloom filter backed by a bytearray.
@@ -96,7 +97,7 @@ class _BloomFilter:
 
 
 _bloom: Optional[_BloomFilter] = None
-_bloom_attempted = False   # set after first load attempt so we don't retry forever
+_bloom_attempted = False  # set after first load attempt so we don't retry forever
 
 _manifest: Optional[dict] = None
 _manifest_attempted = False
@@ -170,7 +171,9 @@ def _find_dump_and_index() -> tuple[Path, Path]:
             and "index" not in name
         ):
             dump = p
-        elif "pages-articles-multistream-index" in name and (name.endswith(".bz2") or name.endswith(".txt")):
+        elif "pages-articles-multistream-index" in name and (
+            name.endswith(".bz2") or name.endswith(".txt")
+        ):
             index = p
     if not dump:
         raise FileNotFoundError(f"No Wikipedia dump found in {WIKI_DIR}")
@@ -396,7 +399,7 @@ def is_in_wiki(title: str) -> bool:
     so callers never incorrectly skip lookups.
     """
     if _bloom is None:
-        return True   # no filter available — don't gate anything
+        return True  # no filter available — don't gate anything
     return title in _bloom or title.lower() in _bloom
 
 

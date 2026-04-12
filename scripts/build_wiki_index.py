@@ -49,15 +49,16 @@ MANIFEST_PATH = WIKI_DIR / "wiki_manifest.json"
 
 # Bloom filter parameters
 # 22M articles, 0.1% false positive rate → ~26 MB, 10 hash functions
-BLOOM_N = 22_000_000          # expected number of items
-BLOOM_FP = 0.001              # target false-positive rate
-BLOOM_K = 10                  # number of hash functions
+BLOOM_N = 22_000_000  # expected number of items
+BLOOM_FP = 0.001  # target false-positive rate
+BLOOM_K = 10  # number of hash functions
 
 # Category manifest: top N categories by article count
 MANIFEST_TOP_N = 300
 
 
 # ── Bloom filter (pure Python, no dependencies beyond mmh3) ──────────────────
+
 
 def _bloom_size(n: int, fp: float) -> int:
     """Optimal bit count for n items at fp false-positive rate."""
@@ -121,15 +122,51 @@ class BloomFilter:
 # Wikipedia top-level category prefixes we care about
 # Derived from https://en.wikipedia.org/wiki/Wikipedia:Contents/Categories
 _KNOWN_DOMAINS = [
-    "Agriculture", "Arts", "Astronomy", "Biology", "Business", "Chemistry",
-    "Computing", "Culture", "Economics", "Education", "Engineering",
-    "Entertainment", "Environment", "Events", "Film", "Food", "Geography",
-    "Government", "Health", "History", "Humanities", "Language", "Law",
-    "Literature", "Mathematics", "Medicine", "Military", "Music", "Nature",
-    "People", "Philosophy", "Physics", "Politics", "Psychology", "Religion",
-    "Science", "Society", "Software", "Sports", "Technology", "Television",
-    "Transport", "War",
+    "Agriculture",
+    "Arts",
+    "Astronomy",
+    "Biology",
+    "Business",
+    "Chemistry",
+    "Computing",
+    "Culture",
+    "Economics",
+    "Education",
+    "Engineering",
+    "Entertainment",
+    "Environment",
+    "Events",
+    "Film",
+    "Food",
+    "Geography",
+    "Government",
+    "Health",
+    "History",
+    "Humanities",
+    "Language",
+    "Law",
+    "Literature",
+    "Mathematics",
+    "Medicine",
+    "Military",
+    "Music",
+    "Nature",
+    "People",
+    "Philosophy",
+    "Physics",
+    "Politics",
+    "Psychology",
+    "Religion",
+    "Science",
+    "Society",
+    "Software",
+    "Sports",
+    "Technology",
+    "Television",
+    "Transport",
+    "War",
 ]
+
 
 def _classify_title(title: str) -> str | None:
     """
@@ -138,8 +175,18 @@ def _classify_title(title: str) -> str | None:
     Returns None for meta-pages (Wikipedia:, Talk:, etc.)
     """
     # Skip meta namespaces
-    for ns in ("Wikipedia:", "Talk:", "User:", "File:", "Template:", "Help:",
-               "Category:", "Portal:", "Draft:", "Module:"):
+    for ns in (
+        "Wikipedia:",
+        "Talk:",
+        "User:",
+        "File:",
+        "Template:",
+        "Help:",
+        "Category:",
+        "Portal:",
+        "Draft:",
+        "Module:",
+    ):
         if title.startswith(ns):
             return None
 
@@ -151,6 +198,7 @@ def _classify_title(title: str) -> str | None:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def _find_index() -> Path:
     for p in WIKI_DIR.iterdir():
@@ -164,7 +212,9 @@ def _find_index() -> Path:
 def build(dry_run: bool = False) -> None:
     index_path = _find_index()
     compressed = index_path.name.endswith(".bz2")
-    print(f"Index: {index_path} ({index_path.stat().st_size / 1e6:.0f} MB{'  compressed' if compressed else '  plain text'})")
+    print(
+        f"Index: {index_path} ({index_path.stat().st_size / 1e6:.0f} MB{'  compressed' if compressed else '  plain text'})"
+    )
 
     m = _bloom_size(BLOOM_N, BLOOM_FP)
     print(f"Bloom: m={m:,} bits ({m // 8 / 1e6:.1f} MB), k={BLOOM_K}")
@@ -202,7 +252,9 @@ def build(dry_run: bool = False) -> None:
                 print(f"  {total:>10,} articles  ({elapsed:.0f}s)", flush=True)
 
     elapsed = time.time() - t0
-    print(f"Done: {total:,} articles in {elapsed:.1f}s (skipped {skipped:,} meta pages)")
+    print(
+        f"Done: {total:,} articles in {elapsed:.1f}s (skipped {skipped:,} meta pages)"
+    )
 
     if not dry_run:
         print(f"Saving bloom filter → {BLOOM_PATH}")
@@ -223,7 +275,9 @@ def build(dry_run: bool = False) -> None:
         "version": 1,
         "article_count": article_count,
         "meta_page_count": meta_count,
-        "dump_date": index_path.name.split("-")[1] if "-" in index_path.name else "unknown",
+        "dump_date": index_path.name.split("-")[1]
+        if "-" in index_path.name
+        else "unknown",
         "bloom_filter": str(BLOOM_PATH.name),
         "bloom_fp_rate": BLOOM_FP,
         "coverage_note": (

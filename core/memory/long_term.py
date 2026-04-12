@@ -734,6 +734,7 @@ class LongTermMemory:
                 SELECT id, agent, topic, title, content, tags, created_at, expires_at
                 FROM knowledge
                 WHERE (expires_at IS NULL OR expires_at > NOW())
+                  AND topic != 'learned_intent'
                   AND to_tsvector('english', title || ' ' || content)
                       @@ plainto_tsquery('english', %s)
                 ORDER BY ts_rank(
@@ -758,7 +759,9 @@ class LongTermMemory:
     async def _vector_search_with_embedding(
         self, query: str, embedding: list[float], limit: int = 5
     ) -> list[dict]:
-        """Semantic search using a pre-computed embedding vector. Excludes expired entries."""
+        """Semantic search using a pre-computed embedding vector. Excludes expired entries
+        and internal orchestrator topics (e.g. learned_intent) that are only useful to
+        the orchestrator itself and pollute recall for other agents."""
         pool = await self._get_pool()
         async with pool.connection() as conn:
             cur = await conn.execute(
@@ -768,6 +771,7 @@ class LongTermMemory:
                 FROM knowledge
                 WHERE embedding IS NOT NULL
                   AND (expires_at IS NULL OR expires_at > NOW())
+                  AND topic != 'learned_intent'
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """,
