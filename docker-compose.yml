@@ -55,6 +55,14 @@ services:
         AGENT_MODULE: orchestrator
     container_name: agent_orchestrator
     restart: unless-stopped
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./agents/orchestrator
+          target: /app/agent
+        - action: sync+restart
+          path: ./core
+          target: /app/core
     healthcheck:
       # Verify the agent process is alive and its Redis connection is healthy.
       # All agents run as "python -m agent.main" so match on agent.main, not main.py.
@@ -98,6 +106,11 @@ services:
       dockerfile: docker/bridge.Dockerfile
     container_name: agent_discord_bridge
     restart: unless-stopped
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./agents/discord_bridge
+          target: /app/agent
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null"]
       interval: 30s
@@ -348,6 +361,14 @@ services:
         AGENT_MODULE: optimizer
     container_name: agent_optimizer
     restart: unless-stopped
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./agents/optimizer
+          target: /app/agent
+        - action: sync+restart
+          path: ./core
+          target: /app/core
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
       interval: 30s
