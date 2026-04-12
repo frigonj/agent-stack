@@ -214,6 +214,7 @@ class BaseAgent(ABC):
             self._idle_watchdog_loop(),
             self._classify_loop(),
             self._approval_poll_loop(),
+            self._expiry_review_loop(),
         )
 
     async def stop(self, summary: Optional[str] = None) -> None:
@@ -1279,139 +1280,113 @@ class BaseAgent(ABC):
                     log.warning("memory.classify_loop_error", error=str(exc))
                     await asyncio.sleep(5)
 
-    # ── TTL classification rules ──────────────────────────────────────────────
-    # Maps (topic, tag) patterns to sizes.  Checked in order; first match wins.
-    # Sizes > "short" (24h) require user approval before being committed.
-    _TTL_RULES: list[tuple[set[str], set[str], str]] = [
-        # (topic_keywords, tag_keywords, size)
-        ({"user_correction"}, set(), "permanent"),
-        ({"learned_intent"}, {"seed", "intent"}, "long"),
-        ({"learned_intent"}, set(), "medium"),
-        ({"task_failure"}, set(), "session"),
-        ({"task_success"}, set(), "short"),
-        ({"task_result"}, set(), "short"),
-        ({"architecture"}, set(), "permanent"),
-        ({"research"}, set(), "medium"),
-        ({"bug", "pattern"}, set(), "medium"),
-    ]
-
-    def _classify_ttl_by_rules(self, topic: str, tags: list[str]) -> str:
-        """
-        Assign a TTL size using deterministic rules rather than an LLM call.
-        Returns a TTL_SIZE_NAME string.  Falls back to "short" if no rule matches.
-        """
-        topic_lower = topic.lower()
-        tags_lower = {t.lower() for t in tags}
-        for topic_kws, tag_kws, size in self._TTL_RULES:
-            topic_match = not topic_kws or any(kw in topic_lower for kw in topic_kws)
-            tag_match = not tag_kws or bool(tag_kws & tags_lower)
-            if topic_match and tag_match:
-                return size
-        return "short"  # safe default — everything expires within 24h
-
-    async def _classify_ttl_with_history(
-        self, topic: str, tags: list[str], content: str
-    ) -> str:
-        """
-        Classify TTL size, consulting past approval decisions first.
-
-        If we find similar past decisions with high confidence (≥ 3 votes,
-        approval rate ≥ 75% or ≤ 25%), use that as the size instead of the
-        static rule table.  Falls back to _classify_ttl_by_rules on no history.
-        """
-        try:
-            past = await self.memory.find_similar_approval_decisions(
-                topic, content, limit=10
-            )
-        except Exception:
-            past = []
-
-        if past:
-            # Filter to high-similarity hits (similarity > 0.7 if available)
-            relevant = [r for r in past if r.get("similarity", 0) > 0.7]
-            if len(relevant) >= 3:
-                approved_count = sum(1 for r in relevant if r["approved"])
-                approval_rate = approved_count / len(relevant)
-                # Strong approval signal → use the most common proposed_size
-                if approval_rate >= 0.75:
-                    sizes = [r["proposed_size"] for r in relevant if r["approved"]]
-                    if sizes:
-                        from collections import Counter
-
-                        inferred_size = Counter(sizes).most_common(1)[0][0]
-                        log.info(
-                            "memory.ttl_from_history",
-                            topic=topic,
-                            inferred_size=inferred_size,
-                            approval_rate=round(approval_rate, 2),
-                            sample=len(relevant),
-                        )
-                        return inferred_size
-                # Strong denial signal → always short
-                elif approval_rate <= 0.25:
-                    log.info(
-                        "memory.ttl_denied_by_history",
-                        topic=topic,
-                        approval_rate=round(approval_rate, 2),
-                        sample=len(relevant),
-                    )
-                    return "short"
-
-        return self._classify_ttl_by_rules(topic, tags)
-
     async def _handle_classify_job(self, data: dict) -> None:
         """
-        Assign a TTL size to one knowledge row.
+        Assign a TTL to a new knowledge row.
 
-        - Checks past approval decisions first (learned patterns), then falls
-          back to deterministic rules.
-        - Sizes > short (> 24h) require user approval via Discord.  Instead of
-          blocking, we persist the request to pending_memory_approvals and return
-          immediately.  _approval_poll_loop() finalises the decision asynchronously.
-        - Short-classified rows are committed immediately (no approval needed).
+        All memories start as 'short' (24h) — no approval required on write.
+        The _expiry_review_loop will evaluate each row before it expires and
+        request a user extension if the memory looks worth keeping.
         """
         knowledge_id = int(data[b"id"] if b"id" in data else data["id"])
-        topic = (
-            (data.get(b"topic") or data.get("topic") or b"").decode()
-            if isinstance(data.get(b"topic") or data.get("topic"), bytes)
-            else str(data.get(b"topic") or data.get("topic") or "")
-        )
-        content = (
-            (data.get(b"content") or data.get("content") or b"").decode()
-            if isinstance(data.get(b"content") or data.get("content"), bytes)
-            else str(data.get(b"content") or data.get("content") or "")
-        )
-        tags_raw = data.get(b"tags") or data.get("tags") or b"[]"
-        tags = json.loads(tags_raw if isinstance(tags_raw, str) else tags_raw.decode())
+        await self.memory.set_expiry(knowledge_id, "short")
+        log.info("memory.classified", id=knowledge_id, size="short")
 
-        size = await self._classify_ttl_with_history(topic, tags, content)
+    async def _handle_memory_approval_result(self, event: Event) -> None:
+        """Called when the user clicks ✅/❌ on an extension request in Discord."""
+        approval_id = event.payload.get("approval_id", "")
+        approved = bool(event.payload.get("approved", False))
+        await self._finalise_approval(approval_id, approved)
 
-        _APPROVAL_REQUIRED = {"medium", "long", "permanent"}
-        if size in _APPROVAL_REQUIRED:
-            await self._request_memory_approval(
-                knowledge_id, topic, content, tags, size
-            )
-            # Return without setting expiry — poll loop will finalise once user decides
-            return
-
-        # Short / session: commit immediately, no approval needed
-        await self.memory.set_expiry(knowledge_id, size)
-        log.info("memory.classified", id=knowledge_id, size=size, topic=topic)
-
-    async def _request_memory_approval(
-        self,
-        knowledge_id: int,
-        topic: str,
-        content: str,
-        tags: list[str],
-        proposed_size: str,
-    ) -> None:
+    async def _finalise_approval(self, approval_id: str, approved: bool) -> None:
         """
-        Persist the approval request to Postgres and publish a Discord embed.
-        Returns immediately — finalisation happens in _approval_poll_loop().
-        Deduplicates: if a live pending row already exists for this knowledge_id,
-        no new embed is sent.
+        Apply the user's extension decision.
+        Approved → extend by 7 days.  Denied → let the row expire naturally
+        (don't reset expires_at — it's already near expiry).
         """
+        row = await self.memory.resolve_pending_approval(approval_id, approved)
+        if row is None:
+            return  # already resolved or not found
+
+        knowledge_id = row["knowledge_id"]
+        if approved:
+            await self.memory.set_expiry(knowledge_id, "extend")
+            log.info("memory.extension_granted", id=knowledge_id, topic=row["topic"])
+        else:
+            # Denied: leave expires_at unchanged — row will expire on its own
+            log.info("memory.extension_denied", id=knowledge_id, topic=row["topic"])
+
+        await self.memory.delete_pending_approval(approval_id)
+
+    # ── Expiry review loop ────────────────────────────────────────────────────
+
+    # Topics considered worth asking the user to extend (everything else silently expires)
+    _EXTENSION_WORTHY_TOPICS: frozenset[str] = frozenset(
+        {
+            "architecture",
+            "user_correction",
+            "research",
+            "bug",
+            "pattern",
+            "tool",
+            "knowledge_gap",
+            "finding",
+        }
+    )
+
+    # Topics that are purely operational noise — never ask for extension
+    _EPHEMERAL_TOPICS: frozenset[str] = frozenset(
+        {
+            "learned_intent",
+            "task_failure",
+            "task_success",
+            "task_result",
+            "task_started",
+            "heartbeat",
+        }
+    )
+
+    _EXPIRY_REVIEW_INTERVAL = 1800  # check every 30 minutes
+    _EXPIRY_REVIEW_WINDOW_HOURS = 6  # warn when expiry is within 6 hours
+
+    async def _expiry_review_loop(self) -> None:
+        """
+        Periodically find memories that are about to expire.
+        For each one, decide whether it's worth asking the user to extend it.
+        Ephemeral topics (intent examples, task noise) are silently dropped.
+        Substantive topics get an extension request sent to Discord.
+        """
+        await asyncio.sleep(60)  # stagger startup — let the agent settle first
+        while self._running:
+            try:
+                rows = await self.memory.get_expiring_soon(
+                    within_hours=self._EXPIRY_REVIEW_WINDOW_HOURS
+                )
+                for row in rows:
+                    topic = (row.get("topic") or "").lower()
+                    if any(t in topic for t in self._EPHEMERAL_TOPICS):
+                        continue  # silently let it expire
+                    if any(t in topic for t in self._EXTENSION_WORTHY_TOPICS):
+                        await self._request_extension(row)
+                    # Unknown topics: also let expire silently
+            except Exception as exc:
+                if self._running:
+                    log.warning("memory.expiry_review_error", error=str(exc))
+            await asyncio.sleep(self._EXPIRY_REVIEW_INTERVAL)
+
+    async def _request_extension(self, row: dict) -> None:
+        """
+        Ask the user whether to extend a memory that is about to expire.
+        Deduplicates: if an extension request is already pending for this
+        knowledge_id, no new embed is sent.
+        """
+        knowledge_id = int(row["id"])
+        topic = row.get("topic", "unknown")
+        content = row.get("content", "")
+        tags = row.get("tags") or []
+        if isinstance(tags, str):
+            tags = json.loads(tags)
+
         approval_id = f"mem_approval_{knowledge_id}"
         inserted = await self.memory.insert_pending_approval(
             approval_id=approval_id,
@@ -1420,14 +1395,10 @@ class BaseAgent(ABC):
             topic=topic,
             tags=tags,
             content=content,
-            proposed_size=proposed_size,
+            proposed_size="extend",
         )
         if not inserted:
-            log.debug("memory.approval_already_pending", id=knowledge_id)
-            return  # duplicate — embed already in Discord
-
-        ttl_labels = {"medium": "7 days", "long": "30 days", "permanent": "forever"}
-        label = ttl_labels.get(proposed_size, proposed_size)
+            return  # extension request already in flight
 
         await self.emit(
             EventType.MEMORY_APPROVAL_REQUESTED,
@@ -1437,83 +1408,21 @@ class BaseAgent(ABC):
                 "topic": topic,
                 "content": content[:300],
                 "tags": tags,
-                "proposed_size": proposed_size,
-                "proposed_label": label,
+                "proposed_size": "extend",
+                "proposed_label": "7 more days",
+                "is_extension": True,
             },
             target="broadcast",
         )
-        log.info(
-            "memory.approval_requested",
-            id=knowledge_id,
-            topic=topic,
-            proposed_size=proposed_size,
-        )
+        log.info("memory.extension_requested", id=knowledge_id, topic=topic)
 
-    async def _handle_memory_approval_result(self, event: Event) -> None:
-        """
-        Called when the user clicks ✅/❌ in Discord.
-        Resolves the pending_memory_approvals row, then applies set_expiry
-        and records the decision — all in one place.
-        """
-        approval_id = event.payload.get("approval_id", "")
-        approved = bool(event.payload.get("approved", False))
-        await self._finalise_approval(approval_id, approved)
-
-    async def _finalise_approval(self, approval_id: str, approved: bool) -> None:
-        """
-        Shared path for both user-clicked and timed-out approvals.
-        Marks the DB row, applies set_expiry, records the decision.
-        """
-        row = await self.memory.resolve_pending_approval(approval_id, approved)
-        if row is None:
-            return  # already resolved or not found
-
-        knowledge_id = row["knowledge_id"]
-        topic = row["topic"]
-        tags = row["tags"] if isinstance(row["tags"], list) else json.loads(row["tags"])
-        content = row["content"]
-        proposed_size = row["proposed_size"]
-
-        final_size = proposed_size if approved else "short"
-        if not approved:
-            log.info(
-                "memory.approval_denied",
-                id=knowledge_id,
-                topic=topic,
-                downgraded_to=final_size,
-            )
-
-        await self.memory.set_expiry(knowledge_id, final_size)
-        await self.memory.record_approval_decision(
-            agent=self.role,
-            topic=topic,
-            tags=tags,
-            content=content,
-            proposed_size=proposed_size,
-            approved=approved,
-        )
-        await self.memory.delete_pending_approval(approval_id)
-        log.info(
-            "memory.approval_finalised",
-            id=knowledge_id,
-            approved=approved,
-            size=final_size,
-        )
-
-    # Seconds between poll loop iterations — checks for user decisions and timeouts
-    _APPROVAL_POLL_INTERVAL = 60
+    # Seconds between poll loop iterations — finalises timed-out extension requests
+    _APPROVAL_POLL_INTERVAL = 300  # 5 minutes
 
     async def _approval_poll_loop(self) -> None:
         """
-        Background loop that finalises pending memory approvals.
-
-        Runs every _APPROVAL_POLL_INTERVAL seconds and handles two cases:
-        1. User clicked ✅/❌ → MEMORY_APPROVAL_RESULT event already updated
-           the DB row; _finalise_approval() picks it up via resolve_pending_approval.
-           (Actually handled immediately in _handle_memory_approval_result — this
-            loop is the fallback for process-restart scenarios.)
-        2. 48h window elapsed → get_expired_pending_approvals() deletes the rows
-           and returns them; we treat all as denied (downgrade to short).
+        Cleans up extension requests whose 48h Discord window has passed
+        without a response. Treat no-response as denied (let memory expire).
         """
         while self._running:
             try:
@@ -1521,30 +1430,12 @@ class BaseAgent(ABC):
                 expired = await self.memory.get_expired_pending_approvals()
                 for row in expired:
                     log.info(
-                        "memory.approval_expired",
+                        "memory.extension_request_expired",
                         approval_id=row["approval_id"],
                         id=row["knowledge_id"],
                     )
-                    final_size = "short"
-                    await self.memory.set_expiry(row["knowledge_id"], final_size)
-                    tags = (
-                        row["tags"]
-                        if isinstance(row["tags"], list)
-                        else json.loads(row["tags"])
-                    )
-                    await self.memory.record_approval_decision(
-                        agent=row["agent"],
-                        topic=row["topic"],
-                        tags=tags,
-                        content=row["content"],
-                        proposed_size=row["proposed_size"],
-                        approved=False,
-                    )
-                    log.info(
-                        "memory.approval_timeout_finalised",
-                        id=row["knowledge_id"],
-                        downgraded_to=final_size,
-                    )
+                    # No response = let it expire naturally; just clean up the row
+                    await self.memory.delete_pending_approval(row["approval_id"])
             except Exception as exc:
                 if self._running:
                     log.warning("memory.approval_poll_error", error=str(exc))

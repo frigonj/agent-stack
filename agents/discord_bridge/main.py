@@ -1790,18 +1790,19 @@ class DiscordBridgeClient(discord.Client):
                 await tracking_ch.send(embed=embed)
 
         elif event_type == "task.completed":
-            # Memory approval requests piggyback on task.completed — intercept early
+            # Memory extension requests piggyback on task.completed — intercept early
             if payload.get("memory_approval"):
                 approval_id = payload.get("approval_id", "")
-                topic = payload.get("topic", "")
                 approvals_ch = await self._get_approvals_channel()
                 target_ch = approvals_ch or channel
                 embed = discord.Embed(
-                    title="🧠 Memory Retention Approval",
+                    title="🧠 Extend Memory?",
                     description=payload.get("result", ""),
                     color=discord.Color.blurple(),
                 )
-                embed.set_footer(text="Auto-denies in 48 hours if no response")
+                embed.set_footer(
+                    text="Approve to keep 7 more days · Deny to let it expire · Auto-denies in 48h"
+                )
                 view = MemoryApprovalView(approval_id, self.redis)
                 await target_ch.send(embed=embed, view=view)
                 return

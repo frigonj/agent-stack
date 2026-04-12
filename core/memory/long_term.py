@@ -33,6 +33,7 @@ TTL_SIZES: dict[str, Optional[str]] = {
     "medium": "7 days",
     "long": "30 days",
     "permanent": None,
+    "extend": "7 days",  # granted when user approves an extension request
 }
 
 TTL_SIZE_NAMES = list(TTL_SIZES.keys())  # ordered, for prompts
@@ -846,6 +847,37 @@ class LongTermMemory:
                 LIMIT %s
                 """,
                 (limit,),
+            )
+            rows = await cur.fetchall()
+        return list(rows)
+
+    async def get_expiring_soon(
+        self, within_hours: int = 6, limit: int = 50
+    ) -> list[dict]:
+        """
+        Return knowledge rows expiring within `within_hours` hours that do not
+        already have a live pending approval (extension already in flight).
+        Used by the expiry-review loop to decide whether to request an extension.
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT k.id, k.agent, k.topic, k.content, k.tags, k.expires_at
+                FROM knowledge k
+                WHERE k.expires_at IS NOT NULL
+                  AND k.expires_at > NOW()
+                  AND k.expires_at <= NOW() + (%s * INTERVAL '1 hour')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pending_memory_approvals p
+                      WHERE p.knowledge_id = k.id
+                        AND p.result IS NULL
+                        AND p.expires_at > NOW()
+                  )
+                ORDER BY k.expires_at ASC
+                LIMIT %s
+                """,
+                (within_hours, limit),
             )
             rows = await cur.fetchall()
         return list(rows)

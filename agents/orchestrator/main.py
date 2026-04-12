@@ -1541,24 +1541,33 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 
     async def _handle_memory_approval_request(self, event: Event) -> None:
         """
-        An agent wants to store a memory longer than 24h.
-        Forward to Discord so the user can approve (✅) or deny (❌).
-        The approval_id is embedded in the payload so the discord bridge
-        can emit MEMORY_APPROVAL_RESULT when the user reacts.
+        A memory is about to expire and the agent is requesting an extension.
+        Forward to Discord so the user can approve (keep 7 more days) or deny (let expire).
         """
         approval_id = event.payload.get("approval_id", "")
         topic = event.payload.get("topic", "unknown")
         content = event.payload.get("content", "")[:200]
-        proposed_label = event.payload.get("proposed_label", "?")
+        proposed_label = event.payload.get("proposed_label", "7 more days")
         agent = event.source
+        is_extension = event.payload.get("is_extension", False)
 
-        msg = (
-            f"🧠 **Memory approval needed**\n"
-            f"Agent **{agent}** wants to store a memory for **{proposed_label}**.\n"
-            f"Topic: `{topic}`\n"
-            f"Content: {content}\n\n"
-            f"React ✅ to approve or ❌ to deny (auto-denies in 2 min)."
-        )
+        # Human-readable topic label (strip internal underscores)
+        topic_label = topic.replace("_", " ").title()
+
+        if is_extension:
+            msg = (
+                f"A memory from **{agent}** is expiring soon.\n\n"
+                f"**Topic:** {topic_label}\n"
+                f"**Remembered:** {content}\n\n"
+                f"Keep it for **{proposed_label}**?"
+            )
+        else:
+            msg = (
+                f"**{agent}** saved a memory.\n\n"
+                f"**Topic:** {topic_label}\n"
+                f"**Content:** {content}\n\n"
+                f"Extend retention to **{proposed_label}**?"
+            )
 
         # Reuse TASK_COMPLETED broadcast so the discord bridge picks it up
         # and renders a message with reaction buttons.
