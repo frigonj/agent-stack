@@ -105,7 +105,7 @@ If you develop a reusable extraction or generation pattern, request executor to
 save it as a named script in /workspace/tools/ for future reuse.
 
 ## research agent (delegate via orchestrator)
-The research agent searches the internet via SearXNG (Google + Bing + DDG, no API key):
+The research agent searches the internet via Wikipedia (offline) + Brave Search API:
 - Decomposes questions → multi-query search → fact extraction → cross-source consensus
 - Commits sourced facts to Postgres (table: research_sources)
 Route "what is X", "latest version of Y", "current news/status" queries to research.

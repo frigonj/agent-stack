@@ -553,7 +553,7 @@ Writes, edits, refactors, and fixes code. Delegates: reads→code_search, writes
 - NEVER route "explain what this does" tasks to developer (use code_search)
 
 ### research
-Multi-source internet research via SearXNG (Google+Bing+DDG).
+Multi-source internet research via Wikipedia (offline) + Brave Search API.
 - Use for: "what is X?", "latest version of Y", "current news/status of Z", any web lookup
 - Returns sourced, consensus-checked facts. Zero Claude API calls.
 - NEVER use for codebase questions — that's code_search
@@ -793,7 +793,7 @@ Agents:
 - document_qa  : answer questions from /workspace/docs; review agent-stack architecture at /workspace/src;
                  generate LaTeX documents compiled to PDF (output: /workspace/docs/generated/)
 - code_search  : search /workspace/repos for functions/classes/patterns
-- research     : internet research via SearXNG — "what is X", "latest Y", "current status of Z"
+- research     : internet research (Wikipedia + Brave) — "what is X", "latest Y", "current status of Z"
 - discord      : Discord server management (channels, categories, messages, topics, file uploads from /workspace)
 - optimizer    : run perf tests + get improvement suggestions — "optimise", "benchmark", "what's slow", "perf test"
 
@@ -937,6 +937,7 @@ When context contains "User clarification:" after a proposal was made:
         await self._load_learned_intents()
         await self._seed_intent_examples()
         await self._check_version_reset()
+        await self._recover_pending_clarification()
         # Warn about any plans that were in-flight when the process last exited
         loaded_plans = await self.memory.load_active_plans()
         if loaded_plans:
@@ -1022,12 +1023,12 @@ When context contains "User clarification:" after a proposal was made:
             orig_task, orig_task_id, orig_discord_msg = self._pending_clarification
             # Cancel clears the pending clarification without resuming.
             if task.strip().lower() in ("cancel", "nevermind", "never mind", "stop"):
-                self._pending_clarification = None
+                await self._clear_pending_clarification()
                 await self._publish_reply(
                     "Cancelled.", task_id, discord_message_id, is_chat=True
                 )
                 return
-            self._pending_clarification = None
+            await self._clear_pending_clarification()
             clarification_ctx = f"\n\nUser clarification: {task}"
             log.info(
                 "orchestrator.clarification_answered",
@@ -1042,6 +1043,7 @@ When context contains "User clarification:" after a proposal was made:
                         orig_task_id,
                         discord_message_id=orig_discord_msg or discord_message_id,
                         retry_context=clarification_ctx,
+                        reply_task_id=task_id,
                     )
                 except Exception as exc:
                     log.error("orchestrator.clarification_resume_error", error=str(exc))
@@ -2863,14 +2865,18 @@ When context contains "User clarification:" after a proposal was made:
         discord_message_id: str | None = None,
         retry_context: str = "",
         _plan_attempt: int = 0,
+        reply_task_id: str | None = None,
     ) -> None:
-        """Build an ExecutionPlan and start phase 1."""
+        """Build an ExecutionPlan and start phase 1.
+        reply_task_id: when set, replies (proposals/clarifications) are published
+        under this task_id instead of task_id so the discord bridge can match the
+        pending message that triggered this resume."""
         # Conversation context (resolve follow-ups like "clean it up", "yes proceed")
         conversation_context = ""
         if self._conversation:
             lines = [
                 f"  [{i + 1}] {t[:160]}"
-                for i, (t, _r, _ts) in enumerate(self._conversation)
+                for i, (t, _r, _ts, *_) in enumerate(self._conversation)
             ]
             conversation_context = (
                 "\nRecent conversation (oldest→newest):\n" + "\n".join(lines)
@@ -2919,6 +2925,7 @@ When context contains "User clarification:" after a proposal was made:
                 retry_context,
                 task_id=task_id,
                 discord_message_id=discord_message_id,
+                reply_task_id=reply_task_id,
             )
 
         # Planner asked for clarification — no plan to build
@@ -3037,7 +3044,9 @@ When context contains "User clarification:" after a proposal was made:
         trimmed_conv = ""
         if self._conversation:
             recent = list(self._conversation)[-3:]
-            lines = [f"  [{i + 1}] {t[:160]}" for i, (t, _r, _ts) in enumerate(recent)]
+            lines = [
+                f"  [{i + 1}] {t[:160]}" for i, (t, _r, _ts, *_) in enumerate(recent)
+            ]
             trimmed_conv = "\nRecent conversation (last 3):\n" + "\n".join(lines)
         if (
             self._estimate_tokens([HumanMessage(content=context + trimmed_conv)])
@@ -3075,6 +3084,7 @@ When context contains "User clarification:" after a proposal was made:
         retry_context: str,
         task_id: str = "",
         discord_message_id: str | None = None,
+        reply_task_id: str | None = None,
     ) -> list[PlanStep]:
         """
         Call the LLM to build a structured phased plan.
@@ -3084,9 +3094,15 @@ When context contains "User clarification:" after a proposal was made:
         fitted_context = await self._fit_plan_context(
             task, context, conversation_context, retry_context
         )
+        # When the user has already replied to a proposal, put the clarification
+        # BEFORE the task so the scope-check instruction doesn't fire first.
+        if "User clarification:" in retry_context:
+            human_content = f"{retry_context}\n\nOriginal task: {task}{fitted_context.replace(retry_context, '')}"
+        else:
+            human_content = f"Task: {task}{fitted_context}"
         messages = [
             SystemMessage(content=self._PLAN_PROMPT),
-            HumanMessage(content=f"Task: {task}{fitted_context}"),
+            HumanMessage(content=human_content),
         ]
         try:
             response = await self.llm_invoke(messages)
@@ -3100,13 +3116,26 @@ When context contains "User clarification:" after a proposal was made:
 
             # Planner is proposing a phased breakdown for a project-scale task.
             # Suspend and wait for the user to confirm which phases to run.
-            if "propose" in data and task_id:
+            # If retry_context already carries a user clarification (i.e. the user
+            # already replied to a prior proposal) the planner should have built a
+            # plan — treat a repeated propose as a parse failure and fall through to
+            # the hard fallback so we don't loop indefinitely.
+            if (
+                "propose" in data
+                and task_id
+                and "User clarification:" not in retry_context
+            ):
                 proposal = str(data["propose"])
                 log.info("orchestrator.planner_propose", proposal=proposal[:120])
-                self._pending_clarification = (task, task_id, discord_message_id)
+                # reply_task_id is the new incoming task_id when resuming from
+                # clarification — use it so the bridge can match _pending_messages.
+                _reply_id = reply_task_id or task_id
+                await self._save_pending_clarification(
+                    task, task_id, discord_message_id
+                )
                 await self._publish_reply(
                     f"This looks like a multi-phase project. Here's how I'd break it down:\n\n{proposal}",
-                    task_id,
+                    _reply_id,
                     discord_message_id,
                     original_task=task,
                     is_chat=True,
@@ -3119,9 +3148,12 @@ When context contains "User clarification:" after a proposal was made:
                 question = str(data["clarify"])
                 log.info("orchestrator.planner_clarify", question=question[:100])
                 # Save pending state so _handle_task can resume on the next message.
-                self._pending_clarification = (task, task_id, discord_message_id)
+                _reply_id = reply_task_id or task_id
+                await self._save_pending_clarification(
+                    task, task_id, discord_message_id
+                )
                 await self._publish_reply(
-                    question, task_id, discord_message_id, original_task=task
+                    question, _reply_id, discord_message_id, original_task=task
                 )
                 return []
 
@@ -3506,15 +3538,13 @@ When context contains "User clarification:" after a proposal was made:
                 "Executor produced no command — LLM described the task instead of running it",
             )
 
-        # Hard failure markers — structured executor output formats (safe to match globally)
-        structured_fail_markers = [
-            "Exit code: 1\n",
-            "Exit code: 2\n",
-            "Exit code: 127\n",
-        ]
-        for m in structured_fail_markers:
-            if m in result:
-                return False, m.strip()
+        # Any non-zero exit code is a failure — match "Exit code: <N>" where N != 0.
+        # Using regex so codes like 1, 2, 127, 128, 255 etc. are all caught.
+        _exit_match = re.search(r"Exit code:\s*(-?\d+)", result)
+        if _exit_match:
+            _code = int(_exit_match.group(1))
+            if _code != 0:
+                return False, f"Exit code: {_code}"
 
         # Caught-exception strings returned as results by any agent
         universal_fail_prefixes = [
@@ -3568,69 +3598,6 @@ When context contains "User clarification:" after a proposal was made:
                 )
 
         return True, ""
-
-    # ── Internet fix-research ────────────────────────────────────────────────
-
-    _SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
-
-    async def _research_fix(self, task: str, error: str, max_results: int = 5) -> str:
-        """
-        Query SearXNG directly for solutions to a failed task/error.
-        Returns a compact string of (domain, snippet) pairs ready to inject
-        into a fix step's task description, or "" if search is unavailable.
-        """
-        # Build a concise, search-engine-friendly query from the error
-        # Strip ANSI codes and long tracebacks; keep the last meaningful line
-        clean_error = re.sub(r"\x1b\[[0-9;]*m", "", error)
-        error_lines = [
-            line.strip() for line in clean_error.splitlines() if line.strip()
-        ]
-        # Prefer lines that look like error messages (contain "Error", "error", "failed", etc.)
-        error_hint = next(
-            (
-                line
-                for line in reversed(error_lines)
-                if re.search(r"error|failed|exception|not found|cannot", line, re.I)
-            ),
-            error_lines[-1] if error_lines else error[:120],
-        )
-        query = f"{error_hint[:100]} fix"
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{self._SEARXNG_URL}/search",
-                    params={
-                        "q": query,
-                        "format": "json",
-                        "language": "en",
-                        "safesearch": "0",
-                    },
-                )
-                resp.raise_for_status()
-                results = resp.json().get("results", [])[:max_results]
-        except Exception as exc:
-            log.debug("orchestrator.fix_research_unavailable", error=str(exc))
-            return ""
-
-        if not results:
-            return ""
-
-        lines = []
-        for r in results:
-            domain = urlparse(r.get("url", "")).netloc.lstrip("www.")
-            snippet = r.get("content", r.get("snippet", "")).strip()[:200]
-            if snippet:
-                lines.append(f"  [{domain}] {snippet}")
-
-        if not lines:
-            return ""
-
-        log.info("orchestrator.fix_research_found", query=query[:60], hits=len(lines))
-        return (
-            f"\n\n[Internet search for '{query[:80]}' found these hints:]\n"
-            + "\n".join(lines)
-        )
 
     # ── Phase completion / retry / escalation ────────────────────────────────
 
@@ -3696,18 +3663,15 @@ When context contains "User clarification:" after a proposal was made:
                     elif new_depth <= 6:
                         fix_agent = "claude_code_agent"
                         chain_ctx = "\n".join(f"  - {e}" for e in error_chain[-3:])
-                        web_hints = await self._research_fix(step.task, error_text)
                         fix_task = (
                             f"A previous agent ({step.agent}) failed to complete this task.\n"
                             f"Original task: {step.task}\n\n"
-                            f"Error history (most recent first):\n{chain_ctx}"
-                            f"{web_hints}\n\n"
+                            f"Error history (most recent first):\n{chain_ctx}\n\n"
                             "Please provide a correct solution using your full reasoning capability."
                         )
                     else:
                         fix_agent = step.agent
-                        # Reformulate from scratch via LLM, enriched with web search hints
-                        web_hints = await self._research_fix(step.task, error_text)
+                        # Reformulate from scratch via LLM
                         try:
                             rephrase_messages = [
                                 SystemMessage(
@@ -3724,7 +3688,6 @@ When context contains "User clarification:" after a proposal was made:
                                         + "\n".join(
                                             f"  - {e}" for e in error_chain[-3:]
                                         )
-                                        + web_hints
                                     )
                                 ),
                             ]
@@ -3777,33 +3740,17 @@ When context contains "User clarification:" after a proposal was made:
                     await self._dispatch_phase(plan, next_phase)
                     return
 
-            # All failed steps exhausted their fix budget — do one last web search then escalate
+            # All failed steps exhausted their fix budget — escalate to user
             exhausted = [s for s in failed if s.depth >= max_depth]
             error_lines = "\n".join(
                 f"• [{s.agent}] {s.task[:80]}\n  "
                 f"Final error (depth {s.depth}): {s.result[:200]}"
                 for s in exhausted
             )
-            # Search for each unique error; collect hints for the user
-            web_sections: list[str] = []
-            seen_queries: set[str] = set()
-            for s in exhausted:
-                hints = await self._research_fix(s.task, s.result[:300])
-                # _research_fix returns "" or a string starting with "\n\n[Internet search..."
-                # De-duplicate by query (first 60 chars of the bracketed label)
-                if hints and hints[:80] not in seen_queries:
-                    seen_queries.add(hints[:80])
-                    web_sections.append(hints.strip())
-            web_block = (
-                ("\n\n**Possible fixes found online:**\n" + "\n".join(web_sections))
-                if web_sections
-                else ""
-            )
             reply = (
                 f"❌ Could not complete after {max_depth} fix attempt(s).\n\n"
-                f"Failed steps:\n{error_lines}"
-                f"{web_block}\n\n"
-                "Please review the hints above or provide more specific instructions."
+                f"Failed steps:\n{error_lines}\n\n"
+                "Please review the errors above or provide more specific instructions."
             )
             await self._emit_plan_status(
                 plan, f"❌ Escalating to user — fix depth {max_depth} exhausted"
@@ -3998,15 +3945,11 @@ When context contains "User clarification:" after a proposal was made:
 
     # Extra containers that must be running before an agent can do its work.
     # Keyed by agent role name → list of container names to start first.
-    _AGENT_DEPS = {
-        "research": ["agent_searxng"],
-    }
+    _AGENT_DEPS: dict[str, list[str]] = {}
 
     # Health-check URLs for dependency containers. Polled after `docker start`
     # until a 200 is returned (or the timeout expires).
-    _DEP_HEALTH_URLS: dict[str, str] = {
-        "agent_searxng": f"{_SEARXNG_URL}/",
-    }
+    _DEP_HEALTH_URLS: dict[str, str] = {}
     _DEP_HEALTH_TIMEOUT = 30  # seconds to wait for readiness
     _DEP_HEALTH_INTERVAL = 1.5  # seconds between poll attempts
 
@@ -4039,8 +3982,7 @@ When context contains "User clarification:" after a proposal was made:
         self, agent: str, plan: "ExecutionPlan | None" = None
     ) -> bool:
         """Start an ephemeral agent container if it isn't already running.
-        Also starts any declared dependency containers (e.g. searxng for research)
-        and waits for them to become healthy before returning.
+        Also starts any declared dependency containers and waits for them to become healthy before returning.
         Uses `docker start` — no compose plugin required.
         Returns True on success, False if the container could not be started."""
         if agent not in self._EPHEMERAL_AGENTS:
@@ -4274,6 +4216,57 @@ When context contains "User clarification:" after a proposal was made:
 
     _LAST_TASK_KEY = "orchestrator:last_task"  # Redis key for restart recovery
     _LAST_TASK_TTL = 3600 * 6  # 6 hours — stale after that, retry makes no sense
+    _PENDING_CLARIFICATION_KEY = "orchestrator:pending_clarification"
+    _PENDING_CLARIFICATION_TTL = 3600 * 2  # 2 hours
+
+    async def _save_pending_clarification(
+        self, task: str, task_id: str, discord_message_id: str | None
+    ) -> None:
+        self._pending_clarification = (task, task_id, discord_message_id)
+        try:
+            await self.bus._client.setex(
+                self._PENDING_CLARIFICATION_KEY,
+                self._PENDING_CLARIFICATION_TTL,
+                json.dumps(
+                    {
+                        "task": task,
+                        "task_id": task_id,
+                        "discord_message_id": discord_message_id or "",
+                    }
+                ),
+            )
+        except Exception as exc:
+            log.warning(
+                "orchestrator.pending_clarification_save_failed", error=str(exc)
+            )
+
+    async def _clear_pending_clarification(self) -> None:
+        self._pending_clarification = None
+        try:
+            await self.bus._client.delete(self._PENDING_CLARIFICATION_KEY)
+        except Exception as exc:
+            log.warning(
+                "orchestrator.pending_clarification_clear_failed", error=str(exc)
+            )
+
+    async def _recover_pending_clarification(self) -> None:
+        try:
+            raw = await self.bus._client.get(self._PENDING_CLARIFICATION_KEY)
+            if raw:
+                stored = json.loads(raw)
+                self._pending_clarification = (
+                    stored["task"],
+                    stored["task_id"],
+                    stored.get("discord_message_id") or None,
+                )
+                log.info(
+                    "orchestrator.pending_clarification_recovered",
+                    task=stored["task"][:60],
+                )
+        except Exception as exc:
+            log.warning(
+                "orchestrator.pending_clarification_recover_failed", error=str(exc)
+            )
 
     async def _publish_reply(
         self,

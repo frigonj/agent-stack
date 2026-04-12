@@ -35,7 +35,7 @@ cd "$(dirname "$0")/.."   # always run from repo root
 # Ephemeral agents (executor, research, document_qa, code_search,
 # claude_code_agent, developer) are spun up on demand by the orchestrator
 # and will automatically use the new image on their next spawn.
-ALWAYS_ON="redis postgres searxng orchestrator discord_bridge optimizer"
+ALWAYS_ON="redis postgres orchestrator discord_bridge optimizer"
 
 # Redis streams to flush. Add any new agent streams here if you create one.
 REDIS_STREAMS="agents:broadcast agents:orchestrator agents:document_qa \

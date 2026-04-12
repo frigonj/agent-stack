@@ -513,7 +513,7 @@ The document_qa agent can:
 Route tasks involving documentation, architecture review, or PDF/LaTeX generation to document_qa.
 
 ## research agent (delegate via orchestrator)
-The research agent searches the internet via SearXNG (Google + Bing + DDG, no API key):
+The research agent searches the internet via Wikipedia (offline) + Brave Search API:
 - Decomposes questions → multi-query search → fact extraction → cross-source consensus
 - Commits sourced facts to Postgres (table: research_sources) for future recall
 - Zero Claude API calls — uses local LLM (Qwen) throughout
