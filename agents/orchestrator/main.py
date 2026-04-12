@@ -797,13 +797,31 @@ Agents:
 - discord      : Discord server management (channels, categories, messages, topics, file uploads from /workspace)
 - optimizer    : run perf tests + get improvement suggestions — "optimise", "benchmark", "what's slow", "perf test"
 
-Return ONLY valid JSON, no markdown fences. Two possible responses:
+── Scope check (evaluate FIRST, before building a plan) ──────────────────────
+A task is PROJECT-SCALE if it meets 2 or more of these conditions:
+  • Requires creating a new repository or project from scratch
+  • Integrates 2 or more distinct external APIs or services
+  • Implements non-trivial business logic across multiple components
+  • Would reasonably take a developer more than a few hours to complete
+  • Contains future phases explicitly deferred by the user ("later I will want…")
 
-1. When requirements are clear — execution plan:
+For PROJECT-SCALE tasks, do NOT build an execution plan yet. Instead, return a
+phased breakdown proposal so the user can confirm scope before any work begins:
+{"propose": "**Phase 1 — <title>:** <one-sentence scope>\\n**Phase 2 — <title>:** <one-sentence scope>\\n...\\n\\nReply with the phase number(s) to execute, or 'all' to run everything in order."}
+
+Only propose 2–5 phases. Each phase should be independently deliverable.
+──────────────────────────────────────────────────────────────────────────────
+
+Return ONLY valid JSON, no markdown fences. Three possible responses:
+
+1. When requirements are clear and task is NOT project-scale — execution plan:
 {"steps": [{"phase": 1, "task": "...", "agent": "...", "expected": "..."}, ...]}
 
 2. When requirements are too vague to act on safely — clarification request:
 {"clarify": "Your single focused question here"}
+
+3. When task is project-scale — phased breakdown proposal:
+{"propose": "..."}
 
 Rules for plans:
 - expected = one short phrase describing success (e.g. "exit code 0", "file written", "list returned")
@@ -823,7 +841,12 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
   GOOD: "write updated REDIS_URL to /workspace/src/.env using tee"
 - For multi-file or multi-command tasks, assign each file/command its own step (same phase if independent).
 - code_search steps must name the specific function, class, or pattern to find.
-- research steps must state the exact question to research."""
+- research steps must state the exact question to research.
+
+When context contains "User clarification:" after a proposal was made:
+- The user's reply selects which phase(s) to execute (e.g. "1", "1 and 2", "all").
+- Build an execution plan ONLY for the selected phase(s). Scope each step tightly to
+  that phase's deliverable. Do NOT include work from unselected phases."""
 
     def __init__(self, settings: Settings):
         super().__init__(settings)
@@ -1011,6 +1034,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 original_task=orig_task[:80],
                 answer=task[:80],
             )
+
             async def _resume_with_clarification() -> None:
                 try:
                     await self._run_task(
@@ -1027,6 +1051,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                         orig_discord_msg or discord_message_id,
                         original_task=orig_task,
                     )
+
             asyncio.create_task(_resume_with_clarification())
             return
 
@@ -3072,6 +3097,21 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 if raw.lower().startswith("json"):
                     raw = raw[4:]
             data = json.loads(raw)
+
+            # Planner is proposing a phased breakdown for a project-scale task.
+            # Suspend and wait for the user to confirm which phases to run.
+            if "propose" in data and task_id:
+                proposal = str(data["propose"])
+                log.info("orchestrator.planner_propose", proposal=proposal[:120])
+                self._pending_clarification = (task, task_id, discord_message_id)
+                await self._publish_reply(
+                    f"This looks like a multi-phase project. Here's how I'd break it down:\n\n{proposal}",
+                    task_id,
+                    discord_message_id,
+                    original_task=task,
+                    is_chat=True,
+                )
+                return []
 
             # Planner is asking for clarification — suspend the task and wait
             # for the user's reply before building the plan.
