@@ -43,7 +43,7 @@ from core.brave_quota import record_actual_usage, request_search_approval
 from core.config import Settings
 from core.context import truncate_task
 from core.events.bus import Event, EventType
-from core.wiki import wiki_lookup, wiki_search_titles
+from core.wiki import is_in_wiki, wiki_awareness_context, wiki_lookup, wiki_search_titles
 
 log = structlog.get_logger()
 
@@ -94,7 +94,12 @@ and note the discrepancy so the orchestrator can update memory.
 - code_search: codebase search, grep patterns, understanding local code
 - document_qa: PDF reading, LaTeX generation, architecture review
 Route non-research tasks back via the orchestrator. Do not attempt to run commands.
+
+## Offline Wikipedia knowledge base
+{wiki_context}
 """
+
+SYSTEM_PROMPT = SYSTEM_PROMPT.format(wiki_context=wiki_awareness_context())
 
 # ── Wikipedia helpers ─────────────────────────────────────────────────────────
 
@@ -105,10 +110,18 @@ async def _wiki_search(query: str) -> list[dict]:
     as Brave results so the fact-extraction pipeline can treat them uniformly.
 
     Strategy:
+      0. Bloom pre-check: skip entirely if the title is definitely not in dump
       1. Direct title lookup (exact match after normalisation)
       2. If miss: fuzzy title scan for articles containing all query words,
          then fetch the best match
     """
+    # Bloom pre-check — fast O(1) gate, avoids loading the full index for
+    # queries that are definitely not in the dump (e.g. very recent events,
+    # local topics, proper names not notable enough for Wikipedia).
+    if not is_in_wiki(query):
+        log.debug("wiki.bloom_miss", query=query[:60])
+        return []
+
     # Try exact title lookup first
     result = await wiki_lookup(query)
     if result is None:
@@ -133,7 +146,10 @@ async def _wiki_search(query: str) -> list[dict]:
     hits = [
         {
             "url": result.url,
-            "title": result.title + (f" (via {result.redirect_followed})" if result.redirect_followed else ""),
+            "title": result.title
+            + (
+                f" (via {result.redirect_followed})" if result.redirect_followed else ""
+            ),
             "content": chunk,
             "engine": "wikipedia_offline",
         }

@@ -438,7 +438,9 @@ class BraveSearchApprovalView(discord.ui.View):
             await bus.set_approval(self.approval_id, decision, ex=600)
 
             label = "✅ Approved" if decision == "approved" else "❌ Denied"
-            color = discord.Color.green() if decision == "approved" else discord.Color.red()
+            color = (
+                discord.Color.green() if decision == "approved" else discord.Color.red()
+            )
 
             embed = interaction.message.embeds[0]
             embed.color = color
@@ -2737,14 +2739,14 @@ class DiscordBridgeClient(discord.Client):
 
     async def _post_brave_search_approval(self, payload: dict, channel) -> None:
         """Post a Brave Search quota approval embed."""
-        approval_id      = payload.get("approval_id", "")
-        purpose          = payload.get("purpose", "")
-        queries          = payload.get("queries", [])
-        n_requests       = payload.get("n_requests", len(queries))
-        monthly_used     = payload.get("monthly_used", 0)
-        monthly_cost     = payload.get("monthly_cost_usd", 0.0)
-        projected_total  = payload.get("projected_monthly", monthly_used + n_requests)
-        projected_cost   = payload.get("projected_cost_usd", 0.0)
+        approval_id = payload.get("approval_id", "")
+        purpose = payload.get("purpose", "")
+        queries = payload.get("queries", [])
+        n_requests = payload.get("n_requests", len(queries))
+        monthly_used = payload.get("monthly_used", 0)
+        monthly_cost = payload.get("monthly_cost_usd", 0.0)
+        projected_total = payload.get("projected_monthly", monthly_used + n_requests)
+        projected_cost = payload.get("projected_cost_usd", 0.0)
 
         cost_this_search = round(n_requests / 1000 * 5.0, 4)
 
@@ -2781,7 +2783,9 @@ class DiscordBridgeClient(discord.Client):
             value=f"`{projected_total}` reqs · `${projected_cost:.4f}`",
             inline=True,
         )
-        embed.set_footer(text="No response within 5 minutes = auto-denied (falls back to Wikipedia only)")
+        embed.set_footer(
+            text="No response within 5 minutes = auto-denied (falls back to Wikipedia only)"
+        )
         view = BraveSearchApprovalView(approval_id, self.redis)
         await channel.send(embed=embed, view=view)
 

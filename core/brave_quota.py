@@ -34,6 +34,7 @@ BRAVE_COST_PER_1000 = 5.00  # USD — used for display only
 
 # ── Redis key helpers ─────────────────────────────────────────────────────────
 
+
 def _monthly_key() -> str:
     """Redis key for the current UTC month's request counter."""
     now = datetime.now(timezone.utc)
@@ -48,13 +49,14 @@ def _daily_key() -> str:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+
 async def get_quota_summary(bus, memory) -> dict:
     """
     Return a dict with current month/day usage and estimated cost.
     Safe to call at any time — returns zeros on Redis miss.
     """
     monthly = int(await bus._client.get(_monthly_key()) or 0)
-    daily   = int(await bus._client.get(_daily_key()) or 0)
+    daily = int(await bus._client.get(_daily_key()) or 0)
     return {
         "monthly_requests": monthly,
         "daily_requests": daily,
@@ -130,9 +132,7 @@ async def request_search_approval(
         return False, None
 
     # Write the ledger row
-    ledger_id = await _write_ledger(
-        memory, task_id, n_requests, purpose, queries
-    )
+    ledger_id = await _write_ledger(memory, task_id, n_requests, purpose, queries)
 
     # Increment Redis counters (INCRBY + 30-day TTL to auto-expire old months)
     pipe = bus._client.pipeline()
@@ -168,10 +168,13 @@ async def record_actual_usage(memory, ledger_id: int, actual_reqs: int) -> None:
                 (actual_reqs, ledger_id),
             )
     except Exception as exc:
-        log.warning("brave_quota.record_actual_failed", ledger_id=ledger_id, error=str(exc))
+        log.warning(
+            "brave_quota.record_actual_failed", ledger_id=ledger_id, error=str(exc)
+        )
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
 
 async def _write_ledger(
     memory, task_id: str, approved_reqs: int, purpose: str, queries: list[str]
