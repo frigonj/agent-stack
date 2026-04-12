@@ -1977,7 +1977,9 @@ class LongTermMemory:
                     result.get("tier1_passed", False),
                     json.dumps(result.get("tier1_reasons", [])),
                     result.get("tier2_score"),
-                    json.dumps(result.get("tier2_breakdown")) if result.get("tier2_breakdown") else None,
+                    json.dumps(result.get("tier2_breakdown"))
+                    if result.get("tier2_breakdown")
+                    else None,
                     json.dumps(result.get("tier2_flags", [])),
                     result.get("tier3_score"),
                     result.get("tier3_model"),

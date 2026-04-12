@@ -19,6 +19,7 @@ Usage:
     pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
     asyncio.create_task(pipeline.run(plan, synthesised_reply))
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -69,9 +70,9 @@ class EvalPipeline:
 
         # Derive plan metadata
         steps = plan_dict.get("steps", [])
-        agents_used = list(dict.fromkeys(
-            s.get("agent") for s in steps if s.get("status") == "done"
-        ))
+        agents_used = list(
+            dict.fromkeys(s.get("agent") for s in steps if s.get("status") == "done")
+        )
         plan_retries = sum(s.get("retry_count", 0) for s in steps)
         approval_requested = plan_dict.get("approval_requested", False)
 
@@ -126,7 +127,9 @@ class EvalPipeline:
         content = synthesised_reply
         if t1.artifact_path:
             try:
-                content = Path(t1.artifact_path).read_text(encoding="utf-8", errors="ignore")
+                content = Path(t1.artifact_path).read_text(
+                    encoding="utf-8", errors="ignore"
+                )
             except Exception:
                 pass
 
@@ -177,9 +180,7 @@ class EvalPipeline:
 
         # Write a review file for the pending queue
         if review_status == "pending":
-            await asyncio.to_thread(
-                self._write_review_file, eval_id, record, content
-            )
+            await asyncio.to_thread(self._write_review_file, eval_id, record, content)
             # Emit event for Discord bridge to post to #eval-queue
             await self.bus.publish(
                 "agents:broadcast",

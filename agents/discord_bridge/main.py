@@ -703,7 +703,9 @@ class EvalReviewView(discord.ui.View):
         await interaction.response.send_message(label, ephemeral=True)
         self.stop()
 
-    @discord.ui.button(label="Good output", style=discord.ButtonStyle.success, emoji="👍")
+    @discord.ui.button(
+        label="Good output", style=discord.ButtonStyle.success, emoji="👍"
+    )
     async def approve(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -2338,10 +2340,14 @@ class DiscordBridgeClient(discord.Client):
         approval_requested = payload.get("approval_requested", False)
 
         score_str = f"{final_score:.1f}/10" if final_score is not None else "n/a"
-        t1_str = "✅ Pass" if tier1_passed else f"❌ Fail ({', '.join(tier1_reasons[:2])})"
+        t1_str = (
+            "✅ Pass" if tier1_passed else f"❌ Fail ({', '.join(tier1_reasons[:2])})"
+        )
         color = (
-            discord.Color.green() if (final_score or 0) >= 8
-            else discord.Color.orange() if (final_score or 0) >= 5
+            discord.Color.green()
+            if (final_score or 0) >= 8
+            else discord.Color.orange()
+            if (final_score or 0) >= 5
             else discord.Color.red()
         )
 
@@ -2354,7 +2360,9 @@ class DiscordBridgeClient(discord.Client):
         embed.add_field(name="Score", value=score_str, inline=True)
         embed.add_field(name="Tier 1", value=t1_str, inline=True)
         if tier2_flags:
-            embed.add_field(name="Flags", value=", ".join(tier2_flags[:5]), inline=False)
+            embed.add_field(
+                name="Flags", value=", ".join(tier2_flags[:5]), inline=False
+            )
         if artifact_path:
             embed.add_field(name="Artifact", value=f"`{artifact_path}`", inline=False)
         if approval_requested:
@@ -2363,7 +2371,9 @@ class DiscordBridgeClient(discord.Client):
                 value="Plan requested user approval mid-task",
                 inline=False,
             )
-        embed.set_footer(text="👍 = good output  |  👎 = bad output  |  Optional: reply with feedback")
+        embed.set_footer(
+            text="👍 = good output  |  👎 = bad output  |  Optional: reply with feedback"
+        )
 
         try:
             msg = await ch.send(

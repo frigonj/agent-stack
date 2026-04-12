@@ -82,6 +82,13 @@ engines:
     timeout: 10.0
     disabled: false
 
+  # Qwant: independent EU index, good fallback when Brave/Bing rate-limit
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    timeout: 10.0
+    disabled: false
+
   # Disable engines that return 403s and trigger suspension penalties
   - name: karmasearch
     engine: karmasearch

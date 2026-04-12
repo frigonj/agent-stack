@@ -10,6 +10,7 @@ Usage:
     checker = StructuralChecker()
     passed, reasons, artifact_path = await checker.check(plan, result_text)
 """
+
 from __future__ import annotations
 
 import glob
@@ -41,8 +42,19 @@ TASK_TYPE_MAP: dict[str, str] = {
 # Classify a plan's original_task into a task_type
 _TASK_TYPE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(architecture|arch[\s_-]?doc|architectural)\b", re.I), "arch_doc"),
-    (re.compile(r"\b(research|look up|find out|what are the latest|web search)\b", re.I), "research"),
-    (re.compile(r"\b(find all|where is|what calls|usages of|code search|explain how)\b", re.I), "code_analysis"),
+    (
+        re.compile(
+            r"\b(research|look up|find out|what are the latest|web search)\b", re.I
+        ),
+        "research",
+    ),
+    (
+        re.compile(
+            r"\b(find all|where is|what calls|usages of|code search|explain how)\b",
+            re.I,
+        ),
+        "code_analysis",
+    ),
 ]
 
 
@@ -72,7 +84,9 @@ class StructuralChecker:
         spec_key = TASK_TYPE_MAP.get(task_type, task_type)
         spec_path = _GOLDEN_DIR / spec_key / "expected_structure.json"
         if not spec_path.exists():
-            log.debug("eval.structural.no_spec", task_type=task_type, path=str(spec_path))
+            log.debug(
+                "eval.structural.no_spec", task_type=task_type, path=str(spec_path)
+            )
             return None
         try:
             return json.loads(spec_path.read_text())
@@ -109,11 +123,15 @@ class StructuralChecker:
         if task_type is None:
             task_type = classify_task(original_task)
         if task_type is None:
-            return CheckResult(passed=True, reasons=["no_spec_for_task_type"], task_type=None)
+            return CheckResult(
+                passed=True, reasons=["no_spec_for_task_type"], task_type=None
+            )
 
         spec = self._load_spec(task_type)
         if spec is None:
-            return CheckResult(passed=True, reasons=["no_spec_found"], task_type=task_type)
+            return CheckResult(
+                passed=True, reasons=["no_spec_found"], task_type=task_type
+            )
 
         failures: list[str] = []
         artifact_path: Optional[str] = None
@@ -123,19 +141,25 @@ class StructuralChecker:
         if artifact_spec.get("path_pattern"):
             artifact_path = self._find_artifact(spec)
             if artifact_path is None:
-                failures.append(f"artifact_missing: no file matching {artifact_spec['path_pattern']}")
+                failures.append(
+                    f"artifact_missing: no file matching {artifact_spec['path_pattern']}"
+                )
             else:
                 # Size check
                 min_bytes = artifact_spec.get("min_size_bytes")
                 if min_bytes:
                     size = os.path.getsize(artifact_path)
                     if size < min_bytes:
-                        failures.append(f"artifact_too_small: {size}B < {min_bytes}B minimum")
+                        failures.append(
+                            f"artifact_too_small: {size}B < {min_bytes}B minimum"
+                        )
 
                 # Extension check
                 required_ext = artifact_spec.get("required_extension")
                 if required_ext and not artifact_path.endswith(required_ext):
-                    failures.append(f"artifact_wrong_extension: expected {required_ext}")
+                    failures.append(
+                        f"artifact_wrong_extension: expected {required_ext}"
+                    )
 
         # ── Structural content checks (against artifact or result_text) ───
         structural = spec.get("structural_checks", {})
@@ -144,7 +168,9 @@ class StructuralChecker:
         # Prefer artifact content for file-based checks
         if artifact_path and os.path.exists(artifact_path):
             try:
-                content_to_check = Path(artifact_path).read_text(encoding="utf-8", errors="ignore")
+                content_to_check = Path(artifact_path).read_text(
+                    encoding="utf-8", errors="ignore"
+                )
             except Exception:
                 pass
 
@@ -182,15 +208,21 @@ class StructuralChecker:
             # Min length
             min_len = structural.get("min_response_length_chars")
             if min_len and len(content_to_check) < min_len:
-                failures.append(f"response_too_short: {len(content_to_check)} < {min_len} chars")
+                failures.append(
+                    f"response_too_short: {len(content_to_check)} < {min_len} chars"
+                )
 
             # Min sources
             min_sources = structural.get("min_sources_cited")
             if min_sources:
-                source_patterns = structural.get("source_patterns", ["http://", "https://"])
+                source_patterns = structural.get(
+                    "source_patterns", ["http://", "https://"]
+                )
                 found = sum(1 for p in source_patterns if p in content_to_check)
                 if found < min_sources:
-                    failures.append(f"insufficient_sources: found ~{found}, need {min_sources}")
+                    failures.append(
+                        f"insufficient_sources: found ~{found}, need {min_sources}"
+                    )
 
         # ── PDF existence check ───────────────────────────────────────────
         if structural.get("pdf_must_exist") and artifact_path:

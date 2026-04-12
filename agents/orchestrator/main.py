@@ -976,6 +976,8 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             log.info("orchestrator.agent_joined", agent=event.source)
         elif event.type == EventType.SESSION_RESET:
             await self._handle_session_reset()
+        elif event.type == EventType.ERROR:
+            await self._handle_agent_error(event)
 
     # ── Task intake ──────────────────────────────────────────────────────────
 
@@ -1504,7 +1506,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         feedback = event.payload.get("feedback", "")
 
         if eval_id is None or verdict is None:
-            log.warning("orchestrator.eval_verdict_missing_fields", payload=event.payload)
+            log.warning(
+                "orchestrator.eval_verdict_missing_fields", payload=event.payload
+            )
             return
 
         try:
@@ -3229,6 +3233,69 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
             discord_message_id=discord_message_id,
         )
 
+    async def _handle_agent_error(self, event: Event) -> None:
+        """
+        An agent raised an unhandled exception and emitted EventType.ERROR.
+        Mark the matching plan step as failed so _check_phase_complete can
+        trigger the fix/retry cycle (or escalate to the user).
+        Without this handler the step stays 'running' forever and Discord hangs.
+        """
+        if event.source not in self.SPECIALIST_ROLES:
+            return
+
+        payload = event.payload
+        error_msg = payload.get("error", "unknown error")
+        subtask_id = payload.get("subtask_id", "")
+        parent_task_id = payload.get("parent_task_id", "")
+        discord_message_id = payload.get("discord_message_id") or None
+
+        log.error(
+            "orchestrator.agent_error_received",
+            source=event.source,
+            error=error_msg[:200],
+            subtask_id=subtask_id,
+            parent_task_id=parent_task_id,
+        )
+
+        plan = self._plans.get(parent_task_id) if parent_task_id else None
+        if plan:
+            step = next((s for s in plan.steps if s.step_id == subtask_id), None)
+            if step is None:
+                # Fall back: first running step for this agent
+                step = next(
+                    (
+                        s
+                        for s in plan.steps
+                        if s.status == "running" and s.agent == event.source
+                    ),
+                    None,
+                )
+            if step:
+                step.result = f"Agent error: {error_msg}"
+                step.status = "failed"
+                await self._emit_plan_status(
+                    plan, f"💥 `[{event.source}]` crashed: {error_msg[:120]}"
+                )
+                await self._check_phase_complete(plan)
+            return
+
+        # No active plan — orphan error, surface directly to Discord
+        log.warning(
+            "orchestrator.orphan_agent_error",
+            source=event.source,
+            error=error_msg[:200],
+        )
+        task_id = payload.get("task_id", event.task_id)
+        if not discord_message_id and parent_task_id:
+            ctx_meta = await self.bus.get_context_metadata(parent_task_id)
+            if ctx_meta:
+                discord_message_id = ctx_meta.get("discord_message_id") or None
+        await self._publish_reply(
+            f"⚠️ Agent `{event.source}` encountered an error: {error_msg}",
+            task_id,
+            discord_message_id,
+        )
+
     async def _handle_discord_done(self, event: Event) -> None:
         payload = event.payload
         task_id = payload.get("task_id")
@@ -3320,6 +3387,17 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
         for m in structured_fail_markers:
             if m in result:
                 return False, m.strip()
+
+        # Caught-exception strings returned as results by any agent
+        universal_fail_prefixes = [
+            "Research failed:",
+            "Agent error:",
+            "fetch failed:",
+            "Tool error:",
+        ]
+        for prefix in universal_fail_prefixes:
+            if result.startswith(prefix):
+                return False, result[:120]
 
         # Prose-style markers — only meaningful when the executor itself produced the result;
         # these phrases appear naturally in code being analysed by other agents (e.g. code_search).
@@ -3647,7 +3725,9 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
                 self._plans.pop(plan.task_id, None)
                 # Collect all step results for the eval pipeline
                 _eval_content = "\n\n".join(r for _, r in all_results if r)
-                await self._close_task_context(plan, success=True, synthesised_reply=_eval_content)
+                await self._close_task_context(
+                    plan, success=True, synthesised_reply=_eval_content
+                )
                 await self.memory.upsert_plan(
                     plan.task_id,
                     plan.plan_id,

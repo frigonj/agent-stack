@@ -14,6 +14,7 @@ Usage:
     if needs_tier3(score):
         score3, model = await judge.score_tier3(task_type, content)
 """
+
 from __future__ import annotations
 
 import json
@@ -88,6 +89,7 @@ def _parse_judge_response(raw: str, rubric: dict) -> tuple[float, dict, list[str
     except json.JSONDecodeError:
         # Try to extract JSON object from the text
         import re
+
         m = re.search(r"\{.*\}", clean, re.DOTALL)
         if m:
             try:
@@ -102,9 +104,7 @@ def _parse_judge_response(raw: str, rubric: dict) -> tuple[float, dict, list[str
     overall = float(data.get("overall", 0))
     if overall == 0 and scores:
         criteria = {c["id"]: c["weight"] for c in rubric.get("criteria", [])}
-        overall = sum(
-            float(scores.get(cid, 0)) * w for cid, w in criteria.items()
-        )
+        overall = sum(float(scores.get(cid, 0)) * w for cid, w in criteria.items())
 
     # Clamp to [0, 10]
     overall = max(0.0, min(10.0, overall))
@@ -173,9 +173,7 @@ class LLMJudge:
         log.info("eval.llm_judge.tier2", task_type=task_type, score=score, flags=flags)
         return score, breakdown, flags
 
-    async def score_tier3(
-        self, task_type: str, content: str
-    ) -> tuple[float, str]:
+    async def score_tier3(self, task_type: str, content: str) -> tuple[float, str]:
         """
         Call Gemini Flash to score the output.
         Returns (score 0-10, model_name).
@@ -210,5 +208,10 @@ class LLMJudge:
             return 0.0, "gemini_unavailable"
 
         score, _, _ = _parse_judge_response(raw, rubric)
-        log.info("eval.llm_judge.tier3", task_type=task_type, score=score, model=_GEMINI_MODEL)
+        log.info(
+            "eval.llm_judge.tier3",
+            task_type=task_type,
+            score=score,
+            model=_GEMINI_MODEL,
+        )
         return score, _GEMINI_MODEL

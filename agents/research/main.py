@@ -50,7 +50,7 @@ CONFIDENCE_COMMIT_THRESHOLD = 0.75  # facts above this go to Postgres
 # fall through to the next set so we always get something back.
 _SEARCH_ENGINE_SETS = [
     "bing,duckduckgo,brave",  # primary: Google disabled (HTML parser broken)
-    "wikipedia,brave,mojeek",  # fallback: bot-detection-resistant
+    "wikipedia,mojeek,qwant",  # fallback: no Brave overlap, bot-detection-resistant
 ]
 
 SYSTEM_PROMPT = """You are a research specialist in a multi-agent AI stack. You receive \

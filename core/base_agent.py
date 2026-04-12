@@ -1760,6 +1760,15 @@ class BaseAgent(ABC):
                 "error": str(exc),
                 "triggering_event_id": triggering_event.event_id,
                 "triggering_event_type": triggering_event.type,
+                # Propagate routing keys so the orchestrator can locate the plan step
+                "task_id": triggering_event.payload.get(
+                    "task_id", triggering_event.task_id
+                ),
+                "subtask_id": triggering_event.payload.get("subtask_id", ""),
+                "parent_task_id": triggering_event.payload.get("parent_task_id", ""),
+                "discord_message_id": triggering_event.payload.get(
+                    "discord_message_id", ""
+                ),
             },
         )
 
