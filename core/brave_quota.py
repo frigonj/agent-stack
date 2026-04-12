@@ -120,7 +120,7 @@ async def request_search_approval(
                 "projected_cost_usd": projected_cost,
             },
         ),
-        target="discord_bridge",
+        target="broadcast",
     )
 
     # Block until the user decides (5-minute window)
