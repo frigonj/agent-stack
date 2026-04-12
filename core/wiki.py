@@ -170,7 +170,7 @@ def _find_dump_and_index() -> tuple[Path, Path]:
             and "index" not in name
         ):
             dump = p
-        elif "pages-articles-multistream-index" in name and name.endswith(".bz2"):
+        elif "pages-articles-multistream-index" in name and (name.endswith(".bz2") or name.endswith(".txt")):
             index = p
     if not dump:
         raise FileNotFoundError(f"No Wikipedia dump found in {WIKI_DIR}")
@@ -186,7 +186,8 @@ def _load_index_sync() -> None:
     log.info("wiki.index_loading", path=str(index_path))
 
     entries: list[_IndexEntry] = []
-    with bz2.open(index_path, "rt", encoding="utf-8") as fh:
+    opener = bz2.open if index_path.name.endswith(".bz2") else open
+    with opener(index_path, "rt", encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip("\n")
             # format: offset:page_id:title  (title may contain colons)

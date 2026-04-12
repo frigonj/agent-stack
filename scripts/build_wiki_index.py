@@ -18,6 +18,13 @@ Run once after placing the dump files in /workspace/wiki/:
 
 Both output files are checked into /workspace/wiki/ and loaded lazily by
 core/wiki.py on first use.
+
+IMPORTANT — do NOT extract the .bz2 files.
+Python reads them compressed via the bz2 module. Keep the files exactly as
+downloaded. On Windows, do not use Windows Explorer to "extract" them — it
+cannot handle .bz2 and will error. If you ever need to inspect the contents
+manually, use 7-Zip (https://7-zip.org), but the stack itself never needs
+an extracted copy.
 """
 
 from __future__ import annotations
@@ -147,14 +154,17 @@ def _classify_title(title: str) -> str | None:
 
 def _find_index() -> Path:
     for p in WIKI_DIR.iterdir():
-        if "pages-articles-multistream-index" in p.name and p.name.endswith(".bz2"):
+        if "pages-articles-multistream-index" in p.name and (
+            p.name.endswith(".bz2") or p.name.endswith(".txt")
+        ):
             return p
     raise FileNotFoundError(f"No index file found in {WIKI_DIR}")
 
 
 def build(dry_run: bool = False) -> None:
     index_path = _find_index()
-    print(f"Index: {index_path} ({index_path.stat().st_size / 1e6:.0f} MB compressed)")
+    compressed = index_path.name.endswith(".bz2")
+    print(f"Index: {index_path} ({index_path.stat().st_size / 1e6:.0f} MB{'  compressed' if compressed else '  plain text'})")
 
     m = _bloom_size(BLOOM_N, BLOOM_FP)
     print(f"Bloom: m={m:,} bits ({m // 8 / 1e6:.1f} MB), k={BLOOM_K}")
@@ -165,8 +175,9 @@ def build(dry_run: bool = False) -> None:
     skipped = 0
     t0 = time.time()
 
+    opener = bz2.open if compressed else open
     print("Reading index…")
-    with bz2.open(index_path, "rt", encoding="utf-8") as fh:
+    with opener(index_path, "rt", encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip("\n")
             parts = line.split(":", 2)
