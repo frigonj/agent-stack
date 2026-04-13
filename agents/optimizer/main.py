@@ -269,6 +269,16 @@ class OptimizerAgent(BaseAgent):
     think_interval: int = _THINK_INTERVAL
     idle_timeout: int = 0  # always-on
 
+    # ── Watchdog config ───────────────────────────────────────────────────────
+    # How long a plan step can be "running" before we emit STALE_PLAN (seconds).
+    _STALE_STEP_TIMEOUT_S: int = int(os.getenv("STALE_STEP_TIMEOUT", "300"))  # 5 min
+    # How often the stale-plan and container-health watchdogs run (seconds).
+    _WATCHDOG_INTERVAL_S: int = 60
+    # LLM lock key and heartbeat key (mirrors base_agent constants).
+    _LLM_LOCK_KEY = "llm:lock"
+    _LLM_LOCK_HEARTBEAT_KEY = "llm:lock:heartbeat"
+    _LLM_LOCK_HEARTBEAT_TTL = 15
+
     def __init__(self, settings: Settings):
         super().__init__(settings)
         self._prior_run: Optional[dict] = None
@@ -295,7 +305,12 @@ class OptimizerAgent(BaseAgent):
         except Exception as exc:
             log.warning("optimizer.restore_failed", error=str(exc))
 
-        # Run an initial pass shortly after startup (5 s delay so infra is ready)
+        # Launch watchdog loops
+        asyncio.create_task(self._stale_plan_watchdog_loop())
+        asyncio.create_task(self._container_health_watchdog_loop())
+        asyncio.create_task(self._llm_lock_watchdog_loop())
+
+        # Run an initial perf pass shortly after startup (5 s delay so infra is ready)
         asyncio.get_event_loop().call_later(
             5, lambda: asyncio.create_task(self._run_and_analyse())
         )
@@ -327,6 +342,181 @@ class OptimizerAgent(BaseAgent):
         # Named event type for direct optimizer requests
         if event.type.value == "optimize.request":
             await self._handle_optimize_request(event, payload)
+
+    # ── Watchdog loops ────────────────────────────────────────────────────────
+
+    async def _stale_plan_watchdog_loop(self) -> None:
+        """
+        Every _WATCHDOG_INTERVAL_S seconds, query active_plans for any plan
+        whose updated_at is older than _STALE_STEP_TIMEOUT_S and whose status
+        is still 'running'.  Emit STALE_PLAN to the orchestrator for each one
+        so it can reset and re-dispatch the stuck steps.
+        """
+        while self._running:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=float(self._WATCHDOG_INTERVAL_S)
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            try:
+                pool = await self.memory._get_pool()
+                async with pool.connection() as conn:
+                    cur = await conn.execute(
+                        """
+                        SELECT task_id, plan_id, original_task, plan_json
+                        FROM active_plans
+                        WHERE status = 'running'
+                          AND updated_at < NOW() - INTERVAL '%s seconds'
+                        """,
+                        (self._STALE_STEP_TIMEOUT_S,),
+                    )
+                    rows = await cur.fetchall()
+
+                for row in rows:
+                    task_id, plan_id, original_task, plan_json = row
+                    if isinstance(plan_json, str):
+                        plan_json = json.loads(plan_json)
+
+                    # Find which step_ids are "running"
+                    stale_steps = [
+                        s["step_id"]
+                        for s in plan_json.get("steps", [])
+                        if s.get("status") == "running"
+                    ]
+                    if not stale_steps:
+                        continue
+
+                    log.warning(
+                        "optimizer.stale_plan_detected",
+                        task_id=task_id,
+                        stale_steps=stale_steps,
+                        task_preview=str(original_task)[:60],
+                    )
+                    await self.bus.publish(
+                        Event(
+                            type=EventType.STALE_PLAN,
+                            source=self.role,
+                            payload={
+                                "task_id": task_id,
+                                "plan_id": plan_id,
+                                "stale_step_ids": stale_steps,
+                            },
+                        ),
+                        target="orchestrator",
+                    )
+            except Exception as exc:
+                log.warning("optimizer.stale_watchdog_error", error=str(exc))
+
+    async def _container_health_watchdog_loop(self) -> None:
+        """
+        Every _WATCHDOG_INTERVAL_S seconds, check agent container health via
+        docker inspect.  Any container marked 'unhealthy' that has a restart
+        policy of 'always' or 'unless-stopped' is restarted automatically.
+        Ephemeral containers (restart: no) are reported but not force-restarted
+        — the orchestrator manages their lifecycle.
+        """
+        # Containers managed by the orchestrator (ephemeral — don't auto-restart)
+        _EPHEMERAL = {
+            "agent_executor",
+            "agent_developer",
+            "agent_code_search",
+            "agent_document_qa",
+            "agent_research",
+            "agent_claude_code",
+        }
+        # Always-on containers we should restart if unhealthy
+        _ALWAYS_ON = {"agent_orchestrator", "agent_discord_bridge", "agent_optimizer"}
+
+        while self._running:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=float(self._WATCHDOG_INTERVAL_S)
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    "name=agent_",
+                    "--format",
+                    "{{.Names}}\t{{.Status}}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+                lines = stdout.decode().strip().splitlines()
+
+                for line in lines:
+                    parts = line.split("\t", 1)
+                    if len(parts) != 2:
+                        continue
+                    name, status = parts[0].strip(), parts[1].strip()
+                    if "(unhealthy)" not in status:
+                        continue
+                    if name in _ALWAYS_ON:
+                        log.warning(
+                            "optimizer.unhealthy_container_restart",
+                            container=name,
+                            status=status,
+                        )
+                        await asyncio.create_subprocess_exec(
+                            "docker",
+                            "restart",
+                            name,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                    elif name in _EPHEMERAL:
+                        log.info(
+                            "optimizer.unhealthy_ephemeral_skipped",
+                            container=name,
+                            status=status,
+                        )
+            except Exception as exc:
+                log.warning("optimizer.container_health_error", error=str(exc))
+
+    async def _llm_lock_watchdog_loop(self) -> None:
+        """
+        Central LLM lock stale-lock watchdog.  Runs in the optimizer so a
+        single process owns this responsibility rather than every agent.
+        Clears the lock if the heartbeat has expired (holder crashed).
+        """
+        check_interval = float(self._LLM_LOCK_HEARTBEAT_TTL)
+        while self._running:
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=check_interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            try:
+                lock_val = await self.bus._client.get(self._LLM_LOCK_KEY)
+                if lock_val is None:
+                    continue
+                heartbeat = await self.bus._client.get(self._LLM_LOCK_HEARTBEAT_KEY)
+                if heartbeat is None:
+                    log.warning(
+                        "optimizer.llm_lock_stale",
+                        holder=lock_val,
+                        action="force_expiring",
+                    )
+                    await self.bus._client.delete(self._LLM_LOCK_KEY)
+                    await self.bus._client.publish(
+                        f"{self._LLM_LOCK_KEY}:released", "released"
+                    )
+            except Exception as exc:
+                log.debug("optimizer.llm_lock_watchdog_error", error=str(exc))
 
     async def _handle_optimize_request(self, event: Event, payload: dict) -> None:
         task_id = payload.get("task_id", str(uuid.uuid4()))

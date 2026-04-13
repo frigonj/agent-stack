@@ -671,6 +671,7 @@ class PlanStep:
     result: str = ""
     depth: int = 0  # fix-attempt depth (0 = original, 1–10 = fix subtask)
     error_chain: list = field(default_factory=list)  # errors from prior fix attempts
+    dispatched_at: float = 0.0  # monotonic timestamp when step entered "running"
 
 
 @dataclass
@@ -870,6 +871,9 @@ When context contains "User clarification:" after a proposal was made:
         # Pending planner clarification: set when planner asks user a question,
         # cleared when the user replies.  Tuple of (task, task_id, discord_message_id).
         self._pending_clarification: tuple[str, str, str | None] | None = None
+        # task_id → discord_channel_id; lets _publish_reply route replies to the
+        # right channel even if the bridge restarted and lost _pending_messages.
+        self._task_channel_ids: dict[str, str] = {}
         # Passive eval pipeline — initialised lazily after memory/bus are ready
         self._eval_pipeline: EvalPipeline | None = None
 
@@ -929,6 +933,7 @@ When context contains "User clarification:" after a proposal was made:
     async def on_startup(self) -> None:
         log.info("orchestrator.startup")
         self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
+        asyncio.create_task(self._step_timeout_watchdog_loop())
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -938,10 +943,14 @@ When context contains "User clarification:" after a proposal was made:
         await self._seed_intent_examples()
         await self._check_version_reset()
         await self._recover_pending_clarification()
-        # Warn about any plans that were in-flight when the process last exited
+        # Recover any plans that were in-flight when the process last exited
         loaded_plans = await self.memory.load_active_plans()
         if loaded_plans:
-            interrupted = [r for r in loaded_plans if r["status"] != "paused"]
+            interrupted = [
+                r
+                for r in loaded_plans
+                if r["status"] not in ("paused", "completed", "failed", "expired")
+            ]
             paused = [r for r in loaded_plans if r["status"] == "paused"]
             if interrupted:
                 log.warning(
@@ -950,19 +959,82 @@ When context contains "User clarification:" after a proposal was made:
                     tasks=[r["original_task"][:60] for r in interrupted],
                 )
                 for row in interrupted:
-                    await self.memory.upsert_plan(
-                        row["task_id"],
-                        row["plan_id"],
-                        row["original_task"],
-                        "interrupted",
-                        row["plan_json"],
-                    )
+                    recovered = await self._recover_plan_from_stream(row)
+                    if recovered:
+                        self._plans[row["task_id"]] = recovered
+                        current_phase = recovered.current_phase()
+                        pending = [s for s in recovered.steps if s.status == "pending"]
+                        log.info(
+                            "orchestrator.plan_recovered",
+                            task_id=row["task_id"],
+                            phase=current_phase,
+                            pending_steps=len(pending),
+                        )
+                        await self._emit_plan_status(
+                            recovered,
+                            f"♻️ Recovered after restart — re-dispatching phase {current_phase} ({len(pending)} step(s))",
+                        )
+                        await self._dispatch_phase(recovered, current_phase)
+                    else:
+                        await self.memory.upsert_plan(
+                            row["task_id"],
+                            row["plan_id"],
+                            row["original_task"],
+                            "interrupted",
+                            row["plan_json"],
+                        )
             if paused:
                 log.info(
                     "orchestrator.paused_plans_found",
                     count=len(paused),
                     tasks=[r["original_task"][:60] for r in paused],
                 )
+
+    # ── Step timeout watchdog ────────────────────────────────────────────────
+
+    # Steps running longer than this are considered stale and reset to pending.
+    _STEP_TIMEOUT_S: int = 600  # 10 minutes
+
+    async def _step_timeout_watchdog_loop(self) -> None:
+        """
+        Background loop that checks every 60 s for plan steps that have been
+        in "running" state for longer than _STEP_TIMEOUT_S.  Stale steps are
+        reset to "pending" and the phase is re-dispatched so the plan can
+        self-heal without user intervention.
+        """
+        while self._running:
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=60.0)
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            now = time.time()
+            for task_id, plan in list(self._plans.items()):
+                stale = [
+                    s
+                    for s in plan.steps
+                    if s.status == "running"
+                    and hasattr(s, "dispatched_at")
+                    and (now - s.dispatched_at) > self._STEP_TIMEOUT_S
+                ]
+                if not stale:
+                    continue
+                log.warning(
+                    "orchestrator.step_timeout",
+                    task_id=task_id,
+                    stale_steps=[s.step_id for s in stale],
+                    timeout_s=self._STEP_TIMEOUT_S,
+                )
+                for s in stale:
+                    s.status = "pending"
+                current_phase = plan.current_phase()
+                await self._emit_plan_status(
+                    plan,
+                    f"⏱️ Timeout: {len(stale)} step(s) reset — re-dispatching phase {current_phase}",
+                )
+                await self._dispatch_phase(plan, current_phase)
 
     # ── Event dispatch ───────────────────────────────────────────────────────
 
@@ -1005,6 +1077,8 @@ When context contains "User clarification:" after a proposal was made:
             await self._handle_session_reset()
         elif event.type == EventType.ERROR:
             await self._handle_agent_error(event)
+        elif event.type == EventType.STALE_PLAN:
+            await self._handle_stale_plan(event)
 
     # ── Task intake ──────────────────────────────────────────────────────────
 
@@ -1012,9 +1086,12 @@ When context contains "User clarification:" after a proposal was made:
         task = truncate_task(event.payload.get("task", ""))
         task_id = event.task_id
         discord_message_id = event.payload.get("discord_message_id")
+        discord_channel_id = event.payload.get("discord_channel_id") or None
         # session_id may be provided by the discord bridge after local classification
         hint_session_id = event.payload.get("session_id")
         log.info("orchestrator.task_received", task=task[:80], task_id=task_id)
+        if discord_channel_id:
+            self._task_channel_ids[task_id] = discord_channel_id
 
         # If the planner asked for clarification on a previous task, treat the
         # next incoming message as the user's answer and resume that task with
@@ -3205,6 +3282,156 @@ When context contains "User clarification:" after a proposal was made:
             )
         return steps
 
+    # ── Crash recovery ───────────────────────────────────────────────────────
+
+    async def _recover_plan_from_stream(self, row: dict) -> "ExecutionPlan | None":
+        """
+        Reconstruct an ExecutionPlan from the last DB snapshot + broadcast stream.
+
+        Strategy:
+          1. Rebuild the plan from plan_json (step statuses as of last upsert_plan call).
+          2. Scan agents:broadcast forward from the plan's created_at timestamp for
+             task.completed events with matching parent_task_id.
+          3. Apply any completions found — steps that finished after the last DB write
+             are now correctly marked done/failed.
+          4. Reset any remaining "running" steps back to "pending" so they get re-dispatched.
+
+        Returns None if the plan has no pending/running steps (already fully resolved).
+        """
+        plan_json = row.get("plan_json", {})
+        if isinstance(plan_json, str):
+            plan_json = json.loads(plan_json)
+
+        task_id = row["task_id"]
+        plan_id = row.get("plan_id", str(uuid.uuid4()))
+        original_task = row.get("original_task", "")
+
+        raw_steps = plan_json.get("steps", [])
+        if not raw_steps:
+            return None
+
+        steps = [
+            PlanStep(
+                step_id=s["step_id"],
+                phase=s.get("phase", 1),
+                agent=s.get("agent", "executor"),
+                task=s.get("task", ""),
+                expected=s.get("expected", ""),
+                status=s.get("status", "pending"),
+                result=s.get("result", ""),
+            )
+            for s in raw_steps
+        ]
+
+        # Scan broadcast stream for task.completed events belonging to this plan
+        try:
+            broadcast_key = self.bus._stream_key("broadcast")
+            # Use plan created_at as stream cursor if available (ISO string → Redis ms ID)
+            created_at_str = plan_json.get("created_at", "")
+            start_id = "0-0"
+            if created_at_str:
+                try:
+                    ts = datetime.fromisoformat(created_at_str).timestamp()
+                    start_id = f"{int(ts * 1000)}-0"
+                except Exception:
+                    pass
+
+            # Read up to 2000 events from that point — enough for any real plan
+            entries = await self.bus._client.xrange(
+                broadcast_key, min=start_id, count=2000
+            )
+            for _entry_id, fields in entries:
+                try:
+                    ev = Event.from_redis(fields)
+                except Exception:
+                    continue
+                if ev.type != EventType.TASK_COMPLETED:
+                    continue
+                if ev.payload.get("parent_task_id") != task_id:
+                    continue
+                subtask_id = ev.payload.get("subtask_id")
+                result = ev.payload.get("result", "")
+                step = next((s for s in steps if s.step_id == subtask_id), None)
+                if step and step.status not in ("done", "failed"):
+                    passed, _ = self._validate_result(
+                        step.expected, result, source=ev.source
+                    )
+                    step.result = result
+                    step.status = "done" if passed else "failed"
+                    log.debug(
+                        "orchestrator.recovery_step_applied",
+                        step_id=subtask_id,
+                        status=step.status,
+                    )
+        except Exception as exc:
+            log.warning("orchestrator.recovery_stream_scan_failed", error=str(exc))
+
+        # Any step still "running" was mid-flight at crash — reset to pending
+        for s in steps:
+            if s.status == "running":
+                s.status = "pending"
+                log.debug(
+                    "orchestrator.recovery_step_reset", step_id=s.step_id, agent=s.agent
+                )
+
+        # If nothing left to do, don't restore the plan
+        actionable = [s for s in steps if s.status == "pending"]
+        if not actionable:
+            log.info("orchestrator.recovery_plan_already_complete", task_id=task_id)
+            return None
+
+        plan = ExecutionPlan(
+            plan_id=plan_id,
+            task_id=task_id,
+            original_task=original_task,
+            steps=steps,
+            discord_message_id=plan_json.get("discord_message_id"),
+            context=plan_json.get("context", ""),
+        )
+        await self.memory.upsert_plan(
+            task_id, plan_id, original_task, "running", plan.to_dict()
+        )
+        return plan
+
+    async def _handle_stale_plan(self, event: Event) -> None:
+        """
+        Triggered by the optimizer watchdog when a plan step has been running
+        too long with no result.  Re-run stream reconciliation inline and
+        re-dispatch any steps that need it.
+        """
+        task_id = event.payload.get("task_id")
+        if not task_id:
+            return
+
+        plan = self._plans.get(task_id)
+        if not plan:
+            log.warning("orchestrator.stale_plan_unknown", task_id=task_id)
+            return
+
+        stale_step_ids = event.payload.get("stale_step_ids", [])
+        log.warning(
+            "orchestrator.stale_plan_received",
+            task_id=task_id,
+            stale_steps=stale_step_ids,
+        )
+
+        # Reset stale running steps back to pending
+        reset = 0
+        for s in plan.steps:
+            if s.status == "running" and (
+                not stale_step_ids or s.step_id in stale_step_ids
+            ):
+                s.status = "pending"
+                reset += 1
+
+        if reset:
+            current_phase = plan.current_phase()
+            await self._emit_plan_status(
+                plan,
+                f"⏱️ Watchdog: {reset} stale step(s) reset — re-dispatching phase {current_phase}",
+            )
+            await self._dispatch_phase(plan, current_phase)
+
     # ── Phase dispatch ───────────────────────────────────────────────────────
 
     async def _dispatch_phase(self, plan: ExecutionPlan, phase: int) -> None:
@@ -3242,6 +3469,7 @@ When context contains "User clarification:" after a proposal was made:
             if step.status == "failed":
                 continue  # already marked failed during pre-warm
             step.status = "running"
+            step.dispatched_at = time.monotonic()
 
             if step.agent == "discord":
                 n = await self._execute_discord_subtask(step.task, plan.task_id)
@@ -4329,10 +4557,17 @@ When context contains "User clarification:" after a proposal was made:
         discord_message_id: str | None = None,
         original_task: str = "",
         is_chat: bool = False,
+        discord_channel_id: str | None = None,
     ) -> None:
+        # Fall back to the stored channel for this task if not explicitly provided
+        resolved_channel_id = discord_channel_id or self._task_channel_ids.pop(
+            task_id, None
+        )
         payload = {"result": result, "task_id": task_id}
         if discord_message_id:
             payload["discord_message_id"] = discord_message_id
+        if resolved_channel_id:
+            payload["discord_channel_id"] = resolved_channel_id
         if is_chat:
             payload["is_chat"] = True
         await self.emit(EventType.TASK_COMPLETED, payload=payload, target="broadcast")

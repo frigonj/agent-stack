@@ -198,6 +198,7 @@ class EventType(str, Enum):
     # System
     HEARTBEAT = "system.heartbeat"
     ERROR = "system.error"
+    STALE_PLAN = "system.stale_plan"  # optimizer → orchestrator: a plan step has been running too long
 
 
 @dataclass

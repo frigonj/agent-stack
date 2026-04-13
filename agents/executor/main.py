@@ -672,6 +672,131 @@ class ExecutorAgent(BaseAgent):
                 commands=sorted(self._runtime_allowlist),
             )
 
+    async def _drain_stale_pel(self) -> None:
+        """
+        Override base class behaviour: instead of ACKing and dropping PEL entries,
+        replay any task.assigned messages that were mid-flight when the executor
+        last crashed.  This gives the orchestrator a TASK_COMPLETED rather than
+        a silent hang.
+
+        Non-task.assigned PEL entries (broadcast events etc.) are ACKed and dropped
+        as normal — only work items are worth replaying.
+        """
+        key = self.bus._stream_key(self.role)
+        try:
+            result = await self.bus._client.xautoclaim(
+                key,
+                self.group_name,
+                self.consumer_name,
+                min_idle_time=0,
+                start_id="0-0",
+            )
+            claimed = result[1] if result and len(result) > 1 else []
+            if not claimed:
+                return
+
+            replay, drop = [], []
+            for entry in claimed:
+                if not entry:
+                    continue
+                entry_id, fields = entry[0], entry[1]
+                try:
+                    ev = Event.from_redis(fields)
+                    if (
+                        ev.type == EventType.TASK_ASSIGNED
+                        and ev.payload.get("assigned_to") == "executor"
+                    ):
+                        replay.append((entry_id, ev))
+                    else:
+                        drop.append(entry_id)
+                except Exception:
+                    drop.append(entry_id)
+
+            if drop:
+                await self.bus._client.xack(key, self.group_name, *drop)
+
+            if replay:
+                log.warning(
+                    "executor.pel_replay",
+                    count=len(replay),
+                    tasks=[ev.payload.get("task", "")[:60] for _, ev in replay],
+                )
+                for entry_id, ev in replay:
+                    # Tag the task so the LLM knows this is a recovery attempt
+                    ev.payload["task"] = (
+                        "[RECOVERY — previous attempt interrupted]\n"
+                        + ev.payload.get("task", "")
+                    )
+                    ev.payload["recovery"] = True
+                    await self._handle_task(ev)
+                    await self.bus._client.xack(key, self.group_name, entry_id)
+
+        except Exception as exc:
+            log.debug("executor.pel_drain_skipped", error=str(exc))
+            # Fall back to base class behaviour on error
+            await super()._drain_stale_pel()
+
+        # Always drain broadcast PEL entries via base class
+        broadcast_key = self.bus._stream_key("broadcast")
+        try:
+            result = await self.bus._client.xautoclaim(
+                broadcast_key,
+                self.group_name,
+                self.consumer_name,
+                min_idle_time=0,
+                start_id="0-0",
+            )
+            claimed = result[1] if result and len(result) > 1 else []
+            if claimed:
+                ids = [e[0] for e in claimed if e]
+                await self.bus._client.xack(broadcast_key, self.group_name, *ids)
+        except Exception:
+            pass
+
+    async def _idle_watchdog_loop(self) -> None:
+        """
+        Override: same as base class but resets idle clock if unprocessed tasks
+        are waiting in the executor stream.  Prevents the executor from exiting
+        while the orchestrator has already dispatched work into its queue.
+        """
+        if not self._idle_timeout:
+            return
+        import time as _time
+
+        check_interval = max(0.5, min(5.0, self._idle_timeout))
+        log.info(
+            "agent.idle_watchdog_active",
+            role=self.role,
+            idle_timeout=self._idle_timeout,
+            check_interval=check_interval,
+        )
+        while self._running:
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=check_interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self._running:
+                return
+            # Before considering an idle exit, check if work is waiting in the stream
+            try:
+                key = f"agents:{self.role}"
+                groups = await self.bus._client.xinfo_groups(key)
+                for g in groups:
+                    lag = g.get("lag") or g.get("pel-count") or 0
+                    if int(lag) > 0:
+                        # Reset idle clock — there is queued work incoming
+                        self._last_event_time = _time.monotonic()
+                        break
+            except Exception:
+                pass
+            idle_secs = _time.monotonic() - self._last_event_time
+            if idle_secs >= self._idle_timeout:
+                log.info("agent.idle_exit", role=self.role, idle_secs=int(idle_secs))
+                self._running = False
+                self._stop_event.set()
+                return
+
     async def _seed_workspace_scripts(self) -> None:
         """
         Copy seed tool scripts from /workspace/src/workspace/tools/ into
