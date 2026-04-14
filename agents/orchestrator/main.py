@@ -1017,6 +1017,7 @@ When context contains "User clarification:" after a proposal was made:
         # _CONTAINER_CB_COOLDOWN_S has elapsed since the last failure.
         # A successful start resets the counter.
         self._container_failures: dict[str, tuple[int, float]] = {}
+        self._task_worker_task: asyncio.Task | None = None
 
     _OWN_TOOLS = [
         (
@@ -1075,7 +1076,7 @@ When context contains "User clarification:" after a proposal was made:
         log.info("orchestrator.startup")
         self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
         asyncio.create_task(self._step_timeout_watchdog_loop())
-        asyncio.create_task(self._task_queue_worker())
+        asyncio.create_task(self._task_worker_watchdog())
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -1353,6 +1354,31 @@ When context contains "User clarification:" after a proposal was made:
 
     # ── Plan queue worker ─────────────────────────────────────────────────────
 
+    async def _task_worker_watchdog(self) -> None:
+        """
+        Supervises _task_queue_worker and restarts it if it ever dies.
+
+        asyncio tasks that raise an unhandled exception are silently discarded
+        unless something holds a reference and checks their result.  This watchdog
+        holds that reference and restarts the worker so queued tasks are never
+        permanently stuck after a crash.
+        """
+        while self._running:
+            self._task_worker_task = asyncio.create_task(self._task_queue_worker())
+            try:
+                await self._task_worker_task
+                # Worker exited cleanly (only happens on shutdown)
+                break
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.error(
+                    "orchestrator.task_worker_crashed",
+                    error=str(exc),
+                    pending=self._task_queue.qsize(),
+                )
+                await asyncio.sleep(1)  # brief pause before restart
+
     async def _task_queue_worker(self) -> None:
         """
         Serialises plan execution: dequeues one (task, task_id, discord_message_id)
@@ -1379,6 +1405,15 @@ When context contains "User clarification:" after a proposal was made:
                 await self._run_task(
                     task, task_id, discord_message_id=discord_message_id
                 )
+            except asyncio.CancelledError:
+                # Worker is being cancelled (agent shutdown) — re-raise so it
+                # exits cleanly rather than silently swallowing the signal.
+                log.warning(
+                    "orchestrator.task_worker_cancelled",
+                    task=task[:80],
+                    task_id=task_id,
+                )
+                raise
             except Exception as exc:
                 log.error("orchestrator.plan_error", task=task[:80], error=str(exc))
                 await self._publish_reply(
@@ -1387,6 +1422,16 @@ When context contains "User clarification:" after a proposal was made:
                     discord_message_id,
                     original_task=task,
                 )
+            except BaseException as exc:
+                # SystemExit, KeyboardInterrupt, etc. — log so it's visible, then
+                # re-raise so the process can shut down properly.
+                log.error(
+                    "orchestrator.task_worker_fatal",
+                    task=task[:80],
+                    task_id=task_id,
+                    error=repr(exc),
+                )
+                raise
             finally:
                 self._task_queue.task_done()
 

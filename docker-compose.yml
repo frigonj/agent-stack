@@ -56,9 +56,8 @@ services:
     container_name: agent_orchestrator
     restart: unless-stopped
     healthcheck:
-      # Verify the agent process is alive and its Redis connection is healthy.
-      # All agents run as "python -m agent.main" so match on agent.main, not main.py.
-      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
+      # /proc/1/cmdline always present; python3 socket ping needs no extra packages.
+      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -99,7 +98,7 @@ services:
     container_name: agent_discord_bridge
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null"]
+      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -349,7 +348,7 @@ services:
     container_name: agent_optimizer
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python.*agent.main' > /dev/null && redis-cli -u $${REDIS_URL} ping | grep -q PONG"]
+      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
