@@ -626,7 +626,7 @@ class BaseAgent(ABC):
             if self._active_tasks == 0:
                 await self._set_status("idle")
 
-    _STATUS_KEY_PREFIX = "agent:status"
+    _STATUS_KEY_PREFIX = "agent:live_status"
     _STATUS_TTL = 3600  # 1 hour — auto-expires so stale entries don't linger
 
     async def _set_status(self, status: str, task: str = "") -> None:
