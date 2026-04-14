@@ -289,6 +289,8 @@ class DocumentQAAgent(BaseAgent):
             messages,
             action_handler=_read_action,
             max_steps=3,
+            subtask_id=subtask_id or "",
+            parent_task_id=parent_task_id or "",
         )
 
         return answer

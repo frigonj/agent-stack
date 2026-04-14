@@ -212,6 +212,8 @@ class DeveloperAgent(BaseAgent):
             messages,
             action_handler=_dev_action,
             max_steps=10,
+            subtask_id=task_id,
+            parent_task_id=parent_task_id or "",
         )
 
         await self.emit(
@@ -223,19 +225,19 @@ class DeveloperAgent(BaseAgent):
     # ── Action helpers ────────────────────────────────────────────────────────
 
     async def _read_file(self, path: str) -> str:
-        """Emit a read-file subtask to executor and wait for the result."""
-        subtask_id = f"dev-read-{path.replace('/', '-')}"
-        await self.emit(
-            EventType.TASK_ASSIGNED,
-            payload={
-                "task": f"cat {path}",
-                "assigned_to": "executor",
-                "subtask_id": subtask_id,
-            },
-            target="executor",
-        )
-        result = await self._wait_for_subtask(subtask_id, timeout=30)
-        return result or f"(could not read {path})"
+        """Read a file directly — no round-trip to executor needed."""
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+            # Cap at 8 000 chars to stay within LLM context budget
+            if len(content) > 8_000:
+                content = content[:8_000] + "\n… (truncated)"
+            return content
+        except FileNotFoundError:
+            return f"(file not found: {path})"
+        except PermissionError:
+            return f"(permission denied: {path})"
+        except Exception as exc:
+            return f"(could not read {path}: {exc})"
 
     async def _delegate_search(
         self, task_id: str, subtask_id: str | None, query: str

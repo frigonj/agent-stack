@@ -445,7 +445,9 @@ async def _handle_event(
     task = truncate_task(payload.get("task", "").strip())
     task_id = data.get("task_id", str(uuid.uuid4()))
     parent_task_id = payload.get("parent_task_id", "")
-    subtask_id = payload.get("subtask_id", "")
+    subtask_id = payload.get(
+        "subtask_id"
+    )  # must be echoed verbatim; None if not set by orchestrator
 
     if not task:
         return

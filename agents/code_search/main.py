@@ -224,6 +224,8 @@ class CodeSearchAgent(BaseAgent):
             messages,
             action_handler=_search_action,
             max_steps=4,
+            subtask_id=subtask_id or "",
+            parent_task_id=parent_task_id or "",
         )
 
         await self.emit(

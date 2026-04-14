@@ -1927,8 +1927,26 @@ class DiscordBridgeClient(discord.Client):
                 except Exception as exc:
                     log.warning("discord_bridge.reply_failed", error=str(exc))
 
+            # Fallback: if the bridge restarted and lost _pending_messages, the
+            # orchestrator includes discord_channel_id in the payload so we can
+            # still route the reply to the right channel instead of #logs.
+            fallback_ch_id = payload.get("discord_channel_id")
+            dest_channel = channel
+            if fallback_ch_id:
+                try:
+                    dest_channel = await self.fetch_channel(int(fallback_ch_id))
+                except Exception as exc:
+                    log.warning(
+                        "discord_bridge.fallback_channel_fetch_failed",
+                        channel_id=fallback_ch_id,
+                        error=str(exc),
+                    )
+
             await self._send_long_result(
-                channel, embed, result, filename=f"result_{(task_id or 'task')[:8]}.txt"
+                dest_channel,
+                embed,
+                result,
+                filename=f"result_{(task_id or 'task')[:8]}.txt",
             )
             log.info(
                 "discord_bridge.message_sent", event_type=event_type, source=source

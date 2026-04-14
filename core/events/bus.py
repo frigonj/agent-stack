@@ -384,6 +384,56 @@ class EventBus:
         """Acknowledge a processed message."""
         await self._client.xack(stream, group, entry_id)
 
+    DEAD_LETTER_STREAM = "dead_letter"
+    DEAD_LETTER_MAX = 2_000  # keep last 2 000 entries; older ones are pruned
+
+    async def publish_dead_letter(
+        self,
+        reason: str,
+        source: str,
+        event_type: str,
+        payload: dict,
+    ) -> str:
+        """
+        Write an unroutable event to the dead-letter stream (agents:dead_letter).
+
+        Every entry captures enough context to understand what happened and
+        replay or discard it manually:
+          - reason      : human-readable description of why it was dead-lettered
+          - source      : originating agent role
+          - event_type  : the EventType string of the original event
+          - payload_*   : key fields from the original payload (task_id, subtask_id,
+                          parent_task_id, result preview, error)
+          - ts          : wall-clock Unix timestamp (float as string)
+
+        Returns the Redis entry ID.
+        """
+        key = self._stream_key(self.DEAD_LETTER_STREAM)
+        entry = {
+            "reason": reason,
+            "source": source,
+            "event_type": event_type,
+            "parent_task_id": str(payload.get("parent_task_id") or ""),
+            "subtask_id": str(payload.get("subtask_id") or ""),
+            "task_id": str(payload.get("task_id") or ""),
+            "result_preview": str(payload.get("result", ""))[:300],
+            "error_preview": str(payload.get("error", ""))[:300],
+            "ts": str(time.time()),
+        }
+        entry_id = await self._client.xadd(
+            key, entry, maxlen=self.DEAD_LETTER_MAX, approximate=True
+        )
+        log.warning(
+            "event_bus.dead_letter",
+            reason=reason,
+            source=source,
+            event_type=event_type,
+            parent_task_id=entry["parent_task_id"],
+            subtask_id=entry["subtask_id"],
+            entry_id=entry_id,
+        )
+        return entry_id
+
     async def publish_and_ack(
         self,
         event: Event,

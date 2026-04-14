@@ -102,6 +102,7 @@ class BaseAgent(ABC):
         self.memory = LongTermMemory(
             database_url=settings.database_url,
             agent_name=self.role,
+            redis_url=settings.redis_url,
         )
         self.llm = ChatOpenAI(
             base_url=f"{settings.lm_studio_url}/v1",
@@ -510,9 +511,7 @@ class BaseAgent(ABC):
         check_interval = float(self._LLM_LOCK_HEARTBEAT_TTL)
         while self._running:
             try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=check_interval
-                )
+                await asyncio.wait_for(self._stop_event.wait(), timeout=check_interval)
                 return  # stop requested
             except asyncio.TimeoutError:
                 pass
@@ -800,6 +799,8 @@ class BaseAgent(ABC):
         messages: list,
         action_handler: Callable[[str, str], Awaitable[str]],
         max_steps: int = 10,
+        subtask_id: str = "",
+        parent_task_id: str = "",
     ) -> str:
         """
         ReAct-style multi-step loop: Reason → Act → Observe → repeat.
@@ -811,12 +812,23 @@ class BaseAgent(ABC):
         The loop ends when the LLM emits ``DONE: <answer>`` (preferred),
         produces a response with no action lines (implicit done), or
         exhausts ``max_steps``.
+
+        subtask_id / parent_task_id: when provided, a HEARTBEAT event is emitted
+        at the start of each iteration so the orchestrator watchdog can confirm
+        the agent is actively making progress (not silently stalled).
         """
         msgs = list(messages)
         consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
 
         for step in range(max_steps):
+            if subtask_id:
+                await self.emit_heartbeat(
+                    subtask_id=subtask_id,
+                    parent_task_id=parent_task_id,
+                    activity="llm_invoke",
+                    loop_step=step,
+                )
             response = await self.llm_invoke(msgs)
             content: str = response.content
 
@@ -1737,6 +1749,35 @@ class BaseAgent(ABC):
         await self.bus.publish(
             Event(type=event_type, source=self.role, payload=payload),
             target=target,
+        )
+
+    async def emit_heartbeat(
+        self,
+        subtask_id: str,
+        parent_task_id: str = "",
+        activity: str = "",
+        loop_step: int = 0,
+    ) -> None:
+        """
+        Emit a HEARTBEAT event tied to a specific subtask.
+
+        Called at natural progress boundaries (each ReAct loop iteration,
+        each shell command, each fetch) so the orchestrator watchdog can
+        distinguish a working agent from a silently stalled one.
+
+        The event goes to agents:broadcast so it is visible in the plan
+        status stream and inspectable by any observer.
+        """
+        await self.emit(
+            EventType.HEARTBEAT,
+            payload={
+                "subtask_id": subtask_id,
+                "parent_task_id": parent_task_id,
+                "agent": self.role,
+                "activity": activity,
+                "loop_step": loop_step,
+                "task_preview": self._current_task[:80],
+            },
         )
 
     async def _emit_error(self, triggering_event: Event, exc: Exception) -> None:

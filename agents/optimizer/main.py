@@ -283,6 +283,10 @@ class OptimizerAgent(BaseAgent):
         super().__init__(settings)
         self._prior_run: Optional[dict] = None
         self._last_run_ts: float = 0.0
+        # task_id → wall-clock timestamp (seconds) of the last PLAN_STATUS event
+        # seen for that plan.  Updated on every PLAN_STATUS; used to detect stale
+        # plans without polling Postgres.
+        self._plan_last_seen: dict[str, float] = {}
 
     async def on_startup(self) -> None:
         log.info("optimizer.startup", interval_h=_THINK_INTERVAL // 3600)
@@ -326,10 +330,26 @@ class OptimizerAgent(BaseAgent):
     async def handle_event(self, event: Event) -> None:
         """
         Handles:
+          PLAN_STATUS       — update last-seen timestamp for stale-plan tracking
+          TASK_COMPLETED    — remove plan from tracking when it completes/closes
           OPTIMIZE_REQUEST  — run targeted tests + return suggestion report
           TASK_CREATED      — if payload.target_agent == "optimizer", handle as request
         """
         payload = event.payload or {}
+
+        # Track plan liveness via PLAN_STATUS events — replaces DB polling
+        if event.type == EventType.PLAN_STATUS:
+            task_id = payload.get("task_id")
+            if task_id:
+                self._plan_last_seen[task_id] = time.time()
+            return
+
+        # Remove plan from tracking when it closes
+        if event.type == EventType.TASK_COMPLETED:
+            task_id = payload.get("task_id") or payload.get("parent_task_id")
+            if task_id:
+                self._plan_last_seen.pop(task_id, None)
+            return
 
         # Accept direct task routing
         if (
@@ -347,10 +367,18 @@ class OptimizerAgent(BaseAgent):
 
     async def _stale_plan_watchdog_loop(self) -> None:
         """
-        Every _WATCHDOG_INTERVAL_S seconds, query active_plans for any plan
-        whose updated_at is older than _STALE_STEP_TIMEOUT_S and whose status
-        is still 'running'.  Emit STALE_PLAN to the orchestrator for each one
-        so it can reset and re-dispatch the stuck steps.
+        Detect stale plans by tracking silence on agents:broadcast PLAN_STATUS events.
+
+        Every _WATCHDOG_INTERVAL_S seconds, scan _plan_last_seen for entries whose
+        last PLAN_STATUS is older than _STALE_STEP_TIMEOUT_S.  For each stale plan,
+        emit STALE_PLAN to the orchestrator (which resets and re-dispatches) and
+        remove the entry from tracking.
+
+        This replaces the previous Postgres polling approach.  The orchestrator emits
+        PLAN_STATUS on every meaningful state change (dispatch, step complete, phase
+        advance, failure) so the last-seen timestamp is a reliable liveness signal.
+        Plans are added to _plan_last_seen on first PLAN_STATUS and removed on
+        TASK_COMPLETED — no DB queries needed.
         """
         while self._running:
             try:
@@ -362,54 +390,29 @@ class OptimizerAgent(BaseAgent):
                 pass
             if not self._running:
                 return
-            try:
-                pool = await self.memory._get_pool()
-                async with pool.connection() as conn:
-                    cur = await conn.execute(
-                        """
-                        SELECT task_id, plan_id, original_task, plan_json
-                        FROM active_plans
-                        WHERE status = 'running'
-                          AND updated_at < NOW() - INTERVAL '%s seconds'
-                        """,
-                        (self._STALE_STEP_TIMEOUT_S,),
-                    )
-                    rows = await cur.fetchall()
 
-                for row in rows:
-                    task_id, plan_id, original_task, plan_json = row
-                    if isinstance(plan_json, str):
-                        plan_json = json.loads(plan_json)
-
-                    # Find which step_ids are "running"
-                    stale_steps = [
-                        s["step_id"]
-                        for s in plan_json.get("steps", [])
-                        if s.get("status") == "running"
-                    ]
-                    if not stale_steps:
-                        continue
-
-                    log.warning(
-                        "optimizer.stale_plan_detected",
-                        task_id=task_id,
-                        stale_steps=stale_steps,
-                        task_preview=str(original_task)[:60],
-                    )
-                    await self.bus.publish(
-                        Event(
-                            type=EventType.STALE_PLAN,
-                            source=self.role,
-                            payload={
-                                "task_id": task_id,
-                                "plan_id": plan_id,
-                                "stale_step_ids": stale_steps,
-                            },
-                        ),
-                        target="orchestrator",
-                    )
-            except Exception as exc:
-                log.warning("optimizer.stale_watchdog_error", error=str(exc))
+            now = time.time()
+            stale_task_ids = [
+                tid
+                for tid, last_seen in list(self._plan_last_seen.items())
+                if now - last_seen > self._STALE_STEP_TIMEOUT_S
+            ]
+            for task_id in stale_task_ids:
+                log.warning(
+                    "optimizer.stale_plan_detected",
+                    task_id=task_id,
+                    silent_for_s=round(now - self._plan_last_seen[task_id]),
+                )
+                await self.bus.publish(
+                    Event(
+                        type=EventType.STALE_PLAN,
+                        source=self.role,
+                        payload={"task_id": task_id},
+                    ),
+                    target="orchestrator",
+                )
+                # Remove so we don't fire again until the plan emits new status
+                self._plan_last_seen.pop(task_id, None)
 
     async def _container_health_watchdog_loop(self) -> None:
         """

@@ -34,13 +34,14 @@ from urllib.parse import urlparse
 
 import httpx
 import structlog
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.base_agent import BaseAgent, run_agent
 from core.config import Settings
 from core.events.bus import Event, EventType
 from core.context import truncate_task, truncate_context
 from core.eval.pipeline import EvalPipeline
+from core.memory.long_term import PlanVersionConflict
 
 log = structlog.get_logger()
 
@@ -319,6 +320,37 @@ _RETRY_RE = re.compile(
     re.I,
 )
 
+# ── Constraint detection ──────────────────────────────────────────────────────
+# Matches user messages that express a hard constraint the planner must respect
+# across the lifetime of a conversation (e.g. "don't use Docker").
+# Conversation entries tagged as constraints are pinned in _fit_plan_context and
+# never dropped, even when the full conversation history is trimmed.
+_CONSTRAINT_RE = re.compile(
+    r"\b("
+    r"don'?t(\s+ever)?\s+use"
+    r"|never\s+use"
+    r"|must\s+not\s+use"
+    r"|avoid\s+using"
+    r"|always\s+use"
+    r"|must\s+use"
+    r"|do\s+not\s+use"
+    r"|no\s+\w+"  # "no Docker", "no pip", …
+    r"|without\s+\w+"  # "without Docker"
+    r"|instead\s+of\s+\w+"  # "instead of pip"
+    r"|use\s+\w+\s+instead"  # "use conda instead"
+    r"|don'?t\s+install"
+    r"|don'?t\s+modify"
+    r"|keep\s+.{0,40}\s+unchanged"
+    r"|leave\s+.{0,40}\s+as\s+(is|it\s+is)"
+    r")\b",
+    re.I,
+)
+
+
+def _is_constraint(text: str) -> bool:
+    """Return True if the user message expresses a planning constraint."""
+    return bool(_CONSTRAINT_RE.search(text))
+
 
 # ── Seed intent examples ──────────────────────────────────────────────────────
 # Canonical labelled examples stored to PostgreSQL on first startup.
@@ -391,6 +423,10 @@ _SEED_INTENTS: list[tuple[str, str]] = [
 
 
 def _route_by_keyword(task: str) -> list[dict] | None:
+    """Return a single-step plan only for tasks that are already a concrete shell
+    command or a clearly atomic single-agent operation (the matched patterns cover
+    these cases). The result is used as a fast-path hint — callers that need a
+    full multi-step plan should call _llm_plan instead."""
     tl = task.lower().strip()
     for pattern, agent in _KEYWORD_ROUTES:
         if pattern.search(tl):
@@ -401,7 +437,65 @@ def _route_by_keyword(task: str) -> list[dict] | None:
     return None
 
 
+def _detect_agent_hint(task: str) -> str | None:
+    """Return the best-matching agent name from keyword patterns without building
+    a plan step.  Used to seed _llm_plan so the planner can bias toward the
+    right agent when decomposing multi-step tasks."""
+    tl = task.lower().strip()
+    for pattern, agent in _KEYWORD_ROUTES:
+        if pattern.search(tl):
+            return agent
+    return None
+
+
 # ── Discord action parser ─────────────────────────────────────────────────────
+
+
+_INFRASTRUCTURE_ERROR_PATTERNS = re.compile(
+    r"failed to start agent container"
+    r"|container exited immediately"
+    r"|timed out starting"
+    r"|No such container"
+    r"|docker.*error"
+    r"|Agent error: step stalled"
+    r"|OCI runtime"
+    r"|cannot connect to the docker daemon",
+    re.I,
+)
+
+
+def _classify_failure(result: str) -> str:
+    """
+    Classify a step failure as 'infrastructure' or 'logic'.
+
+    Infrastructure: container wouldn't start, Docker errors, stall timeouts.
+      → fix cycle should be bypassed immediately (no retries will help).
+    Logic: wrong command, missing file, bad output — agent ran but produced
+      a bad result.
+      → normal fix cycle applies.
+    """
+    return (
+        "infrastructure" if _INFRASTRUCTURE_ERROR_PATTERNS.search(result) else "logic"
+    )
+
+
+def _truncate_error(text: str, head: int = 300, tail: int = 300) -> str:
+    """
+    Truncate an error string while preserving both ends.
+
+    For tracebacks and multi-line executor output the root cause is almost
+    always at the *end* (innermost exception / last non-zero exit line), not
+    at the start (boilerplate header).  A simple [:N] slice discards exactly
+    the part that matters for reformulation.
+
+    Strategy: keep the first `head` chars and the last `tail` chars, joining
+    them with a marker that makes the truncation explicit.  If the full text
+    fits within head + tail + marker overhead, return it unchanged.
+    """
+    if len(text) <= head + tail:
+        return text
+    marker = f"\n…[{len(text) - head - tail} chars omitted]…\n"
+    return text[:head] + marker + text[-tail:]
 
 
 def _slugify(name: str) -> str:
@@ -670,8 +764,14 @@ class PlanStep:
     status: str = "pending"  # pending | running | done | failed
     result: str = ""
     depth: int = 0  # fix-attempt depth (0 = original, 1–10 = fix subtask)
-    error_chain: list = field(default_factory=list)  # errors from prior fix attempts
+    # Original planner-assigned sub-task, set at depth 0 and carried forward
+    # unchanged on every fix step so reformulation always has the true intent.
+    original_subtask: str = ""
+    # Each entry: {"depth": N, "task": "...", "error": "..."}
+    # Stores both what was attempted and what failed at every depth.
+    error_chain: list = field(default_factory=list)
     dispatched_at: float = 0.0  # monotonic timestamp when step entered "running"
+    stall_count: int = 0  # how many times this step has been stalled and reset
 
 
 @dataclass
@@ -685,6 +785,10 @@ class ExecutionPlan:
     context: str = ""
     context_id: str = ""  # context stream ID (same as task_id for tasks)
     created_at: float = field(default_factory=time.time)
+    # Last version number returned by upsert_plan.  Passed back on the next
+    # write so Postgres can detect a lost-update (optimistic locking).
+    # -1 means "not yet written to DB" — first write uses unconditional insert.
+    db_version: int = -1
     # Phases currently being advanced — guards against concurrent _check_phase_complete
     # calls (possible because asyncio.create_task fires multiple result handlers).
     _phases_advancing: set = field(default_factory=set)
@@ -726,6 +830,10 @@ class ExecutionPlan:
                     "expected": s.expected,
                     "status": s.status,
                     "result": s.result,
+                    "depth": s.depth,
+                    "original_subtask": s.original_subtask,
+                    "error_chain": s.error_chain,
+                    "stall_count": s.stall_count,
                 }
                 for s in self.steps
             ],
@@ -825,7 +933,15 @@ Return ONLY valid JSON, no markdown fences. Three possible responses:
 {"propose": "..."}
 
 Rules for plans:
-- expected = one short phrase describing success (e.g. "exit code 0", "file written", "list returned")
+- expected = REQUIRED. A concrete, verifiable success signal for each step. Must name what
+  the result will contain. If you cannot determine a success signal, emit {"clarify": "..."} instead.
+  Per-agent examples:
+    executor:    "exit code 0", "exit code 0 and /workspace/out.txt exists"
+    developer:   "function implemented and tests pass", "script written to /workspace/..."
+    research:    "at least 3 sources cited with URLs", "answer includes comparison table"
+    document_qa: "answer includes section name and line reference", "PDF compiled at /workspace/..."
+    code_search: "class definition found with file path and line number"
+    discord:     "channel created", "message sent"
 - 1–4 phases, 1–8 steps total
 - discord agent for ANYTHING involving Discord channels/categories/messages/topics
 - When unsure which agent, use executor
@@ -833,6 +949,13 @@ Rules for plans:
 - Prefer checking /workspace/tools/ for existing scripts before creating new executor steps
 
 Step quality rules (CRITICAL — failure to follow causes task failures):
+- Each step's "task" field MUST be a self-contained instruction scoped to THAT agent's
+  capability. It must NOT restate the original user request. The agent will only receive
+  the "task" field — it has NO knowledge of the original user message or other steps.
+  BAD:  "create a Python script in a new GitHub repository"   ← this is the full user ask
+  GOOD (executor):    "mkdir -p /workspace/repos/my-project && git init /workspace/repos/my-project"
+  GOOD (developer):   "write a Python script that does X and save it to /workspace/repos/my-project/main.py"
+  GOOD (executor):    "git -C /workspace/repos/my-project add . && git commit -m 'initial commit'"
 - PREFER two focused steps over one ambiguous step. "Read file X then update Y" → two steps.
 - Each executor step must describe ONE concrete operation: a single command, a single file read,
   or a single file write. Never combine "read AND write" or "find AND update" in one step.
@@ -843,6 +966,7 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 - For multi-file or multi-command tasks, assign each file/command its own step (same phase if independent).
 - code_search steps must name the specific function, class, or pattern to find.
 - research steps must state the exact question to research.
+- document_qa steps must state the exact document path or question to answer/validate.
 
 When context contains "User clarification:" after a proposal was made:
 - The user's reply selects which phase(s) to execute (e.g. "1", "1 and 2", "all").
@@ -876,6 +1000,23 @@ When context contains "User clarification:" after a proposal was made:
         self._task_channel_ids: dict[str, str] = {}
         # Passive eval pipeline — initialised lazily after memory/bus are ready
         self._eval_pipeline: EvalPipeline | None = None
+        # Set after on_startup completes recovery.  TASK_COMPLETED events that
+        # arrive before this is set are buffered so they don't hit _handle_result
+        # before _plans is populated with recovered plans.
+        self._recovery_complete: asyncio.Event = asyncio.Event()
+        self._pre_recovery_buffer: list = []  # buffered (event,) tuples
+        # ── Plan queue ───────────────────────────────────────────────────────
+        # New task plans are serialized — only one plan runs at a time.
+        # Subsequent TASK_CREATED tasks are enqueued as
+        #   (task, task_id, discord_message_id) tuples and processed in order.
+        self._task_queue: asyncio.Queue = asyncio.Queue()
+        # ── Container circuit-breaker ─────────────────────────────────────────
+        # agent → (failure_count, first_failure_monotonic_ts)
+        # When failure_count reaches _CONTAINER_CB_THRESHOLD within
+        # _CONTAINER_CB_WINDOW_S the agent is quarantined until
+        # _CONTAINER_CB_COOLDOWN_S has elapsed since the last failure.
+        # A successful start resets the counter.
+        self._container_failures: dict[str, tuple[int, float]] = {}
 
     _OWN_TOOLS = [
         (
@@ -934,6 +1075,7 @@ When context contains "User clarification:" after a proposal was made:
         log.info("orchestrator.startup")
         self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
         asyncio.create_task(self._step_timeout_watchdog_loop())
+        asyncio.create_task(self._task_queue_worker())
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -990,51 +1132,177 @@ When context contains "User clarification:" after a proposal was made:
                     tasks=[r["original_task"][:60] for r in paused],
                 )
 
-    # ── Step timeout watchdog ────────────────────────────────────────────────
+        # All recovery dispatches are done — allow TASK_COMPLETED processing
+        self._recovery_complete.set()
 
-    # Steps running longer than this are considered stale and reset to pending.
-    _STEP_TIMEOUT_S: int = 600  # 10 minutes
+        # Replay any TASK_COMPLETED events that arrived before recovery finished
+        if self._pre_recovery_buffer:
+            log.info(
+                "orchestrator.replaying_pre_recovery_events",
+                count=len(self._pre_recovery_buffer),
+            )
+            for buffered_event in self._pre_recovery_buffer:
+                await self._handle_result(buffered_event)
+            self._pre_recovery_buffer.clear()
+
+    # ── Step stall watchdog ──────────────────────────────────────────────────
+
+    # Per-agent heartbeat silence threshold (seconds). An agent is considered
+    # stalled if no HEARTBEAT event with a matching subtask_id has been seen on
+    # agents:broadcast within this window. Values are conservative — they must
+    # comfortably exceed the worst-case LLM response latency for that agent.
+    # All thresholds are overridable at runtime via:
+    #   set_config("heartbeat_silence_secs:{agent}", N)
+    _HEARTBEAT_SILENCE_DEFAULTS: dict[str, int] = {
+        "executor": 30,  # shell commands return fast
+        "developer": 120,  # 10-step ReAct × LLM latency
+        "claude_code_agent": 120,
+        "research": 90,  # web fetch + LLM
+        "code_search": 60,
+        "document_qa": 90,
+        "optimizer": 120,
+        "discord": 15,  # fire-and-forget, near-instant
+    }
+    _HEARTBEAT_SILENCE_DEFAULT_FALLBACK: int = 90  # for unknown agents
+    # Grace period after dispatch before stall detection activates.
+    # Allows for container cold-start and initial LLM call latency.
+    _HEARTBEAT_GRACE_S: int = 30
+    # A step stalled this many times without completing is escalated to the user.
+    _MAX_STALL_COUNT: int = 2
+
+    async def _get_heartbeat_silence_secs(self, agent: str) -> int:
+        """Return the stall threshold for agent, checking runtime config first."""
+        config_val = await self.bus.get_config(f"heartbeat_silence_secs:{agent}")
+        if config_val is not None:
+            try:
+                return int(config_val)
+            except (ValueError, TypeError):
+                pass
+        return self._HEARTBEAT_SILENCE_DEFAULTS.get(
+            agent, self._HEARTBEAT_SILENCE_DEFAULT_FALLBACK
+        )
+
+    async def _last_heartbeat_ms(self, subtask_id: str) -> int | None:
+        """
+        Return the Redis stream entry timestamp (ms) of the most recent
+        HEARTBEAT event for this subtask_id on agents:broadcast, or None
+        if no heartbeat has been seen.
+        """
+        broadcast_key = self.bus._stream_key("broadcast")
+        # Scan the last 500 entries — enough to cover any active step's history
+        try:
+            entries = await self.bus._client.xrevrange(broadcast_key, count=500)
+        except Exception:
+            return None
+        for entry_id, fields in entries:
+            if fields.get(b"type", fields.get("type", "")) in (
+                b"system.heartbeat",
+                "system.heartbeat",
+            ):
+                payload_raw = fields.get(b"payload", fields.get("payload", "{}"))
+                try:
+                    payload = json.loads(payload_raw)
+                except Exception:
+                    continue
+                if payload.get("subtask_id") == subtask_id:
+                    # Redis stream entry ID is "{ms}-{seq}"
+                    try:
+                        ms = int(str(entry_id).split("-")[0])
+                        return ms
+                    except Exception:
+                        pass
+        return None
 
     async def _step_timeout_watchdog_loop(self) -> None:
         """
-        Background loop that checks every 60 s for plan steps that have been
-        in "running" state for longer than _STEP_TIMEOUT_S.  Stale steps are
-        reset to "pending" and the phase is re-dispatched so the plan can
-        self-heal without user intervention.
+        Background loop (30 s interval) that detects stalled plan steps.
+
+        A step is stalled when the agent assigned to it has not emitted a
+        HEARTBEAT event with a matching subtask_id within the agent's silence
+        threshold, AND the step has been running long enough for the grace
+        period to have elapsed.
+
+        On first stall:
+          - Reset step to "pending", increment stall_count, re-dispatch.
+          - depth is NOT incremented — no work was done.
+
+        On repeated stall (stall_count >= _MAX_STALL_COUNT):
+          - Escalate to the user with a clear message describing what the
+            agent was attempting when it went silent.
         """
         while self._running:
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=60.0)
-                return  # stop requested
+                await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
+                return
             except asyncio.TimeoutError:
                 pass
             if not self._running:
                 return
-            now = time.time()
+
+            now_mono = time.monotonic()
+            now_wall_ms = int(time.time() * 1000)
+
             for task_id, plan in list(self._plans.items()):
-                stale = [
+                running = [
                     s
                     for s in plan.steps
-                    if s.status == "running"
-                    and hasattr(s, "dispatched_at")
-                    and (now - s.dispatched_at) > self._STEP_TIMEOUT_S
+                    if s.status == "running" and s.dispatched_at > 0
                 ]
-                if not stale:
-                    continue
-                log.warning(
-                    "orchestrator.step_timeout",
-                    task_id=task_id,
-                    stale_steps=[s.step_id for s in stale],
-                    timeout_s=self._STEP_TIMEOUT_S,
-                )
-                for s in stale:
-                    s.status = "pending"
-                current_phase = plan.current_phase()
-                await self._emit_plan_status(
-                    plan,
-                    f"⏱️ Timeout: {len(stale)} step(s) reset — re-dispatching phase {current_phase}",
-                )
-                await self._dispatch_phase(plan, current_phase)
+                for step in running:
+                    elapsed = now_mono - step.dispatched_at
+                    if elapsed < self._HEARTBEAT_GRACE_S:
+                        continue  # still within startup grace period
+
+                    silence_secs = await self._get_heartbeat_silence_secs(step.agent)
+                    last_hb_ms = await self._last_heartbeat_ms(step.step_id)
+
+                    # Agents not in the silence table don't emit heartbeats —
+                    # skip stall detection for them entirely.
+                    if step.agent not in self._HEARTBEAT_SILENCE_DEFAULTS:
+                        continue
+
+                    if last_hb_ms is not None:
+                        silence_ms = now_wall_ms - last_hb_ms
+                        if silence_ms < silence_secs * 1000:
+                            continue  # heartbeat is fresh — agent is alive
+
+                    # No heartbeat within the silence window — step is stalled
+                    log.warning(
+                        "orchestrator.step_stalled",
+                        task_id=task_id,
+                        step_id=step.step_id,
+                        agent=step.agent,
+                        stall_count=step.stall_count + 1,
+                        elapsed_s=round(elapsed),
+                        last_hb_ms=last_hb_ms,
+                        silence_threshold_s=silence_secs,
+                    )
+
+                    if step.stall_count >= self._MAX_STALL_COUNT:
+                        # Repeated stall — escalate to user
+                        step.status = "failed"
+                        step.result = (
+                            f"Agent error: step stalled {step.stall_count + 1} time(s) "
+                            f"without completing. Last known activity: "
+                            f"{step.task[:200]}"
+                        )
+                        await self._emit_plan_status(
+                            plan,
+                            f"⚠️ `[{step.agent}]` stalled {step.stall_count + 1}× "
+                            f"on step `{step.step_id[:8]}` — escalating",
+                        )
+                        await self._check_phase_complete(plan)
+                    else:
+                        # First (or second) stall — reset and retry for free
+                        step.stall_count += 1
+                        step.status = "pending"
+                        current_phase = plan.current_phase()
+                        await self._emit_plan_status(
+                            plan,
+                            f"⏳ `[{step.agent}]` stalled (attempt {step.stall_count}) "
+                            f"— resetting step and re-dispatching phase {current_phase}",
+                        )
+                        await self._dispatch_phase(plan, current_phase)
 
     # ── Event dispatch ───────────────────────────────────────────────────────
 
@@ -1042,6 +1310,9 @@ When context contains "User clarification:" after a proposal was made:
         if event.type == EventType.TASK_CREATED:
             await self._handle_task(event)
         elif event.type == EventType.TASK_COMPLETED:
+            if not self._recovery_complete.is_set():
+                self._pre_recovery_buffer.append(event)
+                return
             await self._handle_result(event)
         elif event.type == EventType.TASK_PAUSED:
             await self._handle_task_paused(event)
@@ -1079,6 +1350,45 @@ When context contains "User clarification:" after a proposal was made:
             await self._handle_agent_error(event)
         elif event.type == EventType.STALE_PLAN:
             await self._handle_stale_plan(event)
+
+    # ── Plan queue worker ─────────────────────────────────────────────────────
+
+    async def _task_queue_worker(self) -> None:
+        """
+        Serialises plan execution: dequeues one (task, task_id, discord_message_id)
+        tuple at a time, drives it to completion via _run_task, then picks the next.
+        This ensures the orchestrator never runs two plans concurrently, which
+        prevents resource contention and keeps the event stream unambiguous.
+        """
+        while self._running:
+            try:
+                item = await asyncio.wait_for(self._task_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+
+            task, task_id, discord_message_id = item
+            log.info(
+                "orchestrator.task_dequeued",
+                task=task[:80],
+                task_id=task_id,
+                remaining=self._task_queue.qsize(),
+            )
+            try:
+                await self._run_task(
+                    task, task_id, discord_message_id=discord_message_id
+                )
+            except Exception as exc:
+                log.error("orchestrator.plan_error", task=task[:80], error=str(exc))
+                await self._publish_reply(
+                    f"⚠️ Planning error: {exc}",
+                    task_id,
+                    discord_message_id,
+                    original_task=task,
+                )
+            finally:
+                self._task_queue.task_done()
 
     # ── Task intake ──────────────────────────────────────────────────────────
 
@@ -1169,25 +1479,24 @@ When context contains "User clarification:" after a proposal was made:
                 task, task_id, discord_message_id, session_id=session.session_id
             )
         else:
-            # Detach planning so the event-handler returns immediately and acks
-            # the task.created event.  The orchestrator can then receive and begin
-            # handling new incoming tasks concurrently while this plan is being
-            # built and dispatched.  Error handling is local to the background task.
-            async def _plan_and_run() -> None:
-                try:
-                    await self._run_task(
-                        task, task_id, discord_message_id=discord_message_id
-                    )
-                except Exception as exc:
-                    log.error("orchestrator.plan_error", task=task[:80], error=str(exc))
-                    await self._publish_reply(
-                        f"⚠️ Planning error: {exc}",
-                        task_id,
-                        discord_message_id,
-                        original_task=task,
-                    )
-
-            asyncio.create_task(_plan_and_run())
+            # Enqueue so plans are serialized — one active plan at a time.
+            # The event-handler returns immediately to ack the task.created event;
+            # _task_queue_worker picks up the tuple and drives _run_task in order.
+            queue_pos = self._task_queue.qsize()
+            await self._task_queue.put((task, task_id, discord_message_id))
+            log.info(
+                "orchestrator.task_queued",
+                task=task[:80],
+                task_id=task_id,
+                queue_depth=queue_pos + 1,
+            )
+            if queue_pos > 0:
+                await self._publish_reply(
+                    f"⏳ Task queued (position {queue_pos + 1}) — will start after the current plan completes.",
+                    task_id,
+                    discord_message_id,
+                    is_chat=True,
+                )
 
     # ── Intent classification ─────────────────────────────────────────────────
 
@@ -1306,51 +1615,132 @@ When context contains "User clarification:" after a proposal was made:
         discord_message_id: str | None,
     ) -> None:
         """
-        User said 'try again'. Expire memories from the last attempt so they
-        don't bias the retry, drop staged findings for that attempt, then
-        re-route the last real task.
+        User said 'try again'.
+
+        If the last plan failed mid-execution (some steps succeeded, some failed),
+        resume it at the failed steps rather than replanning from scratch.  The
+        completed phases are preserved; only the failed step(s) are re-dispatched
+        with their error history so the agent can try a different approach.
+
+        If the last plan completed successfully (the user wants a different outcome),
+        or no recoverable plan exists, fall back to replanning from scratch.
         """
-        # Expire DB memories tagged with the last task_id
+        # ── 1. Try to recover the last plan from DB ───────────────────────────
+        last_plan_row: dict | None = None
+        last_discord_msg: str | None = discord_message_id
+
         if self._last_task_id:
-            expired = await self.memory.expire_by_task_id(self._last_task_id)
-            log.info(
-                "orchestrator.retry_memory_expired",
-                task_id=self._last_task_id,
-                expired=expired,
-            )
+            try:
+                last_plan_row = await self.memory.get_plan_by_task_id(
+                    self._last_task_id
+                )
+            except Exception as exc:
+                log.warning("orchestrator.retry_plan_load_failed", error=str(exc))
 
-        # Capture failure summary before wiping findings so we can pass it to
-        # the retry as retry_context (prevents the planner from repeating the
-        # same broken route on the next attempt).
-        failure_summary = ""
-        for f in self._findings:
-            if f.get("topic") in ("task_failure", "task_result", "task_success"):
-                content = f.get("content", "")
-                if content:
-                    failure_summary = content[:400]
-                    break
+        # ── 2. Resume a failed plan at its failed step(s) ─────────────────────
+        if last_plan_row and last_plan_row["status"] == "failed":
+            plan_json = last_plan_row["plan_json"]
+            steps_raw = plan_json.get("steps", [])
 
-        # Drop in-memory findings for the failed attempt
+            failed_steps = [s for s in steps_raw if s.get("status") == "failed"]
+            done_steps = [s for s in steps_raw if s.get("status") == "done"]
+
+            if failed_steps:
+                # Expire stale memories from the failed attempt
+                expired = await self.memory.expire_by_task_id(self._last_task_id)
+                log.info("orchestrator.retry_memory_expired", expired=expired)
+
+                # Rebuild the plan in memory with failed steps reset to pending
+                rebuilt_steps = []
+                for s in steps_raw:
+                    status = s.get("status", "pending")
+                    # Reset failed/fixed steps to pending; preserve done steps
+                    if status in ("failed", "fixed"):
+                        status = "pending"
+                    rebuilt_steps.append(
+                        PlanStep(
+                            step_id=s["step_id"],
+                            phase=s["phase"],
+                            task=s["task"],
+                            agent=s["agent"],
+                            expected=s.get("expected", ""),
+                            status=status,
+                            result=s.get("result", ""),
+                            depth=s.get("depth", 0),
+                            original_subtask=s.get("original_subtask", ""),
+                            error_chain=s.get("error_chain", []),
+                            stall_count=s.get("stall_count", 0),
+                        )
+                    )
+
+                plan = ExecutionPlan(
+                    plan_id=last_plan_row["plan_id"],
+                    task_id=self._last_task_id,
+                    original_task=last_plan_row["original_task"],
+                    steps=rebuilt_steps,
+                    discord_message_id=plan_json.get("discord_message_id")
+                    or discord_message_id,
+                    context=plan_json.get("context", ""),
+                    context_id=self._last_task_id,
+                )
+
+                # Summarise what succeeded and what will be retried
+                done_summary = (
+                    "\n".join(
+                        f"  ✅ [phase {s['phase']} | {s['agent']}] {s['task'][:80]}"
+                        for s in done_steps
+                    )
+                    or "  (none)"
+                )
+                retry_summary = "\n".join(
+                    f"  🔄 [phase {s['phase']} | {s['agent']}] {s['task'][:80]}"
+                    f"\n     Last error: {s.get('result', '')[:120]}"
+                    for s in failed_steps
+                )
+
+                await self._publish_reply(
+                    f"Resuming plan — re-running the failed step(s) only.\n\n"
+                    f"**Already completed:**\n{done_summary}\n\n"
+                    f"**Retrying:**\n{retry_summary}",
+                    task_id,
+                    discord_message_id,
+                    is_chat=True,
+                )
+
+                resume_phase = min(s["phase"] for s in failed_steps)
+                self._plans[self._last_task_id] = plan
+                await self._persist_plan(plan, "running")
+                log.info(
+                    "orchestrator.retry_resume",
+                    task_id=self._last_task_id,
+                    resume_phase=resume_phase,
+                    failed_count=len(failed_steps),
+                    done_count=len(done_steps),
+                )
+                asyncio.create_task(self._dispatch_phase(plan, resume_phase))
+                return
+
+        # ── 3. Fall back: replan from scratch ─────────────────────────────────
+        # Reached when: plan completed successfully, plan not found, or no failed steps.
+        if self._last_task_id:
+            await self.memory.expire_by_task_id(self._last_task_id)
+
         self._findings = [
             f
             for f in self._findings
             if f.get("topic") not in ("task_failure", "task_success", "task_result")
         ]
 
-        # Recover the last real task from conversation history, falling back to
-        # Redis for cross-restart persistence (conversation is in-memory only).
+        # Recover last task text from conversation or Redis
         last_task: str | None = None
-        last_discord_msg: str | None = discord_message_id
         if self._conversation:
-            entry = self._conversation[-1]
-            last_task = entry[0]
+            last_task = self._conversation[-1][0]
         else:
             try:
                 raw = await self.bus._client.get(self._LAST_TASK_KEY)
                 if raw:
                     stored = json.loads(raw)
                     last_task = stored.get("task")
-                    # Use the stored discord_message_id only if caller didn't provide one
                     if not last_discord_msg:
                         last_discord_msg = stored.get("discord_message_id") or None
                     log.info(
@@ -1370,14 +1760,10 @@ When context contains "User clarification:" after a proposal was made:
             return
 
         self._conversation.clear()
-        log.info("orchestrator.retry", original_task=last_task[:80])
-
-        retry_note = ""
-        if failure_summary:
-            retry_note = f"\n\n[Previous attempt failed: {failure_summary}]\nUse a different approach — avoid the same route."
+        log.info("orchestrator.retry_replan", original_task=last_task[:80])
 
         await self._publish_reply(
-            f"Retrying: *{last_task[:120]}*",
+            f"Replanning: *{last_task[:120]}*",
             task_id,
             discord_message_id,
             is_chat=True,
@@ -1387,7 +1773,6 @@ When context contains "User clarification:" after a proposal was made:
                 last_task,
                 task_id,
                 discord_message_id=last_discord_msg,
-                retry_context=retry_note,
             )
         )
 
@@ -1546,9 +1931,7 @@ When context contains "User clarification:" after a proposal was made:
         plan_dict = plan.to_dict()
         plan_dict["paused_at_phase"] = current_phase
 
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, plan.original_task, "paused", plan_dict
-        )
+        await self._persist_plan(plan, "paused")
         await self._emit_plan_status(
             plan,
             f"⏸ Research paused after iteration "
@@ -1624,9 +2007,7 @@ When context contains "User clarification:" after a proposal was made:
                 s.status = "pending"
 
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(
-            task_id, plan_id, original_task, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         await self._emit_plan_status(
             plan,
             f"▶ Resuming from phase {paused_at_phase}…",
@@ -1651,9 +2032,7 @@ When context contains "User clarification:" after a proposal was made:
             current_phase = plan.current_phase()
             plan_dict = plan.to_dict()
             plan_dict["paused_at_phase"] = current_phase
-            await self.memory.upsert_plan(
-                task_id, plan.plan_id, plan.original_task, "knowledge_gap", plan_dict
-            )
+            await self._persist_plan(plan, "knowledge_gap")
 
         await self.bus.publish(
             Event(
@@ -1904,9 +2283,7 @@ When context contains "User clarification:" after a proposal was made:
 
         old_task = plan.original_task
         plan.original_task = updated_task[:500]
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, plan.original_task, "planning", plan.to_dict()
-        )
+        await self._persist_plan(plan, "planning")
         await self._emit_plan_status(
             plan,
             "✏️ Task updated by user — replanning with amended instructions.",
@@ -2959,14 +3336,37 @@ When context contains "User clarification:" after a proposal was made:
                 "\nRecent conversation (oldest→newest):\n" + "\n".join(lines)
             )
 
-        # Long-term memory — cap at 2 to avoid pollution
-        prior_knowledge = (await self.recall(task))[:2]
+        # Long-term memory — cap at 4 hits so we can show both success and failure
+        # records when both exist, but never pollute the planner with more than needed.
+        prior_knowledge = (await self.recall(task))[:4]
         context = ""
         if prior_knowledge:
-            raw_context = "\n\nRelevant prior knowledge:\n" + "\n".join(
-                f"- [{e['topic']}] {e['content'][:200]}" for e in prior_knowledge
-            )
-            context = truncate_context(raw_context)
+            successes = [e for e in prior_knowledge if e["topic"] == "task_success"]
+            failures = [e for e in prior_knowledge if e["topic"] == "task_failure"]
+            other = [
+                e
+                for e in prior_knowledge
+                if e["topic"] not in ("task_success", "task_failure")
+            ]
+
+            lines: list[str] = []
+            # One success record — tells planner which agent sequence worked
+            if successes:
+                e = successes[0]
+                lines.append(f"- [PREVIOUS SUCCESS] {e['content'][:200]}")
+            # One failure record — tells planner what approach to avoid
+            if failures:
+                e = failures[0]
+                lines.append(
+                    f"- [PREVIOUS FAILURE — avoid repeating this approach] {e['content'][:200]}"
+                )
+            # Other knowledge (non-outcome facts), up to 1
+            for e in other[:1]:
+                lines.append(f"- [{e['topic']}] {e['content'][:200]}")
+
+            if lines:
+                raw_context = "\n\nRelevant prior knowledge:\n" + "\n".join(lines)
+                context = truncate_context(raw_context)
 
         # Tool registry — find relevant tools before calling the LLM planner.
         # This lets the planner reference concrete tool names instead of guessing.
@@ -2983,29 +3383,27 @@ When context contains "User clarification:" after a proposal was made:
             await self._run_merch_workflow(task, task_id, discord_message_id)
             return
 
-        if keyword_plan and not retry_context:
-            steps = [
-                PlanStep(
-                    step_id=str(uuid.uuid4()),
-                    phase=s.get("phase", 1),
-                    task=s["task"],
-                    agent=s["agent"],
-                    expected=s.get("expected", ""),
-                )
-                for s in keyword_plan
-            ]
-        else:
-            steps = await self._llm_plan(
-                task,
-                context,
-                conversation_context,
-                retry_context,
-                task_id=task_id,
-                discord_message_id=discord_message_id,
-                reply_task_id=reply_task_id,
-            )
+        # Always run through the LLM planner so multi-step tasks are properly
+        # decomposed into focused per-agent sub-tasks.  The keyword router now
+        # only provides an agent hint that biases the planner — it no longer
+        # short-circuits plan generation with the raw user message as the step task.
+        agent_hint = (
+            keyword_plan[0]["agent"] if keyword_plan and not retry_context else None
+        )
+        steps = await self._llm_plan(
+            task,
+            context,
+            conversation_context,
+            retry_context,
+            task_id=task_id,
+            discord_message_id=discord_message_id,
+            reply_task_id=reply_task_id,
+            agent_hint=agent_hint,
+        )
 
-        # Planner asked for clarification — no plan to build
+        # Empty steps: planner asked for clarification/proposal (task suspended),
+        # or both planning attempts failed (user already notified).  Either way,
+        # nothing to execute.
         if not steps:
             return
 
@@ -3070,10 +3468,33 @@ When context contains "User clarification:" after a proposal was made:
                 return
 
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, task, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         await self._dispatch_phase(plan, min(phases))
+
+    def _build_constraint_context(self) -> str:
+        """
+        Build a short pinned block from all conversation entries tagged as
+        constraints (e.g. "don't use Docker").  Deduped by normalised text;
+        most recent version of a repeated constraint wins.
+
+        This block is always included in the planner prompt regardless of
+        budget — it is treated as an extension of the task itself.
+        """
+        if not self._conversation:
+            return ""
+        seen: dict[str, str] = {}  # normalised_key → display text
+        for entry in self._conversation:
+            task_text = entry[0]
+            is_constraint = entry[4] if len(entry) > 4 else False
+            if not is_constraint:
+                continue
+            # Normalise: lower-case, collapse whitespace → dedup key
+            key = re.sub(r"\s+", " ", task_text.lower().strip())[:120]
+            seen[key] = task_text[:200]  # latest wins
+        if not seen:
+            return ""
+        lines = [f"  • {v}" for v in seen.values()]
+        return "\nHard constraints (MUST be respected):\n" + "\n".join(lines)
 
     async def _fit_plan_context(
         self,
@@ -3087,37 +3508,43 @@ When context contains "User clarification:" after a proposal was made:
         planner always receives the full task description.
 
         Priority (highest → lowest):
-          1. task + retry_context  — always preserved
-          2. conversation_context — trimmed to oldest N entries
-          3. context (memory/tools) — dropped last
+          1. task + retry_context      — always preserved
+          2. constraint_context        — always preserved (pinned constraints)
+          3. conversation_context      — trimmed to 3 most-recent turns
+          4. context (memory/tools)    — dropped last
         """
+        constraint_context = self._build_constraint_context()
+
         limit = await self._get_model_context_limit()
         # Reserve 25% for the reply and ~10% for the system prompt overhead
         budget = int(limit * 0.65)
         base_tokens = self._estimate_tokens(
             [
                 SystemMessage(content=self._PLAN_PROMPT),
-                HumanMessage(content=f"Task: {task}{retry_context}"),
+                HumanMessage(
+                    content=f"Task: {task}{constraint_context}{retry_context}"
+                ),
             ]
         )
         available = budget - base_tokens
 
         if available <= 0:
-            # Task alone overflows — nothing we can add; let llm_invoke truncate
+            # Task + constraints already overflow — constraints still stay,
+            # everything else is dropped; let llm_invoke truncate if needed.
             log.warning(
                 "orchestrator.plan_context_overflow",
                 task_len=len(task),
                 base_tokens=base_tokens,
                 budget=budget,
             )
-            return retry_context
+            return constraint_context + retry_context
 
         # Try adding full context + conversation
         full = context + conversation_context
         if self._estimate_tokens([HumanMessage(content=full)]) <= available:
-            return context + conversation_context + retry_context
+            return context + conversation_context + constraint_context + retry_context
 
-        # Trim conversation to 3 most recent turns
+        # Trim conversation to 3 most recent turns (non-constraint; constraints already pinned)
         trimmed_conv = ""
         if self._conversation:
             recent = list(self._conversation)[-3:]
@@ -3130,14 +3557,14 @@ When context contains "User clarification:" after a proposal was made:
             <= available
         ):
             log.info("orchestrator.plan_context_trimmed", kept="conv_3", task=task[:60])
-            return context + trimmed_conv + retry_context
+            return context + trimmed_conv + constraint_context + retry_context
 
         # Drop conversation entirely, keep memory/tools context
         if self._estimate_tokens([HumanMessage(content=context)]) <= available:
             log.info(
                 "orchestrator.plan_context_trimmed", kept="context_only", task=task[:60]
             )
-            return context + retry_context
+            return context + constraint_context + retry_context
 
         # Context alone is too large — truncate it to fit
         max_ctx_chars = available * 4  # ~4 chars/token
@@ -3151,7 +3578,7 @@ When context contains "User clarification:" after a proposal was made:
             kept="context_truncated",
             task=task[:60],
         )
-        return truncated_ctx + retry_context
+        return truncated_ctx + constraint_context + retry_context
 
     async def _llm_plan(
         self,
@@ -3162,93 +3589,154 @@ When context contains "User clarification:" after a proposal was made:
         task_id: str = "",
         discord_message_id: str | None = None,
         reply_task_id: str | None = None,
+        agent_hint: str | None = None,
     ) -> list[PlanStep]:
         """
         Call the LLM to build a structured phased plan.
-        If the LLM returns {"clarify": "..."}, emit the question and return [].
-        Falls back to a single executor step on parse failure.
+
+        On a bad LLM response (malformed JSON, missing steps, empty steps) the
+        planner is retried exactly once with the bad output shown so the model can
+        self-correct.  If the retry also fails, the task is escalated to the user
+        with a clear error — the raw user message is NEVER passed to a specialist
+        agent as a step task.
+
+        Returns [] when the planner emits clarify/propose (task suspended).
+        Raises PlanningError when both attempts fail (caller escalates to user).
         """
         fitted_context = await self._fit_plan_context(
             task, context, conversation_context, retry_context
         )
-        # When the user has already replied to a proposal, put the clarification
-        # BEFORE the task so the scope-check instruction doesn't fire first.
+        hint_suffix = (
+            f"\n\nAgent hint: keyword analysis suggests '{agent_hint}' is the primary agent for this task."
+            if agent_hint
+            else ""
+        )
         if "User clarification:" in retry_context:
-            human_content = f"{retry_context}\n\nOriginal task: {task}{fitted_context.replace(retry_context, '')}"
+            human_content = f"{retry_context}\n\nOriginal task: {task}{fitted_context.replace(retry_context, '')}{hint_suffix}"
         else:
-            human_content = f"Task: {task}{fitted_context}"
-        messages = [
+            human_content = f"Task: {task}{fitted_context}{hint_suffix}"
+
+        base_messages = [
             SystemMessage(content=self._PLAN_PROMPT),
             HumanMessage(content=human_content),
         ]
-        try:
-            response = await self.llm_invoke(messages)
-            raw = response.content.strip()
-            if "```" in raw:
-                parts = raw.split("```")
-                raw = parts[1] if len(parts) > 1 else parts[0]
-                if raw.lower().startswith("json"):
-                    raw = raw[4:]
-            data = json.loads(raw)
 
-            # Planner is proposing a phased breakdown for a project-scale task.
-            # Suspend and wait for the user to confirm which phases to run.
-            # If retry_context already carries a user clarification (i.e. the user
-            # already replied to a prior proposal) the planner should have built a
-            # plan — treat a repeated propose as a parse failure and fall through to
-            # the hard fallback so we don't loop indefinitely.
-            if (
-                "propose" in data
-                and task_id
-                and "User clarification:" not in retry_context
-            ):
-                proposal = str(data["propose"])
-                log.info("orchestrator.planner_propose", proposal=proposal[:120])
-                # reply_task_id is the new incoming task_id when resuming from
-                # clarification — use it so the bridge can match _pending_messages.
-                _reply_id = reply_task_id or task_id
-                await self._save_pending_clarification(
-                    task, task_id, discord_message_id
-                )
-                await self._publish_reply(
-                    f"This looks like a multi-phase project. Here's how I'd break it down:\n\n{proposal}",
-                    _reply_id,
-                    discord_message_id,
-                    original_task=task,
-                    is_chat=True,
-                )
-                return []
+        last_error: str = ""
+        last_raw: str = ""
 
-            # Planner is asking for clarification — suspend the task and wait
-            # for the user's reply before building the plan.
-            if "clarify" in data and task_id:
-                question = str(data["clarify"])
-                log.info("orchestrator.planner_clarify", question=question[:100])
-                # Save pending state so _handle_task can resume on the next message.
-                _reply_id = reply_task_id or task_id
-                await self._save_pending_clarification(
-                    task, task_id, discord_message_id
+        for attempt in range(2):  # attempt 0 = first try, attempt 1 = self-correction
+            if attempt == 0:
+                messages = base_messages
+            else:
+                # Show the model exactly what it produced and why it was wrong,
+                # then ask it to fix it.  No new context fetches needed.
+                log.warning(
+                    "orchestrator.plan_retry",
+                    attempt=attempt,
+                    error=last_error[:120],
+                    raw_preview=last_raw[:120],
                 )
-                await self._publish_reply(
-                    question, _reply_id, discord_message_id, original_task=task
-                )
-                return []
+                messages = base_messages + [
+                    AIMessage(content=last_raw),
+                    HumanMessage(
+                        content=(
+                            f"That plan was rejected.\n"
+                            f"Reason: {last_error}\n\n"
+                            "Fix only the identified issue(s) and return the corrected JSON. "
+                            "Return ONLY valid JSON matching one of the three formats in the system prompt. "
+                            "No prose, no markdown fences."
+                        )
+                    ),
+                ]
 
-            steps = self._parse_plan_steps(data)
-            if steps:
-                return steps
-        except Exception as exc:
-            log.warning("orchestrator.plan_parse_failed", error=str(exc))
-        # Hard fallback
-        return [
-            PlanStep(
-                step_id=str(uuid.uuid4()),
-                phase=1,
-                task=task,
-                agent="executor",
-                expected="",
+            try:
+                response = await self.llm_invoke(messages)
+                raw = response.content.strip()
+                last_raw = raw
+
+                # Strip markdown fences if present
+                if "```" in raw:
+                    parts = raw.split("```")
+                    raw = parts[1] if len(parts) > 1 else parts[0]
+                    if raw.lower().startswith("json"):
+                        raw = raw[4:]
+
+                data = json.loads(raw)
+
+                # ── propose ────────────────────────────────────────────────
+                if (
+                    "propose" in data
+                    and task_id
+                    and "User clarification:" not in retry_context
+                ):
+                    proposal = str(data["propose"])
+                    log.info("orchestrator.planner_propose", proposal=proposal[:120])
+                    _reply_id = reply_task_id or task_id
+                    await self._save_pending_clarification(
+                        task, task_id, discord_message_id
+                    )
+                    await self._publish_reply(
+                        f"This looks like a multi-phase project. Here's how I'd break it down:\n\n{proposal}",
+                        _reply_id,
+                        discord_message_id,
+                        original_task=task,
+                        is_chat=True,
+                    )
+                    return []
+
+                # ── clarify ────────────────────────────────────────────────
+                if "clarify" in data and task_id:
+                    question = str(data["clarify"])
+                    log.info("orchestrator.planner_clarify", question=question[:100])
+                    _reply_id = reply_task_id or task_id
+                    await self._save_pending_clarification(
+                        task, task_id, discord_message_id
+                    )
+                    await self._publish_reply(
+                        question, _reply_id, discord_message_id, original_task=task
+                    )
+                    return []
+
+                # ── steps ──────────────────────────────────────────────────
+                steps = self._parse_plan_steps(data)
+                if steps:
+                    validation_error = self._validate_plan(steps, task)
+                    if validation_error:
+                        last_error = validation_error
+                        last_raw = raw  # keep for self-correction context
+                        continue
+                    if attempt > 0:
+                        log.info("orchestrator.plan_retry_succeeded", attempt=attempt)
+                    return steps
+
+                last_error = "plan parsed but contained no valid steps"
+
+            except json.JSONDecodeError as exc:
+                last_error = f"JSON parse error: {exc}"
+            except Exception as exc:
+                last_error = str(exc)
+
+        # Both attempts failed — escalate to the user.  Never pass raw user
+        # text to a specialist agent as a substitute for a real plan.
+        log.error(
+            "orchestrator.plan_failed",
+            task=task[:80],
+            last_error=last_error,
+            last_raw=last_raw[:200],
+        )
+        if task_id:
+            _reply_id = reply_task_id or task_id
+            await self._publish_reply(
+                f"⚠️ I was unable to build a plan for this task after two attempts.\n\n"
+                f"**Task:** {task[:200]}\n"
+                f"**Reason:** {last_error}\n\n"
+                "Please rephrase the request or provide more detail.",
+                _reply_id,
+                discord_message_id,
+                original_task=task,
+                is_chat=True,
             )
-        ]
+        return []
 
     _MAX_PLAN_STEPS = 8  # hard cap — prevents runaway plans from the LLM
 
@@ -3271,16 +3759,183 @@ When context contains "User clarification:" after a proposal was made:
             task = str(s.get("task", "")).strip()
             if not task:
                 continue
+            capped = task[:600]
             steps.append(
                 PlanStep(
                     step_id=str(uuid.uuid4()),
                     phase=max(1, int(s.get("phase", 1))),
-                    task=task[:600],  # hard cap on step task length
+                    task=capped,
                     agent=str(s.get("agent", "executor")).strip(),
                     expected=str(s.get("expected", "")).strip()[:200],
+                    original_subtask=capped,  # frozen at depth 0, never mutated
                 )
             )
         return steps
+
+    _KNOWN_AGENTS = frozenset(
+        {
+            "executor",
+            "developer",
+            "code_search",
+            "research",
+            "document_qa",
+            "claude_code_agent",
+            "optimizer",
+        }
+    )
+
+    # Tokens that make an executor task actionable (path sep, common commands, etc.)
+    _EXECUTOR_TOKENS = re.compile(
+        r"(/[\w./]|\b(ls|cat|grep|find|python3?|pip3?|git|docker|npm|yarn|apt|curl|wget|tee|mkdir|cp|mv|rm|echo|touch|chmod|tar|zip|unzip)\b|`|\$[({])",
+        re.I,
+    )
+
+    def _validate_plan(self, steps: list[PlanStep], original_task: str) -> str | None:
+        """
+        Structural validation of a parsed plan before first dispatch.
+
+        Returns None if the plan is valid, or a human-readable error string
+        that is fed back into the _llm_plan self-correction loop.
+
+        Checks (fast, no LLM):
+        1. Step field completeness — task length, known agent name, positive phase
+        2. Phase contiguity — phases must be a contiguous run starting at 1
+        3. Passthrough detection — step task must not be a near-verbatim copy of
+           the original user task (catches planner laziness)
+        4. Agent-specific content — executor tasks must contain actionable tokens;
+           code_search tasks must contain a search-like query
+        5. Explicit self-references — a step must not reference its own phase in
+           a way that implies it depends on its own output
+        """
+        errors: list[str] = []
+
+        # 1. Per-step field checks
+        for i, step in enumerate(steps, start=1):
+            label = f"step {i} (phase {step.phase}, agent={step.agent})"
+
+            if len(step.task) < 10:
+                errors.append(
+                    f"{label}: task is too short ({len(step.task)} chars) — must be >= 10"
+                )
+
+            if step.agent not in self._KNOWN_AGENTS:
+                errors.append(
+                    f"{label}: unknown agent '{step.agent}' — "
+                    f"valid agents: {', '.join(sorted(self._KNOWN_AGENTS))}"
+                )
+
+            if step.phase < 1:
+                errors.append(f"{label}: phase must be >= 1, got {step.phase}")
+
+        # 2. Phase contiguity — phases must form a contiguous set {1, 2, ..., N}
+        phases = sorted({s.phase for s in steps})
+        expected_phases = list(range(1, len(phases) + 1))
+        if phases != expected_phases:
+            errors.append(
+                f"phases are not contiguous starting at 1: got {phases}, "
+                f"expected {expected_phases} — renumber phases so they are sequential"
+            )
+
+        # 3. Passthrough detection — task must not be a near-verbatim copy of the user ask
+        original_norm = original_task.strip().lower()
+        for i, step in enumerate(steps, start=1):
+            task_norm = step.task.strip().lower()
+            # Similarity: if > 85% of original words appear in the step task, it's a passthrough
+            original_words = set(original_norm.split())
+            if original_words and len(original_words) >= 6:
+                overlap = sum(1 for w in original_words if w in task_norm)
+                if overlap / len(original_words) > 0.85:
+                    errors.append(
+                        f"step {i} (phase {step.phase}): task is a near-verbatim copy of the "
+                        f"original user request — decompose it into a specific, focused sub-task "
+                        f"for the '{step.agent}' agent"
+                    )
+
+        # 4. Agent-specific content checks
+        for i, step in enumerate(steps, start=1):
+            if step.agent == "executor":
+                if not self._EXECUTOR_TOKENS.search(step.task):
+                    errors.append(
+                        f"step {i} (phase {step.phase}, agent=executor): task contains no "
+                        f"actionable shell tokens (paths, commands, backticks) — "
+                        f"executor needs a concrete shell command or file path"
+                    )
+            elif step.agent == "code_search":
+                # Must contain something search-like: a quoted string, a dotted name,
+                # a path fragment, or a camelCase/snake_case identifier
+                has_query = re.search(
+                    r'(".*?"|\'.*?\'|[\w]+\.[\w.]+|/[\w./]+|[A-Z][a-z]+[A-Z]|\b_\w+_\b)',
+                    step.task,
+                )
+                if not has_query:
+                    errors.append(
+                        f"step {i} (phase {step.phase}, agent=code_search): task must contain "
+                        f"a specific search target (quoted string, symbol name, or file path)"
+                    )
+
+        # 5. Explicit self-references — detect "phase N" / "step N" forward references
+        #    within a phase that point to the same phase (can never be satisfied)
+        phase_steps: dict[int, list[PlanStep]] = {}
+        for step in steps:
+            phase_steps.setdefault(step.phase, []).append(step)
+
+        for step in steps:
+            # Look for explicit numeric phase/step references in the task text
+            refs = re.findall(r"\bphase\s+(\d+)\b|\bstep\s+(\d+)\b", step.task, re.I)
+            for phase_ref, step_ref in refs:
+                ref_num = int(phase_ref or step_ref)
+                if phase_ref and ref_num == step.phase:
+                    errors.append(
+                        f"step in phase {step.phase}: references 'phase {ref_num}' within its own phase "
+                        f"— outputs from a phase are only available to later phases"
+                    )
+
+        # 6. Discord/direct isolation — discord or direct steps must not share a phase
+        #    with async agent steps.
+        #    discord steps complete via an event callback (_handle_discord_done); if an
+        #    async agent step in the same phase hangs, the discord result sits unacted-on
+        #    indefinitely.  Always put discord/direct steps in their own phase.
+        _SYNC_AGENTS = {"discord", "direct"}
+        for phase_num, phase_step_list in phase_steps.items():
+            agents_in_phase = {s.agent for s in phase_step_list}
+            sync_in_phase = agents_in_phase & _SYNC_AGENTS
+            async_in_phase = agents_in_phase - _SYNC_AGENTS
+            if sync_in_phase and async_in_phase:
+                errors.append(
+                    f"phase {phase_num} mixes synchronous steps ({', '.join(sorted(sync_in_phase))}) "
+                    f"with async agent steps ({', '.join(sorted(async_in_phase))}) — "
+                    f"discord/direct steps must be in their own phase so they resolve independently"
+                )
+
+        # 7. Expected field — must be non-empty for every step.
+        #    A missing expected means the orchestrator cannot verify the step succeeded,
+        #    which makes the fix cycle blind. Agents that produce free-form results
+        #    (research, document_qa) especially need a concrete signal.
+        #    Steps whose agent is "discord" or "direct" are exempt — their success
+        #    is determined structurally (ok flag / non-empty reply).
+        _EXPECTED_EXEMPT = {"discord", "direct"}
+        for i, step in enumerate(steps, start=1):
+            if step.agent in _EXPECTED_EXEMPT:
+                continue
+            if not step.expected or len(step.expected.strip()) < 5:
+                errors.append(
+                    f"step {i} (phase {step.phase}, agent={step.agent}): "
+                    f"'expected' field is missing or too vague — provide a concrete, "
+                    f"verifiable success signal (e.g. 'exit code 0', "
+                    f"'answer includes file path and line number', "
+                    f"'at least 2 sources cited with URLs'). "
+                    f"If you cannot determine a success signal, emit a clarification request instead."
+                )
+
+        if not errors:
+            return None
+
+        log.warning(
+            "orchestrator.plan_validation_failed",
+            error_count=len(errors),
+            errors=errors[:3],
+        )
+        return "Plan validation failed:\n" + "\n".join(f"  • {e}" for e in errors)
 
     # ── Crash recovery ───────────────────────────────────────────────────────
 
@@ -3319,6 +3974,9 @@ When context contains "User clarification:" after a proposal was made:
                 expected=s.get("expected", ""),
                 status=s.get("status", "pending"),
                 result=s.get("result", ""),
+                depth=s.get("depth", 0),
+                original_subtask=s.get("original_subtask", ""),
+                error_chain=s.get("error_chain", []),
             )
             for s in raw_steps
         ]
@@ -3387,10 +4045,9 @@ When context contains "User clarification:" after a proposal was made:
             steps=steps,
             discord_message_id=plan_json.get("discord_message_id"),
             context=plan_json.get("context", ""),
+            db_version=row.get("version", 0),
         )
-        await self.memory.upsert_plan(
-            task_id, plan_id, original_task, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         return plan
 
     async def _handle_stale_plan(self, event: Event) -> None:
@@ -3440,6 +4097,28 @@ When context contains "User clarification:" after a proposal was made:
         if not steps:
             await self._check_phase_complete(plan)
             return
+
+        # Runtime guard: discord/direct steps must not share a phase with async agent
+        # steps (_validate_plan rejects this at plan time, but guard here too).
+        # If the planner somehow produced a mixed phase, split it: dispatch only the
+        # sync steps now and let async steps run after discord resolves.
+        _SYNC_AGENTS = {"discord", "direct"}
+        sync_steps = [s for s in steps if s.agent in _SYNC_AGENTS]
+        async_steps = [s for s in steps if s.agent not in _SYNC_AGENTS]
+        if sync_steps and async_steps:
+            log.warning(
+                "orchestrator.mixed_phase_detected",
+                task_id=plan.task_id,
+                phase=phase,
+                sync_agents=[s.agent for s in sync_steps],
+                async_agents=[s.agent for s in async_steps],
+            )
+            # Defer async steps to the next phase so discord resolves independently.
+            # Renumber: find the highest phase and insert a new one after current.
+            next_phase = plan.max_phase() + 1
+            for s in async_steps:
+                s.phase = next_phase
+            steps = sync_steps  # dispatch only sync steps in this phase
 
         step_desc = " | ".join(f"[{s.agent}] {s.task[:50]}" for s in steps)
         await self._emit_plan_status(plan, f"⚡ Phase {phase}: {step_desc}")
@@ -3574,7 +4253,12 @@ When context contains "User clarification:" after a proposal was made:
                 plan,
                 f"← `[{event.source}]` result ({len(result)} chars): {preview}{'…' if len(result) > 120 else ''}",
             )
-            step = next((s for s in plan.steps if s.step_id == subtask_id), None)
+            step = (
+                next((s for s in plan.steps if s.step_id == subtask_id), None)
+                if subtask_id
+                else None
+            )
+
             if step:
                 passed, reason = self._validate_result(
                     step.expected, result, source=event.source
@@ -3590,15 +4274,41 @@ When context contains "User clarification:" after a proposal was made:
                         plan, f"✅ `[{event.source}]` step complete"
                     )
             else:
-                # Fallback: mark first running step for this agent
-                for s in plan.steps:
-                    if s.status == "running" and s.agent == event.source:
-                        passed, _ = self._validate_result(
-                            s.expected, result, source=event.source
-                        )
-                        s.result = result
-                        s.status = "done" if passed else "failed"
-                        break
+                # subtask_id was missing or did not match any step — this is a
+                # protocol violation.  Rather than silently attributing the result
+                # to a random running step (which corrupts validation for parallel
+                # same-agent steps), we fail explicitly so the fix cycle fires with
+                # a clear diagnostic.
+                log.error(
+                    "orchestrator.unmatched_result",
+                    source=event.source,
+                    subtask_id=subtask_id,
+                    parent_id=parent_id,
+                    result_preview=result[:120],
+                )
+                await self._emit_plan_status(
+                    plan,
+                    f"❌ `[{event.source}]` result arrived with unmatched subtask_id "
+                    f"'{subtask_id}' — cannot attribute to a step",
+                )
+                # Mark the oldest running step for this agent as failed so the phase
+                # does not hang indefinitely.  We prefer failing deterministically
+                # over silently assigning to the wrong step.
+                unmatched_step = next(
+                    (
+                        s
+                        for s in plan.steps
+                        if s.status == "running" and s.agent == event.source
+                    ),
+                    None,
+                )
+                if unmatched_step:
+                    unmatched_step.result = (
+                        f"Agent error: result arrived with unmatched subtask_id "
+                        f"'{subtask_id}' — orchestrator could not route this result. "
+                        f"Result preview: {result[:300]}"
+                    )
+                    unmatched_step.status = "failed"
 
             if event.payload.get("promote", False):
                 await self.promote_now(result, topic=event.source, tags=[event.source])
@@ -3606,27 +4316,35 @@ When context contains "User clarification:" after a proposal was made:
             await self._check_phase_complete(plan)
             return
 
-        # No matching plan — the plan was either expired or this is an orphan result.
-        # Try to recover discord_message_id from the context stream registry so the
-        # user still gets a reply even after plan expiry.
+        # No matching plan — result arrived after plan closure (slow agent, race,
+        # or restart).  Dead-letter it so it is not silently dropped, then notify
+        # the user on the original Discord thread if we can recover the message id.
         log.warning(
             "orchestrator.orphan_result",
             source=event.source,
             parent_id=parent_id,
             subtask_id=subtask_id,
         )
+        await self.bus.publish_dead_letter(
+            reason="result arrived after plan closure or with unknown parent_task_id",
+            source=event.source,
+            event_type="task.completed",
+            payload=event.payload,
+        )
+        # Best-effort Discord notification on the original thread
         discord_message_id = None
         effective_task_id = parent_id or event.task_id
         if parent_id:
             ctx_meta = await self.bus.get_context_metadata(parent_id)
             if ctx_meta:
                 discord_message_id = ctx_meta.get("discord_message_id") or None
-
-        await self._synthesise_and_reply(
-            original_task=event.payload.get("task", ""),
-            raw_results=[(event.source, result)],
-            task_id=effective_task_id,
-            discord_message_id=discord_message_id,
+        await self._publish_reply(
+            f"⚠️ Late result from `{event.source}` arrived after task `{parent_id}` "
+            f"was already closed. The result has been saved to the dead-letter queue "
+            f"and was not applied.\n\nResult preview: {result[:300]}",
+            effective_task_id,
+            discord_message_id,
+            is_chat=True,
         )
 
     async def _handle_agent_error(self, event: Event) -> None:
@@ -3675,11 +4393,18 @@ When context contains "User clarification:" after a proposal was made:
                 await self._check_phase_complete(plan)
             return
 
-        # No active plan — orphan error, surface directly to Discord
+        # No active plan — error arrived after plan closure or with unknown
+        # parent_task_id.  Dead-letter it and notify the user on the original thread.
         log.warning(
             "orchestrator.orphan_agent_error",
             source=event.source,
             error=error_msg[:200],
+        )
+        await self.bus.publish_dead_letter(
+            reason="agent error arrived after plan closure or with unknown parent_task_id",
+            source=event.source,
+            event_type="error",
+            payload=payload,
         )
         task_id = payload.get("task_id", event.task_id)
         if not discord_message_id and parent_task_id:
@@ -3687,9 +4412,12 @@ When context contains "User clarification:" after a proposal was made:
             if ctx_meta:
                 discord_message_id = ctx_meta.get("discord_message_id") or None
         await self._publish_reply(
-            f"⚠️ Agent `{event.source}` encountered an error: {error_msg}",
+            f"⚠️ Agent `{event.source}` reported an error after task `{parent_task_id}` "
+            f"was already closed. The error has been saved to the dead-letter queue.\n\n"
+            f"Error: {error_msg}",
             task_id,
             discord_message_id,
+            is_chat=True,
         )
 
     async def _handle_discord_done(self, event: Event) -> None:
@@ -3760,12 +4488,20 @@ When context contains "User clarification:" after a proposal was made:
         """
         Rule-based result validation. Returns (passed, reason).
 
-        Core rule: a successful result must prove work was actually done.
-        For executor steps: an exit code must be present.
-        For all agents: [EXECUTOR_NO_CMD] and hard error markers are failures.
+        Each agent has a distinct result contract:
+          executor     — must contain 'Exit code: 0'; any non-zero code is a failure.
+          developer    — agent_loop result (DONE: prefix stripped); must be substantive
+                         and not start with a give-up phrase.
+          code_search  — same as developer.
+          document_qa  — free-form text, but explicit LaTeX/compile error markers are failures.
+          research     — free-form text; too-short result signals a silent fetch failure.
+          discord      — JSON/dict result; 'ok': false is a failure.
+          direct       — any non-empty text is accepted (orchestrator answered inline).
         """
         if not result:
             return False, "Empty result"
+
+        # ── Universal failure signals (all agents) ────────────────────────────
 
         # Executor couldn't extract or run a command — it only chatted
         if result.startswith("[EXECUTOR_NO_CMD]"):
@@ -3775,14 +4511,13 @@ When context contains "User clarification:" after a proposal was made:
             )
 
         # Any non-zero exit code is a failure — match "Exit code: <N>" where N != 0.
-        # Using regex so codes like 1, 2, 127, 128, 255 etc. are all caught.
         _exit_match = re.search(r"Exit code:\s*(-?\d+)", result)
         if _exit_match:
             _code = int(_exit_match.group(1))
             if _code != 0:
                 return False, f"Exit code: {_code}"
 
-        # Caught-exception strings returned as results by any agent
+        # Hard error prefixes emitted by any agent
         universal_fail_prefixes = [
             "Research failed:",
             "Agent error:",
@@ -3793,37 +4528,93 @@ When context contains "User clarification:" after a proposal was made:
             if result.startswith(prefix):
                 return False, result[:120]
 
-        # Prose-style markers — only meaningful when the executor itself produced the result;
-        # these phrases appear naturally in code being analysed by other agents (e.g. code_search).
-        executor_fail_markers = [
-            "Traceback (most recent",
-            "Exception:",
-            "not on the allowlist",
-            "Execution error:",
-            "Command timed out",
-        ]
-        if source == "executor":
-            for m in executor_fail_markers:
-                if m in result:
-                    return False, m.strip()
-
         # Discord action failures
         if "'ok': False" in result or '"ok": false' in result.lower():
             return False, "Discord action reported failure"
 
-        # Executor-specific: no evidence of command execution = chatted instead of worked
-        if source == "executor" and "Exit code:" not in result:
-            return False, "Executor result has no 'Exit code:' — command was not run"
+        # ── Per-agent contracts ───────────────────────────────────────────────
 
-        # Expected outcome check: if the expected description names a concrete
-        # success signal, verify it appears somewhere in the result.
+        if source == "executor":
+            # Executor-specific prose markers (safe to check here because these
+            # phrases won't appear in code being analysed by other agents).
+            for m in (
+                "Traceback (most recent",
+                "not on the allowlist",
+                "Execution error:",
+                "Command timed out",
+            ):
+                if m in result:
+                    return False, m.strip()
+            # No evidence of a command having run
+            if "Exit code:" not in result:
+                return (
+                    False,
+                    "Executor result has no 'Exit code:' — command was not run",
+                )
+
+        elif source in ("developer", "code_search"):
+            # agent_loop strips the "DONE:" prefix before returning — the result is
+            # the answer text itself.  Validate by checking it is substantive and
+            # doesn't look like the agent gave up or only described what it would do.
+            result_stripped = result.strip()
+            if len(result_stripped) < 30:
+                return (
+                    False,
+                    f"{source} result too short — agent likely did not complete the task",
+                )
+            # Phrases that indicate the agent described the task instead of doing it
+            gave_up_phrases = [
+                "I would need to",
+                "I cannot",
+                "I don't have access",
+                "Unable to complete",
+                "I am unable to",
+            ]
+            for phrase in gave_up_phrases:
+                if result_stripped.startswith(phrase):
+                    return False, f"{source} agent gave up: {result_stripped[:120]}"
+
+        elif source == "document_qa":
+            # LaTeX/PDF generation failures embedded in the result suffix
+            latex_fail_markers = [
+                "[LaTeX write error:",
+                "latexmk failed",
+                "Agent-stack source not found",
+            ]
+            for m in latex_fail_markers:
+                if m in result:
+                    return False, m.strip()
+            # A result shorter than 20 chars for a QA/generation task is suspicious
+            if len(result.strip()) < 20:
+                return False, "document_qa result too short to be a real answer"
+
+        elif source == "research":
+            # Research agent produces several sentences; fewer than 30 chars suggests
+            # it failed silently (e.g. all sources 404'd and it returned nothing useful).
+            if len(result.strip()) < 30:
+                return (
+                    False,
+                    "Research result too short — likely a silent fetch failure",
+                )
+
+        # ── Expected outcome check ────────────────────────────────────────────
+        # Use the planner-supplied expected signal as a semantic gate.
+        # Strategy: extract meaningful keywords from expected (≥4 chars, skip stop
+        # words) and require that enough of them appear in the result.  This is
+        # intentionally lenient — we require ≥50% keyword overlap so that a rich
+        # expected phrase doesn't false-positive on minor wording differences, but
+        # a completely unrelated result still fails.
+        #
+        # Hard-coded patterns for common deterministic signals are checked first
+        # because their absence is unambiguous (e.g. "Exit code: 0" either appears
+        # or it doesn't — no fuzzy matching needed).
         if expected:
             exp_lower = expected.lower()
             result_lower = result.lower()
-            # "exit code 0" → the result must contain "exit code: 0"
+
+            # Hard deterministic signals
             if "exit code 0" in exp_lower and "exit code: 0" not in result_lower:
                 return False, f"Expected '{expected}' but result has no 'Exit code: 0'"
-            # "file written" → result should mention a path or "written"
             if "file written" in exp_lower and not any(
                 kw in result_lower
                 for kw in ("written", "created", "saved", "/workspace")
@@ -3832,6 +4623,54 @@ When context contains "User clarification:" after a proposal was made:
                     False,
                     f"Expected '{expected}' but result shows no file write confirmation",
                 )
+            if "pdf" in exp_lower and ".pdf" not in result_lower:
+                return False, f"Expected '{expected}' but no PDF path found in result"
+
+            # General keyword overlap for research/document_qa/developer/code_search
+            # Skip the overlap check for executor — the hard exit-code gate above is sufficient.
+            if source not in ("executor", "discord", "direct"):
+                _STOP = {
+                    "a",
+                    "an",
+                    "the",
+                    "and",
+                    "or",
+                    "of",
+                    "in",
+                    "at",
+                    "to",
+                    "is",
+                    "are",
+                    "with",
+                    "that",
+                    "this",
+                    "for",
+                    "from",
+                    "by",
+                    "be",
+                    "on",
+                    "as",
+                    "it",
+                    "its",
+                    "into",
+                    "via",
+                    "any",
+                }
+                keywords = [
+                    w
+                    for w in re.findall(r"[a-z0-9/_.-]{4,}", exp_lower)
+                    if w not in _STOP
+                ]
+                if keywords:
+                    matched = sum(1 for kw in keywords if kw in result_lower)
+                    ratio = matched / len(keywords)
+                    if ratio < 0.5:
+                        missing = [kw for kw in keywords if kw not in result_lower]
+                        return (
+                            False,
+                            f"Expected '{expected}' — result missing key signals: "
+                            f"{', '.join(missing[:4])}",
+                        )
 
         return True, ""
 
@@ -3874,71 +4713,166 @@ When context contains "User clarification:" after a proposal was made:
 
             if fixable:
                 next_phase = max(s.phase for s in plan.steps) + 1
+
+                # Compile prior-phase outputs for the orchestrator's own use when
+                # reformulating fix tasks.  This stays in the orchestrator — agents
+                # receive only the focused sub-task string, never raw context dumps.
+                prior_done = [
+                    s
+                    for s in plan.steps
+                    if s.phase < phase and s.status == "done" and s.result
+                ]
+                prior_summary = "\n".join(
+                    f"  [phase {s.phase} | {s.agent}] {s.task[:80].replace(chr(10), ' ')}"
+                    f"\n    → {s.result[:200].replace(chr(10), ' ')}"
+                    for s in prior_done
+                )
+
                 fix_steps_added = 0
                 for step in fixable:
                     new_depth = step.depth + 1
-                    error_text = step.result[:300]
+                    failure_class = _classify_failure(step.result)
+                    # Store the full result — truncation happens at display time so
+                    # the root cause (often at the end of a traceback) is never lost.
                     error_chain = step.error_chain + [
-                        f"[depth {step.depth}] {error_text}"
+                        {
+                            "depth": step.depth,
+                            "task": step.task,
+                            "error": step.result,
+                            "failure_class": failure_class,
+                        }
                     ]
+                    # original_subtask is frozen at depth 0 — carry it forward unchanged
+                    original_subtask = step.original_subtask or step.task
+
+                    def _fmt_chain(entries: list, n: int = 3) -> str:
+                        """Format the last n error_chain entries for display."""
+                        out = []
+                        for e in entries[-n:]:
+                            if isinstance(e, dict):
+                                fc = e.get("failure_class", "")
+                                fc_tag = f" [{fc}]" if fc else ""
+                                out.append(
+                                    f"  [attempt {e['depth']}{fc_tag}] task: {e['task'][:120]}\n"
+                                    f"    error: {_truncate_error(e['error'])}"
+                                )
+                            else:
+                                out.append(f"  - {e}")
+                        return "\n".join(out)
+
+                    # ── Infrastructure bypass ──────────────────────────────
+                    # Infrastructure failures (container won't start, Docker
+                    # errors, stall timeouts) will not be resolved by retrying
+                    # the same task.  Skip the fix cycle entirely and mark the
+                    # step as requiring immediate escalation by setting depth
+                    # to max_depth so it falls into the exhausted path below.
+                    if failure_class == "infrastructure":
+                        log.warning(
+                            "orchestrator.infrastructure_failure_bypass",
+                            step_id=step.step_id,
+                            agent=step.agent,
+                            result_preview=step.result[:120],
+                        )
+                        await self._emit_plan_status(
+                            plan,
+                            f"🚫 `[{step.agent}]` infrastructure failure — "
+                            f"bypassing fix cycle: {step.result[:120]}",
+                        )
+                        step.depth = max_depth  # force into exhausted path
+                        fix_steps_added = 0  # do not add a fix step for this
+                        break  # fall through to escalation
 
                     # ── Strategy rotation ──────────────────────────────────
-                    # depth 1–3: same agent, error context
+                    # depth 1–3: same agent, error context appended
                     # depth 4–6: escalate to claude_code_agent for deeper reasoning
-                    # depth 7–9: orchestrator reformulates the task entirely
+                    # depth 7–9: orchestrator reformulates the task via LLM,
+                    #            using original_subtask + full attempt history
                     # depth 10:  exhausted — escalated below (not fixable)
                     if new_depth <= 3:
                         fix_agent = step.agent
-                        chain_ctx = "\n".join(f"  - {e}" for e in error_chain[-3:])
+                        chain_ctx = _fmt_chain(error_chain)
                         fix_task = (
-                            f"{step.task}\n\n"
-                            f"[Fix attempt {new_depth}: previous attempt failed.]\n"
-                            f"Error history:\n{chain_ctx}\n"
+                            f"{original_subtask}\n\n"
+                            f"[Fix attempt {new_depth}: previous attempt(s) failed.]\n"
+                            f"Attempt history:\n{chain_ctx}\n"
                             "Try a different approach."
                         )
                     elif new_depth <= 6:
                         fix_agent = "claude_code_agent"
-                        chain_ctx = "\n".join(f"  - {e}" for e in error_chain[-3:])
+                        chain_ctx = _fmt_chain(error_chain)
                         fix_task = (
-                            f"A previous agent ({step.agent}) failed to complete this task.\n"
-                            f"Original task: {step.task}\n\n"
-                            f"Error history (most recent first):\n{chain_ctx}\n\n"
+                            f"A previous agent ({step.agent}) failed to complete this subtask.\n"
+                            f"Original subtask: {original_subtask}\n\n"
+                            f"Attempt history (oldest first):\n{chain_ctx}\n\n"
                             "Please provide a correct solution using your full reasoning capability."
                         )
                     else:
                         fix_agent = step.agent
-                        # Reformulate from scratch via LLM
+                        # Reformulate via LLM using original_subtask + full history.
+                        # Returns JSON {task, expected} so the success signal stays
+                        # aligned with the rewritten sub-task.
+                        # The agent still receives only the clean task string.
+                        new_expected = (
+                            step.expected
+                        )  # default — overwritten if LLM succeeds
                         try:
+                            prior_section = (
+                                f"\nCompleted prior steps:\n{prior_summary}\n"
+                                if prior_summary
+                                else ""
+                            )
+                            chain_ctx = _fmt_chain(error_chain)
                             rephrase_messages = [
                                 SystemMessage(
                                     content=(
+                                        "You are a technical project manager. "
                                         "A specialist agent repeatedly failed a subtask. "
-                                        "Reformulate the task in a completely different way that avoids the known failure mode. "
-                                        "Output only the reformulated task description — no preamble."
+                                        "Using the parent task, prior completed steps, and full attempt history, "
+                                        "write a new self-contained sub-task for the same agent. "
+                                        "Respond with JSON only — no prose, no markdown fences:\n"
+                                        '{"task": "<concrete sub-task for the agent>", '
+                                        '"expected": "<one-line success signal — what a correct result looks like>"}'
                                     )
                                 ),
                                 HumanMessage(
                                     content=(
-                                        f"Original task: {step.task}\n"
-                                        f"Errors so far:\n"
-                                        + "\n".join(
-                                            f"  - {e}" for e in error_chain[-3:]
-                                        )
+                                        f"Parent task: {plan.original_task}\n"
+                                        f"{prior_section}"
+                                        f"Original sub-task (planner intent): {original_subtask}\n"
+                                        f"Original success signal: {step.expected}\n"
+                                        f"Full attempt history:\n{chain_ctx}"
                                     )
                                 ),
                             ]
                             resp = await self.llm_invoke(rephrase_messages)
-                            fix_task = resp.content.strip()
+                            raw_resp = resp.content.strip()
+                            # Strip markdown fences if present
+                            if "```" in raw_resp:
+                                parts = raw_resp.split("```")
+                                raw_resp = parts[1] if len(parts) > 1 else parts[0]
+                                if raw_resp.lower().startswith("json"):
+                                    raw_resp = raw_resp[4:]
+                            reformulated = json.loads(raw_resp)
+                            fix_task = (
+                                str(reformulated.get("task", "")).strip()
+                                or original_subtask
+                            )
+                            new_expected = (
+                                str(reformulated.get("expected", "")).strip()
+                                or step.expected
+                            )
                         except Exception:
-                            fix_task = step.task  # fallback to original
+                            fix_task = original_subtask  # fallback to planner's original intent
+                            new_expected = step.expected
 
                     fix_step = PlanStep(
                         step_id=str(uuid.uuid4()),
                         phase=next_phase,
                         task=fix_task[:2000],
                         agent=fix_agent,
-                        expected=step.expected,
+                        expected=new_expected[:200] if new_depth > 6 else step.expected,
                         depth=new_depth,
+                        original_subtask=original_subtask,
                         error_chain=error_chain,
                     )
                     plan.steps.append(fix_step)
@@ -3966,30 +4900,85 @@ When context contains "User clarification:" after a proposal was made:
                         f"🔧 {fix_steps_added} fix subtask(s) spawned → phase {next_phase}",
                     )
                     plan._phases_advancing.discard(phase)
-                    await self.memory.upsert_plan(
-                        plan.task_id,
-                        plan.plan_id,
-                        plan.original_task,
-                        "running",
-                        plan.to_dict(),
-                    )
+                    await self._persist_plan(plan, "running")
                     await self._dispatch_phase(plan, next_phase)
                     return
 
-            # All failed steps exhausted their fix budget — escalate to user
-            exhausted = [s for s in failed if s.depth >= max_depth]
-            error_lines = "\n".join(
-                f"• [{s.agent}] {s.task[:80]}\n  "
-                f"Final error (depth {s.depth}): {s.result[:200]}"
-                for s in exhausted
+                # fixable was non-empty but no fix steps were spawned — fix cycle bug.
+                # Fall through to escalation so these failures are visible to the user.
+                log.error(
+                    "orchestrator.fix_cycle_produced_no_steps",
+                    plan_id=plan.plan_id,
+                    phase=phase,
+                    fixable_count=len(fixable),
+                )
+
+            # Escalate to user — report ALL failed steps in this phase, not just
+            # the exhausted ones.  A step at depth < max_depth that wasn't fixed
+            # (fix cycle bug) is labelled explicitly so it's visible in the report.
+            def _build_step_narrative(s: PlanStep, max_depth: int) -> str:
+                attempts = []
+                for entry in s.error_chain:
+                    if isinstance(entry, dict):
+                        attempts.append(
+                            f"    [attempt {entry['depth']}] {entry['task'][:80]}\n"
+                            f"      → {_truncate_error(entry['error'])}"
+                        )
+                    else:
+                        attempts.append(f"    {entry}")
+                attempts.append(
+                    f"    [attempt {s.depth}] Final: {_truncate_error(s.result)}"
+                )
+
+                if s.depth >= max_depth:
+                    status_note = (
+                        f"fix budget exhausted ({s.depth}/{max_depth} attempts)"
+                    )
+                    strategy_note = (
+                        "tried same agent → escalated to claude_code_agent → reformulated"
+                        if s.depth >= 7
+                        else (
+                            "tried same agent → escalated to claude_code_agent"
+                            if s.depth >= 4
+                            else "retried same agent with error context"
+                        )
+                    )
+                else:
+                    status_note = (
+                        f"fix cycle did not spawn a retry at depth {s.depth} "
+                        f"(internal error — {max_depth - s.depth} attempt(s) remaining)"
+                    )
+                    strategy_note = "fix cycle aborted prematurely"
+
+                original = s.original_subtask or s.task
+                return (
+                    f"**[{s.agent}]** original subtask: `{original[:120]}`\n"
+                    f"  Status: {status_note}\n"
+                    f"  Strategy: {strategy_note}\n" + "\n".join(attempts)
+                )
+
+            step_narratives = [_build_step_narrative(s, max_depth) for s in failed]
+
+            # Summarise which phases succeeded before the failure
+            done_phases = sorted(set(s.phase for s in plan.steps if s.status == "done"))
+            failed_phase = phase
+            progress_note = (
+                f"Phases completed before failure: {done_phases}\n"
+                if done_phases
+                else "No phases completed before failure.\n"
             )
+
             reply = (
-                f"❌ Could not complete after {max_depth} fix attempt(s).\n\n"
-                f"Failed steps:\n{error_lines}\n\n"
-                "Please review the errors above or provide more specific instructions."
+                f"❌ Task could not be completed — phase {failed_phase} failed "
+                f"({len(failed)} step(s) unresolved).\n\n"
+                f"{progress_note}\n"
+                f"**Failed step(s) and remediation history:**\n\n"
+                + "\n\n".join(step_narratives)
+                + "\n\nPlease review the errors above, clarify the task, or provide additional context."
             )
             await self._emit_plan_status(
-                plan, f"❌ Escalating to user — fix depth {max_depth} exhausted"
+                plan,
+                f"❌ Escalating to user — fix depth {max_depth} exhausted on phase {failed_phase}",
             )
             await self._publish_reply(
                 reply,
@@ -3999,9 +4988,7 @@ When context contains "User clarification:" after a proposal was made:
             )
             self._plans.pop(plan.task_id, None)
             await self._close_task_context(plan, success=False)
-            await self.memory.upsert_plan(
-                plan.task_id, plan.plan_id, plan.original_task, "failed", plan.to_dict()
-            )
+            await self._persist_plan(plan, "failed")
             await self._shutdown_plan_agents(plan)
         else:
             # Phase succeeded
@@ -4010,24 +4997,36 @@ When context contains "User clarification:" after a proposal was made:
                 await self._emit_plan_status(
                     plan, f"✅ Phase {phase} complete → phase {next_phase}"
                 )
-                await self.memory.upsert_plan(
-                    plan.task_id,
-                    plan.plan_id,
-                    plan.original_task,
-                    "running",
-                    plan.to_dict(),
-                )
+                await self._persist_plan(plan, "running")
                 await self._dispatch_phase(plan, next_phase)
             else:
-                # All phases done — synthesise final reply
+                # All phases done — synthesise final reply.
+                # Only the canonical result per original subtask is passed to the
+                # synthesiser.  For any subtask that required fix attempts, only the
+                # deepest "done" step (the one that finally succeeded) contributes —
+                # earlier failed-then-fixed attempts are noise that confuses the LLM.
+                # Steps with depth == 0 are originals; fix steps (depth > 0) share
+                # original_subtask with their predecessor chain.
                 await self._emit_plan_status(plan, "✅ All phases complete")
-                all_results = [
-                    (s.agent, s.result)
-                    for s in plan.steps
-                    if s.status == "done" and s.result
-                ]
+                done_steps = [s for s in plan.steps if s.status == "done" and s.result]
+
+                # Group by original_subtask (falling back to step_id for depth-0 steps
+                # that were never fixed, where original_subtask == task).
+                # Within each group keep only the step with the highest depth — that's
+                # the attempt that actually succeeded.
+                canonical: dict[str, PlanStep] = {}
+                for s in done_steps:
+                    key = s.original_subtask or s.step_id
+                    existing = canonical.get(key)
+                    if existing is None or s.depth > existing.depth:
+                        canonical[key] = s
+
+                canonical_steps = list(canonical.values())
+                all_results = [(s.agent, s.result) for s in canonical_steps]
+                # Use original_subtask for the steps section so the synthesiser sees
+                # planner intent, not the potentially reformulated fix-step task string.
                 all_step_tasks = [
-                    s.task[:200] for s in plan.steps if s.status == "done"
+                    (s.original_subtask or s.task)[:200] for s in canonical_steps
                 ]
                 await self._synthesise_and_reply(
                     original_task=plan.original_task,
@@ -4043,19 +5042,15 @@ When context contains "User clarification:" after a proposal was made:
                 await self._close_task_context(
                     plan, success=True, synthesised_reply=_eval_content
                 )
-                await self.memory.upsert_plan(
-                    plan.task_id,
-                    plan.plan_id,
-                    plan.original_task,
-                    "completed",
-                    plan.to_dict(),
-                )
+                await self._persist_plan(plan, "completed")
                 # ── Promote routing pattern to long-term memory on success ──
                 # This is one of the three legitimate LT write points: task completion
                 # with a conclusive outcome. Captures which agent sequence solved this
                 # class of task for faster routing in future sessions.
+                # Use canonical steps (one per original subtask) so fix-step agents
+                # (e.g. claude_code_agent escalations) don't pollute the routing pattern.
                 agent_sequence = " → ".join(
-                    dict.fromkeys(s.agent for s in plan.steps if s.status == "done")
+                    dict.fromkeys(s.agent for s in canonical_steps)
                 )
                 await self.promote_now(
                     content=(
@@ -4151,6 +5146,57 @@ When context contains "User clarification:" after a proposal was made:
 
     # ── Status events ────────────────────────────────────────────────────────
 
+    async def _persist_plan(self, plan: ExecutionPlan, status: str) -> None:
+        """
+        Persist plan state to Postgres with optimistic locking.
+
+        Uses plan.db_version as the expected version.  On the first write
+        (db_version == -1) an unconditional upsert is used.  On subsequent
+        writes, if another coroutine has already written a newer version,
+        PlanVersionConflict is caught and logged — the in-memory plan state
+        is still authoritative, so we log a warning and move on rather than
+        crashing.  The next write will carry the correct version and succeed.
+        """
+        try:
+            new_version = await self.memory.upsert_plan(
+                plan.task_id,
+                plan.plan_id,
+                plan.original_task,
+                status,
+                plan.to_dict(),
+                expected_version=plan.db_version,
+            )
+            plan.db_version = new_version
+        except PlanVersionConflict:
+            # A concurrent writer already committed a newer version.
+            # The in-memory plan is still authoritative — log and skip.
+            # db_version is intentionally left unchanged: the next state
+            # transition will also hit a conflict, increment to the winner's
+            # version via the unconditional fallback path below, and self-heal.
+            log.warning(
+                "orchestrator.plan_version_conflict",
+                task_id=plan.task_id,
+                expected_version=plan.db_version,
+                status=status,
+            )
+            # Fall back to unconditional write so the in-memory state wins.
+            try:
+                new_version = await self.memory.upsert_plan(
+                    plan.task_id,
+                    plan.plan_id,
+                    plan.original_task,
+                    status,
+                    plan.to_dict(),
+                    expected_version=-1,  # unconditional — we are authoritative
+                )
+                plan.db_version = new_version
+            except Exception as exc:
+                log.error(
+                    "orchestrator.plan_persist_error",
+                    task_id=plan.task_id,
+                    error=str(exc),
+                )
+
     async def _emit_plan_status(self, plan: ExecutionPlan, message: str) -> None:
         """Broadcast a plan status update. Bridge routes these to the appropriate channel."""
         await self.emit(
@@ -4193,6 +5239,15 @@ When context contains "User clarification:" after a proposal was made:
     _DEP_HEALTH_TIMEOUT = 30  # seconds to wait for readiness
     _DEP_HEALTH_INTERVAL = 1.5  # seconds between poll attempts
 
+    # ── Container circuit-breaker constants ───────────────────────────────────
+    # After this many consecutive start failures within _CONTAINER_CB_WINDOW_S,
+    # the agent is quarantined.
+    _CONTAINER_CB_THRESHOLD: int = 3
+    # Failure window — only count failures that happen within this period.
+    _CONTAINER_CB_WINDOW_S: int = 120
+    # How long a quarantined agent stays blocked before another attempt is allowed.
+    _CONTAINER_CB_COOLDOWN_S: int = 300  # 5 minutes
+
     async def _wait_for_dep_ready(self, dep: str) -> bool:
         """Poll dep's health URL until it returns 200 or the timeout expires.
         Returns True if ready, False on timeout."""
@@ -4224,9 +5279,51 @@ When context contains "User clarification:" after a proposal was made:
         """Start an ephemeral agent container if it isn't already running.
         Also starts any declared dependency containers and waits for them to become healthy before returning.
         Uses `docker start` — no compose plugin required.
-        Returns True on success, False if the container could not be started."""
+        Returns True on success, False if the container could not be started.
+
+        Circuit-breaker: after _CONTAINER_CB_THRESHOLD consecutive failures within
+        _CONTAINER_CB_WINDOW_S the agent is quarantined for _CONTAINER_CB_COOLDOWN_S.
+        During quarantine this method returns False immediately without attempting a
+        start, so the fix cycle does not hammer a fundamentally broken container.
+        A successful start resets the failure counter.
+        """
         if agent not in self._EPHEMERAL_AGENTS:
             return True
+
+        # ── Circuit-breaker check ─────────────────────────────────────────────
+        now = time.monotonic()
+        cb_count, cb_first_ts = self._container_failures.get(agent, (0, 0.0))
+        if cb_count >= self._CONTAINER_CB_THRESHOLD:
+            # Still within cooldown window?
+            last_failure_ts = cb_first_ts  # first_ts used as a proxy for window start
+            # Recompute: quarantine expires _CONTAINER_CB_COOLDOWN_S after the
+            # most recent failure, which we track as first_ts + window * count (approx).
+            # Simpler: store (count, last_failure_ts) — patch the tuple semantics.
+            if now - cb_first_ts < self._CONTAINER_CB_COOLDOWN_S:
+                container = self._CONTAINER_NAME.get(agent, f"agent_{agent}")
+                remaining = int(self._CONTAINER_CB_COOLDOWN_S - (now - cb_first_ts))
+                log.error(
+                    "orchestrator.container_quarantined",
+                    agent=agent,
+                    container=container,
+                    failures=cb_count,
+                    cooldown_remaining_s=remaining,
+                )
+                if plan:
+                    await self._emit_plan_status(
+                        plan,
+                        f"🚫 `{container}` is quarantined after {cb_count} consecutive "
+                        f"start failures — retry in {remaining}s",
+                    )
+                return False
+            else:
+                # Cooldown elapsed — reset and allow one more attempt
+                self._container_failures.pop(agent, None)
+                log.info(
+                    "orchestrator.container_cb_reset",
+                    agent=agent,
+                    after_s=int(now - cb_first_ts),
+                )
 
         # Start dependency containers first, then wait for readiness.
         for dep in self._AGENT_DEPS.get(agent, []):
@@ -4299,6 +5396,7 @@ When context contains "User clarification:" after a proposal was made:
                             await self._emit_plan_status(
                                 plan, f"✅ `{container}` created and started"
                             )
+                        self._cb_record_success(agent)
                         return True
                     err = compose_err.decode().strip()[:200]
                 log.error(
@@ -4311,6 +5409,7 @@ When context contains "User clarification:" after a proposal was made:
                     await self._emit_plan_status(
                         plan, f"❌ Failed to start `{container}`: {err[:200]}"
                     )
+                self._cb_record_failure(agent)
                 return False
             # docker start exits 0 as soon as the process launches, even if it
             # immediately crashes.  Give it a moment then confirm it's still up.
@@ -4344,11 +5443,13 @@ When context contains "User clarification:" after a proposal was made:
                     await self._emit_plan_status(
                         plan, f"❌ `{container}` started but exited immediately"
                     )
+                self._cb_record_failure(agent)
                 return False
 
             log.info("orchestrator.agent_started", agent=agent, container=container)
             if plan:
                 await self._emit_plan_status(plan, f"✅ `{container}` started")
+            self._cb_record_success(agent)
             return True
         except asyncio.TimeoutError:
             log.error(
@@ -4358,6 +5459,7 @@ When context contains "User clarification:" after a proposal was made:
                 await self._emit_plan_status(
                     plan, f"❌ Timed out starting `{container}` (60s)"
                 )
+            self._cb_record_failure(agent)
             return False
         except Exception as exc:
             log.error("orchestrator.agent_start_error", agent=agent, error=str(exc))
@@ -4365,7 +5467,34 @@ When context contains "User clarification:" after a proposal was made:
                 await self._emit_plan_status(
                     plan, f"❌ Error starting `{container}`: {exc}"
                 )
+            self._cb_record_failure(agent)
             return False
+
+    def _cb_record_failure(self, agent: str) -> int:
+        """Record a container start failure. Returns the new failure count."""
+        count, first_ts = self._container_failures.get(agent, (0, 0.0))
+        now = time.monotonic()
+        # Reset the window if the previous failure was outside _CONTAINER_CB_WINDOW_S
+        if now - first_ts > self._CONTAINER_CB_WINDOW_S:
+            count, first_ts = 0, now
+        count += 1
+        # Update first_ts only on the first failure in this window; subsequent
+        # failures use the original window start so the cooldown is measured
+        # from the first failure, not the last.
+        self._container_failures[agent] = (count, first_ts if count > 1 else now)
+        log.warning(
+            "orchestrator.container_start_failure",
+            agent=agent,
+            failure_count=count,
+            threshold=self._CONTAINER_CB_THRESHOLD,
+        )
+        return count
+
+    def _cb_record_success(self, agent: str) -> None:
+        """Reset the circuit-breaker after a successful container start."""
+        if agent in self._container_failures:
+            log.info("orchestrator.container_cb_cleared", agent=agent)
+            self._container_failures.pop(agent, None)
 
     # ── Discord action dispatch ───────────────────────────────────────────────
 
@@ -4580,7 +5709,15 @@ When context contains "User clarification:" after a proposal was made:
             ):
                 self._conversation.clear()
                 log.info("orchestrator.conversation_reset", reason="idle_timeout")
-            self._conversation.append((original_task, result[:300], now, task_id))
+            self._conversation.append(
+                (
+                    original_task,
+                    result[:300],
+                    now,
+                    task_id,
+                    _is_constraint(original_task),
+                )
+            )
             self._last_task_id = task_id
             # Persist last real task to Redis so it survives a container restart
             try:
@@ -4624,9 +5761,7 @@ When context contains "User clarification:" after a proposal was made:
             log.warning(
                 "orchestrator.plan_expired", task_id=tid, task=plan.original_task[:60]
             )
-            await self.memory.upsert_plan(
-                tid, plan.plan_id, plan.original_task, "expired", plan.to_dict()
-            )
+            await self._persist_plan(plan, "expired")
             running_steps = [s for s in plan.steps if s.status == "running"]
             await self._emit_plan_status(
                 plan,
@@ -4812,9 +5947,7 @@ When context contains "User clarification:" after a proposal was made:
             ],
         )
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, task_desc, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         await self._emit_plan_status(
             plan,
             f"📐 Daily arch build — spinning up document_qa: {', '.join(short_names[:5])}",
@@ -4863,9 +5996,7 @@ When context contains "User clarification:" after a proposal was made:
             ],
         )
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, task_desc, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         await self._emit_plan_status(
             plan,
             f"⚡ Dispatching optimizer (reason: {reason})",
@@ -4959,9 +6090,7 @@ When context contains "User clarification:" after a proposal was made:
             context_id=task_id,
         )
         self._plans[task_id] = plan
-        await self.memory.upsert_plan(
-            task_id, plan.plan_id, task, "running", plan.to_dict()
-        )
+        await self._persist_plan(plan, "running")
         await self._emit_plan_status(
             plan, "🛍️ Merch bot starting — researching trending topics…"
         )

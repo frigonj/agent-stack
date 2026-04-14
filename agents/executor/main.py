@@ -1165,6 +1165,8 @@ class ExecutorAgent(BaseAgent):
                             messages,
                             action_handler=_exec_action,
                             max_steps=5,
+                            subtask_id=subtask_id or "",
+                            parent_task_id=parent_task_id or "",
                         )
 
                         # NOTE: agent_loop returns DONE: prose summaries, not shell

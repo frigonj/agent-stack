@@ -556,7 +556,9 @@ class ResearchAgent(BaseAgent):
 
         task = truncate_task(event.payload.get("task", ""))
         task_id = event.task_id or str(uuid.uuid4())
-        subtask_id = event.payload.get("subtask_id", str(uuid.uuid4()))
+        subtask_id = event.payload.get(
+            "subtask_id"
+        )  # must be echoed verbatim; None if not set
         parent_id = event.payload.get("parent_task_id", task_id)
         discord_mid = event.payload.get("discord_message_id")
 
@@ -578,7 +580,12 @@ class ResearchAgent(BaseAgent):
             elif is_knowledge_build:
                 result = await self._build_knowledge_db(task, task_id)
             else:
-                result = await self._research(task, task_id)
+                result = await self._research(
+                    task,
+                    task_id,
+                    subtask_id=subtask_id or "",
+                    parent_task_id=parent_id or "",
+                )
         except Exception as exc:
             log.exception("research.task_failed", error=str(exc))
             result = f"Research failed: {exc}"
@@ -599,7 +606,13 @@ class ResearchAgent(BaseAgent):
             target="orchestrator",
         )
 
-    async def _research(self, question: str, task_id: str) -> str:
+    async def _research(
+        self,
+        question: str,
+        task_id: str,
+        subtask_id: str = "",
+        parent_task_id: str = "",
+    ) -> str:
         """
         Full staged evidence loop with Postgres checkpointing.
 
@@ -672,6 +685,13 @@ class ResearchAgent(BaseAgent):
                     brave_enabled = False  # fall back to Wikipedia-only
 
             for iteration in range(start_iteration, MAX_SEARCH_ITERATIONS + 1):
+                if subtask_id:
+                    await self.emit_heartbeat(
+                        subtask_id=subtask_id,
+                        parent_task_id=parent_task_id,
+                        activity="research_iteration",
+                        loop_step=iteration,
+                    )
                 log.info(
                     "research.iteration_start",
                     iteration=iteration,

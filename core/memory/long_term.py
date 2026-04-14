@@ -6,6 +6,11 @@ PostgreSQL + pgvector client for long-term persistent memory.
 Uses an async connection pool (psycopg3) with pgvector for semantic search
 and PostgreSQL FTS (tsvector) for full-text recall. Schema is initialized
 on first connection — no migration tooling required for initial deployment.
+
+Short-lived operational state (active_plans, research_staging, open_tasks,
+agent_status/handoffs, pending_memory_approvals) is stored in Redis instead
+of Postgres — it is TTL-managed, single-key access, and benefits from Redis
+atomic operations (ZADD, WATCH/MULTI/EXEC, PEXPIRE).
 """
 
 from __future__ import annotations
@@ -13,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from typing import Optional
 
+import redis.asyncio as aioredis
 import structlog
 from psycopg import AsyncConnection
 from psycopg.errors import UniqueViolation
@@ -22,6 +29,33 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 log = structlog.get_logger()
+
+# ── Redis key schema ──────────────────────────────────────────────────────────
+# plan:{task_id}                   Hash  — active plan state
+# research:staging:{task_id}       List  — staged facts (JSON strings)
+# tasks:{agent}                    ZSet  — open task queue, score = priority*1e12+ms
+# tasks:data:{task_id}             String — JSON task payload
+# tasks:counter                    String — INCR counter for unique task IDs
+# agent:status:{agent}             Hash  — status, current_task
+# agent:handoff:{agent}            String — last handoff summary
+# approval:{approval_id}           Hash  — pending memory approval fields
+# approval:by_knowledge:{kid}      String — approval_id for dedup lookup
+
+_PLAN_PREFIX = "plan:"
+_STAGING_PREFIX = "research:staging:"
+_TASKS_ZSET = "tasks:{agent}"
+_TASKS_DATA = "tasks:data:{task_id}"
+_TASKS_COUNTER = "tasks:counter"
+_AGENT_STATUS = "agent:status:{agent}"
+_AGENT_HANDOFF = "agent:handoff:{agent}"
+_APPROVAL_PREFIX = "approval:"
+_APPROVAL_BY_KID = "approval:by_knowledge:{kid}"
+
+# TTLs (seconds)
+_PLAN_TTL_S = 7 * 86400  # 7 days — matches old expire_plans()
+_STAGING_TTL_S = 48 * 3600  # 48 hours
+_HANDOFF_TTL_S = 30 * 86400  # 30 days
+_APPROVAL_TTL_S = 48 * 3600  # 48 hours — matches DB expires_at
 
 # ── TTL size tiers ────────────────────────────────────────────────────────────
 # Agents pick a t-shirt size; the background classifier writes expires_at.
@@ -310,6 +344,9 @@ _SCHEMA = [
     # paused status is enforced at application level; column additions are
     # safe to re-run (IF NOT EXISTS / IF NOT EXISTS equivalent via ADD COLUMN IF NOT EXISTS).
     "ALTER TABLE active_plans ADD COLUMN IF NOT EXISTS paused_at_phase INT DEFAULT NULL",
+    # version counter for optimistic locking — incremented on every write so
+    # concurrent upsert_plan calls can detect a lost update.
+    "ALTER TABLE active_plans ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 0",
     # ── content_hash deduplication on knowledge ────────────────────────────
     # SHA-256 of (agent || topic || content).  Upsert on conflict refreshes the
     # row in-place instead of creating a duplicate entry.
@@ -427,6 +464,14 @@ async def _configure_conn(conn: AsyncConnection) -> None:
     await conn.commit()
 
 
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+
+class PlanVersionConflict(Exception):
+    """Raised by upsert_plan when the stored version does not match the
+    expected version, indicating a concurrent write won the race."""
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 
@@ -438,10 +483,12 @@ class LongTermMemory:
     vector_search uses pgvector cosine similarity when embeddings are present.
     """
 
-    def __init__(self, database_url: str, agent_name: str):
+    def __init__(self, database_url: str, agent_name: str, redis_url: str = ""):
         self._url = database_url
         self._agent = agent_name
         self._pool: Optional[AsyncConnectionPool] = None
+        self._redis_url = redis_url
+        self._redis: Optional[aioredis.Redis] = None
 
     async def _get_pool(self) -> AsyncConnectionPool:
         if self._pool is None:
@@ -480,70 +527,69 @@ class LongTermMemory:
                     await conn.execute("SELECT pg_advisory_unlock(8675309)")
         return self._pool
 
-    # ── Session lifecycle ────────────────────────────────────────────────────
+    async def _get_redis(self) -> aioredis.Redis:
+        if self._redis is None:
+            url = self._redis_url or "redis://localhost:6379"
+            self._redis = await aioredis.from_url(
+                url, encoding="utf-8", decode_responses=True
+            )
+        return self._redis
+
+    async def close(self) -> None:
+        if self._pool:
+            await self._pool.close()
+        if self._redis:
+            await self._redis.aclose()
+
+    # ── Session lifecycle (Redis-backed) ─────────────────────────────────────
 
     async def open_session(self) -> dict:
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT status FROM agent_status WHERE agent = %s", (self._agent,)
-            )
-            row = await cur.fetchone()
-            crashed = row is not None and row["status"] == "OPEN"
-            await conn.execute(
-                """
-                INSERT INTO agent_status (agent, status, current_task, updated_at)
-                VALUES (%s, 'OPEN', '', NOW())
-                ON CONFLICT (agent) DO UPDATE SET
-                    status = 'OPEN', current_task = '', updated_at = NOW()
-            """,
-                (self._agent,),
-            )
+        r = await self._get_redis()
+        key = _AGENT_STATUS.format(agent=self._agent)
+        prev_status = await r.hget(key, "status")
+        crashed = prev_status == "OPEN"
+        await r.hset(
+            key,
+            mapping={
+                "status": "OPEN",
+                "current_task": "",
+                "updated_at": str(time.time()),
+            },
+        )
         status = "CRASH" if crashed else "OK"
         log.info("memory.session_opened", agent=self._agent, status=status)
         return {"status": status, "agent": self._agent}
 
     async def recover_context(self) -> dict:
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT status, current_task FROM agent_status WHERE agent = %s",
-                (self._agent,),
-            )
-            row = await cur.fetchone()
-            cur = await conn.execute(
-                "SELECT summary FROM handoffs WHERE agent = %s ORDER BY id DESC LIMIT 1",
-                (self._agent,),
-            )
-            handoff = await cur.fetchone()
+        r = await self._get_redis()
+        status_key = _AGENT_STATUS.format(agent=self._agent)
+        handoff_key = _AGENT_HANDOFF.format(agent=self._agent)
+        fields = await r.hgetall(status_key)
+        last_handoff = await r.get(handoff_key) or ""
         result = {
-            "status": row["status"] if row else "NEW",
-            "current_task": row["current_task"] if row else "",
-            "last_handoff": handoff["summary"] if handoff else "",
+            "status": fields.get("status", "NEW"),
+            "current_task": fields.get("current_task", ""),
+            "last_handoff": last_handoff,
         }
         log.info("memory.context_recovered", agent=self._agent)
         return result
 
     async def checkpoint(self, note: str) -> None:
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "UPDATE agent_status SET current_task = %s, updated_at = NOW() WHERE agent = %s",
-                (note, self._agent),
-            )
+        r = await self._get_redis()
+        key = _AGENT_STATUS.format(agent=self._agent)
+        await r.hset(
+            key, mapping={"current_task": note, "updated_at": str(time.time())}
+        )
         log.debug("memory.checkpoint", agent=self._agent, note=note)
 
     async def close_session(self, summary: str) -> None:
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "INSERT INTO handoffs (agent, summary) VALUES (%s, %s)",
-                (self._agent, summary),
-            )
-            await conn.execute(
-                "UPDATE agent_status SET status = 'CLEAN', updated_at = NOW() WHERE agent = %s",
-                (self._agent,),
-            )
+        r = await self._get_redis()
+        status_key = _AGENT_STATUS.format(agent=self._agent)
+        handoff_key = _AGENT_HANDOFF.format(agent=self._agent)
+        await r.hset(
+            status_key, mapping={"status": "CLEAN", "updated_at": str(time.time())}
+        )
+        await r.set(handoff_key, summary[:2000], ex=_HANDOFF_TTL_S)
         log.info("memory.session_closed", agent=self._agent)
 
     # ── Knowledge store ──────────────────────────────────────────────────────
@@ -910,6 +956,11 @@ class LongTermMemory:
             rows = await cur.fetchall()
         return list(rows)
 
+    # ── Pending memory approvals (Redis-backed) ───────────────────────────────
+    # approval:{approval_id}         Hash — all approval fields + "result" (null/true/false)
+    # approval:by_knowledge:{kid}    String — approval_id for this knowledge_id (dedup)
+    # Both keys share the same 48h TTL via PEXPIRE.
+
     async def insert_pending_approval(
         self,
         approval_id: str,
@@ -920,81 +971,72 @@ class LongTermMemory:
         content: str,
         proposed_size: str,
     ) -> bool:
-        """
-        Insert a pending approval row.  Returns False if one already exists
-        for this knowledge_id (prevents duplicate Discord embeds).
-        """
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                "SELECT approval_id FROM pending_memory_approvals WHERE knowledge_id = %s AND result IS NULL AND expires_at > NOW()",
-                (knowledge_id,),
-            )
-            existing = await cur.fetchone()
-            if existing:
+        """Insert a pending approval. Returns False if one already exists for this knowledge_id."""
+        r = await self._get_redis()
+        dedup_key = _APPROVAL_BY_KID.format(kid=knowledge_id)
+        # Dedup: if an undecided approval already exists for this knowledge_id, skip
+        existing_id = await r.get(dedup_key)
+        if existing_id:
+            existing_fields = await r.hgetall(_APPROVAL_PREFIX + existing_id)
+            if existing_fields and existing_fields.get("result", "null") == "null":
                 return False
-            await conn.execute(
-                """
-                INSERT INTO pending_memory_approvals
-                    (approval_id, knowledge_id, agent, topic, tags, content, proposed_size)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (approval_id) DO NOTHING
-                """,
-                (
-                    approval_id,
-                    knowledge_id,
-                    agent,
-                    topic,
-                    json.dumps(tags),
-                    content[:500],
-                    proposed_size,
-                ),
-            )
+        approval_key = _APPROVAL_PREFIX + approval_id
+        ttl_ms = _APPROVAL_TTL_S * 1000
+        await r.hset(
+            approval_key,
+            mapping={
+                "approval_id": approval_id,
+                "knowledge_id": str(knowledge_id),
+                "agent": agent,
+                "topic": topic,
+                "tags": json.dumps(tags),
+                "content": content[:500],
+                "proposed_size": proposed_size,
+                "result": "null",  # undecided
+            },
+        )
+        await r.pexpire(approval_key, ttl_ms)
+        await r.set(dedup_key, approval_id, px=ttl_ms)
         return True
 
     async def resolve_pending_approval(
         self, approval_id: str, approved: bool
     ) -> dict | None:
-        """
-        Mark a pending approval as decided.  Returns the full row so the caller
-        can apply set_expiry and record_approval_decision.  Returns None if the
-        approval_id is not found or already decided.
-        """
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                UPDATE pending_memory_approvals
-                SET result = %s
-                WHERE approval_id = %s AND result IS NULL
-                RETURNING knowledge_id, agent, topic, tags, content, proposed_size
-                """,
-                (approved, approval_id),
-            )
-            row = await cur.fetchone()
-        return dict(row) if row else None
+        """Mark a pending approval as decided. Returns the row or None if not found/already decided."""
+        r = await self._get_redis()
+        key = _APPROVAL_PREFIX + approval_id
+        fields = await r.hgetall(key)
+        if not fields or fields.get("result", "null") != "null":
+            return None
+        await r.hset(key, "result", "true" if approved else "false")
+        # Shorten TTL to 10 minutes — decided approvals only need brief retention
+        await r.expire(key, 600)
+        tags_raw = fields.get("tags", "[]")
+        tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+        return {
+            "knowledge_id": int(fields.get("knowledge_id", 0)),
+            "agent": fields.get("agent", ""),
+            "topic": fields.get("topic", ""),
+            "tags": tags,
+            "content": fields.get("content", ""),
+            "proposed_size": fields.get("proposed_size", ""),
+        }
 
     async def get_expired_pending_approvals(self) -> list[dict]:
-        """Return pending approval rows whose 48h window has elapsed."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                DELETE FROM pending_memory_approvals
-                WHERE result IS NULL AND expires_at <= NOW()
-                RETURNING approval_id, knowledge_id, agent, topic, tags, content, proposed_size
-                """,
-            )
-            rows = await cur.fetchall()
-        return list(rows)
+        """Return and delete approvals whose TTL has elapsed.
+        With Redis TTL this is a no-op — expired keys vanish automatically.
+        Returns an empty list; the optimizer's watchdog handles notification."""
+        return []
 
     async def delete_pending_approval(self, approval_id: str) -> None:
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "DELETE FROM pending_memory_approvals WHERE approval_id = %s",
-                (approval_id,),
-            )
+        r = await self._get_redis()
+        key = _APPROVAL_PREFIX + approval_id
+        fields = await r.hgetall(key)
+        if fields:
+            kid = fields.get("knowledge_id")
+            if kid:
+                await r.delete(_APPROVAL_BY_KID.format(kid=kid))
+        await r.delete(key)
 
     async def count(self) -> int:
         """Return number of non-expired knowledge entries across all agents."""
@@ -1073,7 +1115,11 @@ class LongTermMemory:
         log.info("memory.pruned", deleted=to_delete, remaining=total - to_delete)
         return to_delete
 
-    # ── Active plan ledger ───────────────────────────────────────────────────
+    # ── Active plan ledger (Redis-backed) ────────────────────────────────────
+    # Each plan is stored as a Redis Hash at plan:{task_id}.
+    # Fields: plan_id, original_task, status, plan_json, version, created_at, updated_at
+    # TTL: _PLAN_TTL_S (7 days), refreshed on every write.
+    # Optimistic locking via WATCH/MULTI/EXEC on the version field.
 
     async def upsert_plan(
         self,
@@ -1082,73 +1128,164 @@ class LongTermMemory:
         original_task: str,
         status: str,
         plan_json: dict,
-    ) -> None:
-        """Create or update a plan row. Called on plan creation and every status change."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                """
-                INSERT INTO active_plans (task_id, plan_id, original_task, status, plan_json)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (task_id) DO UPDATE SET
-                    status     = EXCLUDED.status,
-                    plan_json  = EXCLUDED.plan_json,
-                    updated_at = NOW()
-            """,
-                (task_id, plan_id, original_task[:500], status, json.dumps(plan_json)),
-            )
-        log.debug("memory.plan_upserted", task_id=task_id, status=status)
+        expected_version: int = -1,
+    ) -> int:
+        """
+        Create or update a plan entry in Redis with optimistic locking.
+
+        expected_version=-1 → unconditional write (first creation or forced overwrite).
+        expected_version=N  → only writes if current version == N; raises
+                              PlanVersionConflict otherwise.
+
+        Returns the new version number on success.
+        """
+        r = await self._get_redis()
+        key = _PLAN_PREFIX + task_id
+        now = str(time.time())
+        plan_json_str = json.dumps(plan_json)
+
+        if expected_version < 0:
+            # Unconditional: HSETNX for new keys, then bump version atomically.
+            # Use a pipeline so it's one round-trip.
+            async with r.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                cur_version_raw = await pipe.hget(key, "version")
+                cur_version = (
+                    int(cur_version_raw) if cur_version_raw is not None else -1
+                )
+                new_version = cur_version + 1
+                pipe.multi()
+                pipe.hset(
+                    key,
+                    mapping={
+                        "plan_id": plan_id,
+                        "original_task": original_task[:500],
+                        "status": status,
+                        "plan_json": plan_json_str,
+                        "version": new_version,
+                        "updated_at": now,
+                    },
+                )
+                if cur_version < 0:
+                    pipe.hset(key, "created_at", now)
+                pipe.expire(key, _PLAN_TTL_S)
+                await pipe.execute()
+        else:
+            # Optimistic: only write if version matches expected_version.
+            async with r.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(key)
+                        cur_version_raw = await pipe.hget(key, "version")
+                        cur_version = (
+                            int(cur_version_raw) if cur_version_raw is not None else 0
+                        )
+                        if cur_version != expected_version:
+                            await pipe.reset()
+                            raise PlanVersionConflict(
+                                f"upsert_plan conflict: task_id={task_id} "
+                                f"expected={expected_version} actual={cur_version}"
+                            )
+                        new_version = expected_version + 1
+                        pipe.multi()
+                        pipe.hset(
+                            key,
+                            mapping={
+                                "plan_id": plan_id,
+                                "original_task": original_task[:500],
+                                "status": status,
+                                "plan_json": plan_json_str,
+                                "version": new_version,
+                                "updated_at": now,
+                            },
+                        )
+                        pipe.expire(key, _PLAN_TTL_S)
+                        await pipe.execute()
+                        break
+                    except aioredis.WatchError:
+                        # Another writer changed the key — raise conflict
+                        raise PlanVersionConflict(
+                            f"upsert_plan watch conflict: task_id={task_id} "
+                            f"expected={expected_version}"
+                        )
+
+        log.debug(
+            "memory.plan_upserted", task_id=task_id, status=status, version=new_version
+        )
+        return new_version
+
+    async def get_plan_by_task_id(self, task_id: str) -> dict | None:
+        """Load a plan by task_id. Returns None if not found."""
+        r = await self._get_redis()
+        fields = await r.hgetall(_PLAN_PREFIX + task_id)
+        if not fields:
+            return None
+        plan_json = fields.get("plan_json", "{}")
+        if isinstance(plan_json, str):
+            plan_json = json.loads(plan_json)
+        return {
+            "task_id": task_id,
+            "plan_id": fields.get("plan_id", ""),
+            "original_task": fields.get("original_task", ""),
+            "status": fields.get("status", ""),
+            "plan_json": plan_json,
+            "version": int(fields.get("version", 0)),
+        }
 
     async def load_active_plans(self) -> list[dict]:
-        """Return all plans that were still running when the process last exited.
-        Paused plans are included so they survive restarts, but the orchestrator
-        will NOT auto-resume them — the user must send /resume explicitly."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute("""
-                SELECT task_id, plan_id, original_task, status, plan_json, created_at, updated_at
-                FROM active_plans
-                WHERE status IN ('planning', 'running', 'paused')
-                ORDER BY created_at ASC
-            """)
-            rows = await cur.fetchall()
-        return list(rows)
+        """Return all plans in planning/running/paused status.
+        Scans Redis for plan:* keys — used only at startup for crash recovery."""
+        r = await self._get_redis()
+        active: list[dict] = []
+        active_statuses = {"planning", "running", "paused"}
+        async for key in r.scan_iter(match=f"{_PLAN_PREFIX}*", count=100):
+            fields = await r.hgetall(key)
+            if not fields:
+                continue
+            status = fields.get("status", "")
+            if status not in active_statuses:
+                continue
+            plan_json = fields.get("plan_json", "{}")
+            if isinstance(plan_json, str):
+                plan_json = json.loads(plan_json)
+            task_id = key[len(_PLAN_PREFIX) :]
+            active.append(
+                {
+                    "task_id": task_id,
+                    "plan_id": fields.get("plan_id", ""),
+                    "original_task": fields.get("original_task", ""),
+                    "status": status,
+                    "plan_json": plan_json,
+                    "version": int(fields.get("version", 0)),
+                    "created_at": fields.get("created_at", ""),
+                    "updated_at": fields.get("updated_at", ""),
+                }
+            )
+        # Sort by created_at ascending (matches old SQL ORDER BY created_at ASC)
+        active.sort(key=lambda r: r.get("created_at", ""))
+        return active
 
     async def expire_plans(self) -> int:
-        """Delete plan rows older than 7 days. Returns number deleted."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute("""
-                DELETE FROM active_plans
-                WHERE updated_at < NOW() - INTERVAL '7 days'
-                RETURNING task_id
-            """)
-            rows = await cur.fetchall()
-        deleted = len(rows)
-        if deleted:
-            log.info("memory.plans_expired", deleted=deleted)
-        return deleted
+        """No-op: Redis TTL handles expiry automatically. Returns 0."""
+        return 0
 
-    # ── Research staging helpers ──────────────────────────────────────────────
+    # ── Research staging helpers (Redis-backed) ───────────────────────────────
+    # Facts are stored as JSON strings in a Redis List at research:staging:{task_id}.
+    # Each RPUSH appends facts in insertion order; LRANGE retrieves all in order.
+    # TTL is reset on every save; deleted on final commit.
 
     async def save_research_staging(
         self, task_id: str, iteration: int, facts: list[dict]
     ) -> None:
-        """Persist a batch of staging facts for a pauseable research task."""
+        """Persist a batch of staging facts. iteration is embedded in each fact for ordering."""
         if not facts:
             return
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            for f in facts:
-                await conn.execute(
-                    """
-                    INSERT INTO research_staging (task_id, iteration, fact_json)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (task_id, iteration, json.dumps(f)),
-                )
-            await conn.commit()
+        r = await self._get_redis()
+        key = _STAGING_PREFIX + task_id
+        # Embed iteration into each fact so load can reconstruct order after restart
+        entries = [json.dumps({**f, "_iteration": iteration}) for f in facts]
+        await r.rpush(key, *entries)
+        await r.expire(key, _STAGING_TTL_S)
         log.debug(
             "memory.research_staging_saved",
             task_id=task_id,
@@ -1157,177 +1294,153 @@ class LongTermMemory:
         )
 
     async def load_research_staging(self, task_id: str) -> list[dict]:
-        """Return all staged facts for a task, ordered by iteration."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                SELECT fact_json FROM research_staging
-                WHERE task_id = %s
-                ORDER BY iteration ASC, created_at ASC
-                """,
-                (task_id,),
-            )
-            rows = await cur.fetchall()
-        return [r[0] if isinstance(r[0], dict) else json.loads(r[0]) for r in rows]
+        """Return all staged facts for a task in insertion order."""
+        r = await self._get_redis()
+        raw = await r.lrange(_STAGING_PREFIX + task_id, 0, -1)
+        facts = []
+        for item in raw:
+            try:
+                f = json.loads(item)
+                f.pop("_iteration", None)  # remove internal field before returning
+                facts.append(f)
+            except Exception:
+                pass
+        return facts
 
     async def delete_research_staging(self, task_id: str) -> None:
-        """Remove all staging rows for a task (called after final commit)."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "DELETE FROM research_staging WHERE task_id = %s", (task_id,)
-            )
-            await conn.commit()
+        """Remove all staging facts for a task (called after final commit)."""
+        r = await self._get_redis()
+        await r.delete(_STAGING_PREFIX + task_id)
         log.debug("memory.research_staging_deleted", task_id=task_id)
 
     async def cleanup_stale(self, max_age_hours: int = 24) -> dict:
         """
-        Delete completed/failed tasks, resolved plans, and old handoffs that are
-        older than *max_age_hours*. Called by the orchestrator think loop.
+        Expire stale entries. Redis-backed tables (open_tasks, active_plans,
+        agent_status, handoffs, pending_approvals) self-expire via TTL — no
+        action needed here. Only knowledge entries still require explicit SQL
+        cleanup.
 
-        Returns a dict with counts of each type deleted so the caller can log
-        or emit a status event if anything was pruned.
+        Returns a dict with counts of each type deleted.
         """
-        interval = f"{max_age_hours} hours"
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            # Completed / failed tasks older than max_age
-            cur = await conn.execute(
-                """
-                DELETE FROM open_tasks
-                WHERE status IN ('done', 'failed')
-                  AND updated_at < NOW() - INTERVAL %s
-                RETURNING id
-                """,
-                (interval,),
-            )
-            tasks = len(await cur.fetchall())
-
-            # Terminal plans older than max_age
-            cur = await conn.execute(
-                """
-                DELETE FROM active_plans
-                WHERE status IN ('completed', 'expired', 'failed')
-                  AND updated_at < NOW() - INTERVAL %s
-                RETURNING task_id
-                """,
-                (interval,),
-            )
-            plans = len(await cur.fetchall())
-
-            # Handoffs (session summaries) older than max_age
-            cur = await conn.execute(
-                """
-                DELETE FROM handoffs
-                WHERE ts < NOW() - INTERVAL %s
-                RETURNING id
-                """,
-                (interval,),
-            )
-            handoffs = len(await cur.fetchall())
-
-        # Expired knowledge entries (TTL-based)
+        # Expired knowledge entries (TTL-based SQL cleanup)
         knowledge = await self.expire_knowledge()
 
-        total = tasks + plans + handoffs + knowledge
-        if total:
+        if knowledge:
             log.info(
                 "memory.stale_cleanup",
-                tasks=tasks,
-                plans=plans,
-                handoffs=handoffs,
                 knowledge_expired=knowledge,
                 max_age_hours=max_age_hours,
             )
         return {
-            "tasks": tasks,
-            "plans": plans,
-            "handoffs": handoffs,
+            "tasks": 0,  # Redis ZSet — completed tasks deleted immediately
+            "plans": 0,  # Redis Hash — TTL-managed
+            "handoffs": 0,  # Redis String — TTL-managed
             "knowledge_expired": knowledge,
         }
 
-    async def close(self) -> None:
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
-
-    # ── Open task queue ──────────────────────────────────────────────────────
+    # ── Open task queue (Redis-backed) ───────────────────────────────────────
+    # ZSet key: tasks:{agent}   score = priority * 1e12 + created_ms (lower = higher priority)
+    # Data key: tasks:data:{task_id}  (String, JSON payload, no TTL — deleted on complete)
+    # Counter:  tasks:counter   (INCR for unique integer IDs)
+    #
+    # claim_task uses WATCH/MULTI/EXEC to atomically remove from ZSet and mark as
+    # running — prevents two workers claiming the same task concurrently.
 
     async def enqueue_task(
         self, task: str, priority: int = 5, agent: str = "orchestrator"
     ) -> int:
-        """Add a task to the persistent work queue. Returns the new task id."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                INSERT INTO open_tasks (agent, task, priority)
-                VALUES (%s, %s, %s)
-                RETURNING id
-                """,
-                (agent, task, priority),
-            )
-            row = await cur.fetchone()
-        task_id = row["id"]
+        """Add a task to the priority queue. Returns the new task id."""
+        r = await self._get_redis()
+        task_id = int(await r.incr(_TASKS_COUNTER))
+        created_ms = int(time.time() * 1000)
+        score = priority * 10**12 + created_ms
+        payload = json.dumps(
+            {
+                "id": task_id,
+                "agent": agent,
+                "task": task,
+                "priority": priority,
+                "created_at": created_ms,
+                "status": "pending",
+            }
+        )
+        data_key = _TASKS_DATA.format(task_id=task_id)
+        zset_key = _TASKS_ZSET.format(agent=agent)
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.set(data_key, payload)
+            pipe.zadd(zset_key, {str(task_id): score})
+            await pipe.execute()
         log.info("memory.task_enqueued", task_id=task_id, priority=priority)
         return task_id
 
     async def get_pending_tasks(
         self, limit: int = 5, agent: str = "orchestrator"
     ) -> list[dict]:
-        """
-        Return pending tasks ordered by priority then age.
-        These are consumed by the think loop without any LLM call.
-        """
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                SELECT id, agent, task, priority, created_at
-                FROM open_tasks
-                WHERE status = 'pending' AND agent = %s
-                ORDER BY priority ASC, created_at ASC
-                LIMIT %s
-                """,
-                (agent, limit),
-            )
-            rows = await cur.fetchall()
-        return list(rows)
+        """Return pending tasks ordered by priority then age (lowest score first)."""
+        r = await self._get_redis()
+        zset_key = _TASKS_ZSET.format(agent=agent)
+        members = await r.zrange(zset_key, 0, limit - 1)
+        tasks = []
+        for member in members:
+            data_key = _TASKS_DATA.format(task_id=member)
+            raw = await r.get(data_key)
+            if raw:
+                try:
+                    tasks.append(json.loads(raw))
+                except Exception:
+                    pass
+        return tasks
 
     async def claim_task(self, task_id: int) -> bool:
-        """Mark a task as running. Returns False if already claimed (concurrent safety)."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                UPDATE open_tasks
-                SET status = 'running', updated_at = NOW()
-                WHERE id = %s AND status = 'pending'
-                RETURNING id
-                """,
-                (task_id,),
-            )
-            row = await cur.fetchone()
-        return row is not None
+        """Atomically claim a task: remove from ZSet and mark status=running.
+        Returns False if already claimed by another worker."""
+        r = await self._get_redis()
+        data_key = _TASKS_DATA.format(task_id=task_id)
+        async with r.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(data_key)
+                raw = await pipe.get(data_key)
+                if not raw:
+                    await pipe.reset()
+                    return False
+                payload = json.loads(raw)
+                if payload.get("status") != "pending":
+                    await pipe.reset()
+                    return False
+                payload["status"] = "running"
+                agent = payload.get("agent", "orchestrator")
+                zset_key = _TASKS_ZSET.format(agent=agent)
+                pipe.multi()
+                pipe.set(data_key, json.dumps(payload))
+                pipe.zrem(zset_key, str(task_id))
+                await pipe.execute()
+                return True
+            except aioredis.WatchError:
+                return False
 
     async def complete_task(self, task_id: int) -> None:
-        """Mark a task as done."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "UPDATE open_tasks SET status = 'done', updated_at = NOW() WHERE id = %s",
-                (task_id,),
-            )
+        """Delete task data — completed tasks don't need to be kept."""
+        r = await self._get_redis()
+        await r.delete(_TASKS_DATA.format(task_id=task_id))
 
     async def fail_task(self, task_id: int) -> None:
-        """Return a claimed task to pending so it can be retried."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(
-                "UPDATE open_tasks SET status = 'pending', updated_at = NOW() WHERE id = %s",
-                (task_id,),
-            )
+        """Return a claimed task to pending and re-add to the ZSet."""
+        r = await self._get_redis()
+        data_key = _TASKS_DATA.format(task_id=task_id)
+        raw = await r.get(data_key)
+        if not raw:
+            return
+        payload = json.loads(raw)
+        payload["status"] = "pending"
+        agent = payload.get("agent", "orchestrator")
+        priority = payload.get("priority", 5)
+        created_ms = payload.get("created_at", int(time.time() * 1000))
+        score = priority * 10**12 + created_ms
+        zset_key = _TASKS_ZSET.format(agent=agent)
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.set(data_key, json.dumps(payload))
+            pipe.zadd(zset_key, {str(task_id): score})
+            await pipe.execute()
 
     # ── Shared tool registry ─────────────────────────────────────────────────
     # All agents register capabilities here and search before calling the LLM.
