@@ -57,7 +57,7 @@ services:
     restart: unless-stopped
     healthcheck:
       # /proc/1/cmdline always present; python3 socket ping needs no extra packages.
-      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
+      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n\\$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -348,7 +348,7 @@ services:
     container_name: agent_optimizer
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
+      test: ["CMD-SHELL", "grep -q agent.main /proc/1/cmdline && python3 -c \"import socket,sys;s=socket.create_connection(('redis',6379),2);s.sendall(b'*1\\r\\n\\$4\\r\\nPING\\r\\n');sys.exit(0 if b'PONG' in s.recv(64) else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
