@@ -18,6 +18,8 @@ coverage.xml
 
 # Emrys local persistence (don't version agent memory)
 .persist/
+agent_memory.db
+memory.db
 
 # Emrys source (cloned at setup time, not versioned)
 emrys-src/
