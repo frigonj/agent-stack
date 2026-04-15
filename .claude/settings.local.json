@@ -47,7 +47,12 @@
       "Bash(ls workspace/src/)",
       "Bash(ls workspace/repos/)",
       "Bash(ls workspace/tools/)",
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' diff docker-compose.yml)",
+      "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' log --oneline -3)",
+      "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' add docker-compose.yml)",
+      "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' commit -m ':*)",
+      "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' push)"
     ]
   }
 }

@@ -1820,8 +1820,9 @@ When context contains "User clarification:" after a proposal was made:
         self._conversation.clear()
         log.info("orchestrator.retry_replan", original_task=last_task[:80])
 
+        task_preview = last_task[:200] + ("…" if len(last_task) > 200 else "")
         await self._publish_reply(
-            f"Replanning: *{last_task[:120]}*",
+            f"Replanning: *{task_preview}*",
             task_id,
             discord_message_id,
             is_chat=True,
@@ -4806,17 +4807,45 @@ When context contains "User clarification:" after a proposal was made:
 
         # Still have pending steps in this phase waiting for a dependency to finish?
         # (sequential deps: seq N is pending until seq N-1 goes done)
-        done_ids = {s.step_id for s in plan.steps if s.status == "done"}
+        # A dependency counts as "resolved" if it is done, failed, or fixed —
+        # running/pending deps still block.  If a dep failed, propagate that
+        # failure to the dependent step so the fix cycle can handle it rather
+        # than leaving the dependent permanently pending.
+        resolved_ids = {
+            s.step_id for s in plan.steps if s.status in ("done", "failed", "fixed")
+        }
         waiting = [
             s
             for s in plan.steps
             if s.phase == phase
             and s.status == "pending"
             and s.depends_on
-            and s.depends_on not in done_ids
+            and s.depends_on not in resolved_ids
         ]
         if waiting:
             return
+
+        # Any pending step whose dependency failed/fixed can never run — mark it
+        # failed now so the fix cycle processes it instead of leaving it pending.
+        failed_or_fixed_ids = {
+            s.step_id for s in plan.steps if s.status in ("failed", "fixed")
+        }
+        for s in plan.steps:
+            if (
+                s.phase == phase
+                and s.status == "pending"
+                and s.depends_on
+                and s.depends_on in failed_or_fixed_ids
+            ):
+                s.status = "failed"
+                s.result = (
+                    f"Dependency step '{s.depends_on}' failed — "
+                    "this step was cancelled."
+                )
+                await self._emit_plan_status(
+                    plan,
+                    f"⛔ `[{s.agent}]` step cancelled: dependency '{s.depends_on}' failed",
+                )
 
         # Atomically claim this phase — bail if another coroutine already has it.
         # This must happen before the first `await` to be effective.
@@ -5109,6 +5138,7 @@ When context contains "User clarification:" after a proposal was made:
                 original_task=plan.original_task,
             )
             self._plans.pop(plan.task_id, None)
+            self._task_channel_ids.pop(plan.task_id, None)
             await self._close_task_context(plan, success=False)
             await self._persist_plan(plan, "failed")
             await self._shutdown_plan_agents(plan)
@@ -5159,6 +5189,7 @@ When context contains "User clarification:" after a proposal was made:
                     step_tasks=all_step_tasks or None,
                 )
                 self._plans.pop(plan.task_id, None)
+                self._task_channel_ids.pop(plan.task_id, None)
                 # Collect all step results for the eval pipeline
                 _eval_content = "\n\n".join(r for _, r in all_results if r)
                 await self._close_task_context(
@@ -5835,10 +5866,10 @@ When context contains "User clarification:" after a proposal was made:
         is_chat: bool = False,
         discord_channel_id: str | None = None,
     ) -> None:
-        # Fall back to the stored channel for this task if not explicitly provided
-        resolved_channel_id = discord_channel_id or self._task_channel_ids.pop(
-            task_id, None
-        )
+        # Fall back to the stored channel for this task if not explicitly provided.
+        # Use .get() (not .pop()) so subsequent replies for the same task_id still
+        # have channel routing — the entry is cleaned up only when the plan finalises.
+        resolved_channel_id = discord_channel_id or self._task_channel_ids.get(task_id)
         payload = {"result": result, "task_id": task_id}
         if discord_message_id:
             payload["discord_message_id"] = discord_message_id
@@ -5905,6 +5936,7 @@ When context contains "User clarification:" after a proposal was made:
         ]
         for tid in stale:
             plan = self._plans.pop(tid)
+            self._task_channel_ids.pop(tid, None)
             log.warning(
                 "orchestrator.plan_expired", task_id=tid, task=plan.original_task[:60]
             )
