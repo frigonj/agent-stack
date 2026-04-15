@@ -20,7 +20,6 @@ import logging
 import os
 import signal
 import time
-import uuid
 from abc import ABC, abstractmethod
 import re
 from typing import Any, Awaitable, Callable, Optional
@@ -73,7 +72,7 @@ log = structlog.get_logger()
 # to include all lines through the closing EOF marker so the full heredoc body is
 # passed to the shell rather than just the opening line.
 _ACTION_RE = re.compile(
-    r"^(?P<prefix>CMD|SEARCH|READ):\s*(?P<payload>.+)$", re.MULTILINE
+    r"^(?P<prefix>CMD|SEARCH|READ|ASK):\s*(?P<payload>.+)$", re.MULTILINE
 )
 # Matches a heredoc opener: captures the delimiter (e.g. EOF, 'EOF', "EOF")
 _HEREDOC_RE = re.compile(r"<<\s*['\"]?(\w+)['\"]?\s*$")
@@ -140,6 +139,12 @@ class BaseAgent(ABC):
         # IDLE_TIMEOUT env var overrides the class-level default
         env_idle = os.environ.get("IDLE_TIMEOUT", "")
         self._idle_timeout = int(env_idle) if env_idle.isdigit() else self.idle_timeout
+
+        # Active subtask context — set during agent_loop so llm_invoke can emit
+        # step heartbeats while blocked waiting for the LLM lock.
+        self._current_subtask: tuple[str, str] | None = (
+            None  # (subtask_id, parent_task_id)
+        )
 
         # ── Pending vote clarification requests ───────────────────────────────
         # plan_id → asyncio.Event (set when response arrives)
@@ -221,7 +226,6 @@ class BaseAgent(ABC):
             self._classify_loop(),
             self._approval_poll_loop(),
             self._expiry_review_loop(),
-            self._llm_lock_watchdog_loop(),
         )
 
     async def stop(self, summary: Optional[str] = None) -> None:
@@ -501,46 +505,6 @@ class BaseAgent(ABC):
                 self._stop_event.set()
                 return
 
-    async def _llm_lock_watchdog_loop(self) -> None:
-        """
-        Periodically check whether llm:lock is held without a live heartbeat.
-
-        This catches the case where the lock holder crashed or got stuck *after*
-        acquiring the lock but *before* (or without) starting the heartbeat task,
-        meaning no waiter ever sees the stale condition. Any live agent running
-        this loop will clear the orphaned lock within one check interval.
-
-        Check interval is _LLM_LOCK_HEARTBEAT_TTL so we only act after the
-        heartbeat would naturally have expired.
-        """
-        check_interval = float(self._LLM_LOCK_HEARTBEAT_TTL)
-        while self._running:
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=check_interval)
-                return  # stop requested
-            except asyncio.TimeoutError:
-                pass
-            if not self._running:
-                return
-            try:
-                lock_val = await self.bus._client.get(self._LLM_LOCK_KEY)
-                if lock_val is None:
-                    continue
-                heartbeat = await self.bus._client.get(self._LLM_LOCK_HEARTBEAT_KEY)
-                if heartbeat is None:
-                    log.warning(
-                        "agent.llm_lock_stale_watchdog",
-                        role=self.role,
-                        holder=lock_val,
-                        action="force_expiring",
-                    )
-                    await self.bus._client.delete(self._LLM_LOCK_KEY)
-                    await self.bus._client.publish(
-                        f"{self._LLM_LOCK_KEY}:released", "released"
-                    )
-            except Exception as exc:
-                log.debug("agent.llm_lock_watchdog_error", error=str(exc))
-
     async def _event_loop(self) -> None:
         async for stream, entry_id, event in self.bus.consume(
             role=self.role,
@@ -668,14 +632,6 @@ class BaseAgent(ABC):
 
     # ── LLM call management ─────────────────────────────────────────────────
 
-    # Redis key used as a distributed mutex across all agent containers.
-    # Only one agent may hold this lock at a time, preventing KV cache exhaustion.
-    _LLM_LOCK_KEY = "llm:lock"
-    _LLM_LOCK_TTL = 120  # seconds — auto-releases if agent crashes mid-call
-    _LLM_LOCK_POLL = 1.5  # seconds between acquire attempts
-    _LLM_LOCK_HEARTBEAT_KEY = "llm:heartbeat"
-    _LLM_LOCK_HEARTBEAT_TTL = 15  # seconds — holder must refresh this while in flight
-    _LLM_LOCK_HEARTBEAT_INTERVAL = 5  # seconds between heartbeat refreshes
     _MODEL_CTX_CACHE_TTL = 300  # re-fetch context limit after 5 min (model may reload)
 
     async def _get_model_context_limit(self) -> int:
@@ -826,6 +782,11 @@ class BaseAgent(ABC):
         consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
 
+        # Expose subtask context so llm_invoke can emit step heartbeats while
+        # blocked waiting for the LLM lock (prevents false stall detection).
+        if subtask_id:
+            self._current_subtask = (subtask_id, parent_task_id)
+
         for step in range(max_steps):
             if subtask_id:
                 await self.emit_heartbeat(
@@ -885,11 +846,13 @@ class BaseAgent(ABC):
             done_m = _DONE_RE.search(content)
             if done_m and not actions:
                 log.debug("agent_loop.done", role=self.role, step=step)
+                self._current_subtask = None
                 return done_m.group("answer").strip()
 
             if not actions:
                 # No action lines and no DONE → treat full response as the final answer
                 log.debug("agent_loop.implicit_done", role=self.role, step=step)
+                self._current_subtask = None
                 return content.strip()
 
             # Append the assistant turn
@@ -911,6 +874,25 @@ class BaseAgent(ABC):
                     EventType.AGENT_TOOL_CALL,
                     payload={"step": step, "action": prefix, "input": payload[:200]},
                 )
+                # ASK: is intercepted here — the agent suspends until the user
+                # replies via #knowledge-gap, then the answer comes back as the
+                # observation so the LLM can continue from where it left off.
+                if prefix == "ASK":
+                    task_id = subtask_id or parent_task_id or self.role
+                    try:
+                        answer = await self.raise_knowledge_gap(
+                            what=payload.strip(), task_id=task_id
+                        )
+                    except Exception as exc:
+                        answer = f"(knowledge gap timed out or failed: {exc})"
+                    obs = f"User answered: {answer}" if answer else "(no answer received — proceed with best judgement)"
+                    await self.emit(
+                        EventType.AGENT_TOOL_RESULT,
+                        payload={"step": step, "action": "ASK", "output": obs[:200]},
+                    )
+                    obs_parts.append(f"ASK: {payload}\nOBSERVATION: {obs}")
+                    continue
+
                 try:
                     obs = await action_handler(prefix, payload)
                 except Exception as exc:
@@ -928,6 +910,7 @@ class BaseAgent(ABC):
             # If DONE was present alongside actions, return now.
             if done_m:
                 log.debug("agent_loop.done_after_actions", role=self.role, step=step)
+                self._current_subtask = None
                 return obs_parts[-1].split("OBSERVATION:", 1)[-1].strip()
 
             # ── Self-correction: inject diagnostic nudge on persistent errors ──
@@ -974,7 +957,9 @@ class BaseAgent(ABC):
         ]
         final = await self.llm_invoke(msgs)
         done_m = _DONE_RE.search(final.content)
-        return done_m.group("answer").strip() if done_m else final.content.strip()
+        result = done_m.group("answer").strip() if done_m else final.content.strip()
+        self._current_subtask = None
+        return result
 
     async def _prune_loop_observations(self, messages: list, incoming_obs: str) -> list:
         """
@@ -1104,127 +1089,7 @@ class BaseAgent(ABC):
                 limit=limit,
             )
 
-        # ── Distributed lock with priority queue ────────────────────────────
-        #
-        # Priority: orchestrator (score 0) always cuts the queue ahead of
-        # specialist agents (score 1). This keeps user-facing response latency
-        # low even when specialists are busy with multi-call pipelines.
-        #
-        # Mechanism:
-        #   llm:queue  — Redis sorted set; members are "role:nonce", score is
-        #                priority (0 = high, 1 = normal).  ZADD NX adds our
-        #                entry; we hold the lock when we are rank-0 AND the
-        #                SET NX lock key is ours.
-        #   llm:lock   — Redis string SET NX; actual mutual-exclusion token.
-        #   llm:lock:released — pub/sub channel; PUBLISH wakes up waiters.
-        #
-        lock_priority = 0 if self.role == "orchestrator" else 1
-        nonce = uuid.uuid4().hex
-        member = f"{self.role}:{nonce}"
-        lock_value = member
-        queue_key = f"{self._LLM_LOCK_KEY}:queue"
-        notify_chan = f"{self._LLM_LOCK_KEY}:released"
-        acquired = False
-
-        # Register in the priority queue
-        await self.bus._client.zadd(queue_key, {member: lock_priority}, nx=True)
-        # Set a TTL on the queue key itself so crashed agents don't litter it
-        await self.bus._client.expire(queue_key, self._LLM_LOCK_TTL * 10)
-
-        try:
-            while not acquired:
-                # We can attempt the lock only when we are at the front of the queue
-                front = await self.bus._client.zrange(queue_key, 0, 0)
-                if front and front[0] == member:
-                    ok = await self.bus._client.set(
-                        self._LLM_LOCK_KEY,
-                        lock_value,
-                        nx=True,
-                        ex=self._LLM_LOCK_TTL,
-                    )
-                    if ok:
-                        acquired = True
-                        continue
-
-                front_member = front[0] if front else "unknown"
-                blocking_role = (
-                    front_member.split(":")[0] if front_member else "unknown"
-                )
-                log.debug(
-                    "agent.llm_lock_waiting",
-                    role=self.role,
-                    priority=lock_priority,
-                    blocked_by=blocking_role,
-                    reason=f"LLM lock held by {blocking_role}",
-                )
-                pubsub = self.bus._client.pubsub()
-                await pubsub.subscribe(notify_chan)
-                try:
-                    # get_message() is non-blocking on async redis-py and returns
-                    # None immediately, causing a busy-spin. Use listen() with
-                    # asyncio.wait_for() to actually block until a message arrives.
-                    # Cap wait at _LLM_LOCK_POLL seconds so stale locks (where the
-                    # holder crashed without publishing a release) are retried
-                    # promptly rather than hanging for the full TTL.
-                    async def _wait_for_release():
-                        async for msg in pubsub.listen():
-                            if msg["type"] == "message":
-                                return
-
-                    await asyncio.wait_for(
-                        _wait_for_release(), timeout=float(self._LLM_LOCK_POLL)
-                    )
-                except asyncio.TimeoutError:
-                    pass  # Poll interval elapsed; retry acquisition
-                finally:
-                    await pubsub.unsubscribe(notify_chan)
-                    await pubsub.aclose()
-
-                # After each poll cycle, check if the holder's heartbeat has
-                # expired. A missing heartbeat means the holder acquired the
-                # lock but is not actively calling LM Studio (crashed mid-call
-                # or stuck before the HTTP request). Force-expire the lock so
-                # the queue can advance without waiting the full 120s TTL.
-                heartbeat = await self.bus._client.get(self._LLM_LOCK_HEARTBEAT_KEY)
-                if heartbeat is None:
-                    current_holder = await self.bus._client.get(self._LLM_LOCK_KEY)
-                    if current_holder is not None:
-                        log.warning(
-                            "agent.llm_lock_stale",
-                            role=self.role,
-                            holder=current_holder,
-                            action="force_expiring",
-                        )
-                        await self.bus._client.delete(self._LLM_LOCK_KEY)
-                        await self.bus._client.publish(notify_chan, "released")
-        except Exception:
-            # Clean up queue entry if we never acquired the lock
-            await self.bus._client.zrem(queue_key, member)
-            raise
-
-        # Heartbeat task: refresh llm:heartbeat every _LLM_LOCK_HEARTBEAT_INTERVAL
-        # seconds while the LLM call is in flight. Waiters treat a missing
-        # heartbeat as proof the holder is not actively using LM Studio and
-        # will force-expire the lock after one poll cycle.
-        heartbeat_stop = asyncio.Event()
-
-        async def _heartbeat_loop():
-            while not heartbeat_stop.is_set():
-                await self.bus._client.set(
-                    self._LLM_LOCK_HEARTBEAT_KEY,
-                    lock_value,
-                    ex=self._LLM_LOCK_HEARTBEAT_TTL,
-                )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(heartbeat_stop.wait()),
-                        timeout=float(self._LLM_LOCK_HEARTBEAT_INTERVAL),
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-        heartbeat_task = asyncio.ensure_future(_heartbeat_loop())
-
+        # ── Direct LLM call — LM Studio queues concurrent requests natively ──
         try:
             try:
                 result = await self.llm.ainvoke(messages)
@@ -1273,21 +1138,6 @@ class BaseAgent(ABC):
                     error=str(exc),
                 )
             raise
-        finally:
-            # Stop heartbeat task and delete the heartbeat key
-            heartbeat_stop.set()
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            await self.bus._client.delete(self._LLM_LOCK_HEARTBEAT_KEY)
-            # Remove from queue and release lock, then wake up waiters
-            await self.bus._client.zrem(queue_key, member)
-            current = await self.bus._client.get(self._LLM_LOCK_KEY)
-            if current == lock_value:
-                await self.bus._client.delete(self._LLM_LOCK_KEY)
-                await self.bus._client.publish(notify_chan, "released")
 
     # ── Memory helpers ───────────────────────────────────────────────────────
 

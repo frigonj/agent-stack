@@ -50,6 +50,7 @@ Issue actions one at a time; wait for each OBSERVATION before the next.
   CMD:    <shell command>            — run a shell command via executor
   WRITE:  <path>|||<content>         — write or overwrite a file (REQUIRES APPROVAL)
   PATCH:  <path>|||<unified diff>    — apply a patch to a file (REQUIRES APPROVAL)
+  ASK:    <question for the user>    — pause and ask the user for information you cannot determine yourself (credentials, design decisions, missing config, etc.); their answer comes back as an OBSERVATION
   DONE:   <summary of changes made>  — finish the task
 
 ## Conventions

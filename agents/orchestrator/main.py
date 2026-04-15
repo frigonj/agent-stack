@@ -463,20 +463,42 @@ _INFRASTRUCTURE_ERROR_PATTERNS = re.compile(
     re.I,
 )
 
+# Failures that cannot be resolved by retrying — the agent needs information
+# that only the user can supply (credentials, identity, config values, etc.).
+_USER_INPUT_REQUIRED_PATTERNS = re.compile(
+    r"Please tell me who you are"
+    r"|Author identity unknown"
+    r"|user\.email"
+    r"|user\.name"
+    r"|git config.*global"
+    r"|Authentication failed"
+    r"|could not read Username"
+    r"|Permission denied \(publickey\)"
+    r"|fatal: could not read Password"
+    r"|token.*required"
+    r"|API key.*missing"
+    r"|credentials? (not found|required|missing)",
+    re.I,
+)
+
 
 def _classify_failure(result: str) -> str:
     """
-    Classify a step failure as 'infrastructure' or 'logic'.
+    Classify a step failure as 'infrastructure', 'needs_user_input', or 'logic'.
 
     Infrastructure: container wouldn't start, Docker errors, stall timeouts.
       → fix cycle should be bypassed immediately (no retries will help).
+    needs_user_input: failure requires configuration/credentials only the user can supply.
+      → freeze plan and escalate as a knowledge gap.
     Logic: wrong command, missing file, bad output — agent ran but produced
       a bad result.
       → normal fix cycle applies.
     """
-    return (
-        "infrastructure" if _INFRASTRUCTURE_ERROR_PATTERNS.search(result) else "logic"
-    )
+    if _INFRASTRUCTURE_ERROR_PATTERNS.search(result):
+        return "infrastructure"
+    if _USER_INPUT_REQUIRED_PATTERNS.search(result):
+        return "needs_user_input"
+    return "logic"
 
 
 def _truncate_error(text: str, head: int = 300, tail: int = 300) -> str:
@@ -4933,6 +4955,38 @@ When context contains "User clarification:" after a proposal was made:
                         step.depth = max_depth  # force into exhausted path
                         fix_steps_added = 0  # do not add a fix step for this
                         break  # fall through to escalation
+
+                    # ── User-input required bypass ─────────────────────────
+                    # Some failures (missing git identity, auth credentials,
+                    # API keys) can only be resolved by the user.  Freeze the
+                    # plan immediately and surface a knowledge gap rather than
+                    # spinning through the fix cycle uselessly.
+                    if failure_class == "needs_user_input":
+                        log.warning(
+                            "orchestrator.user_input_required",
+                            step_id=step.step_id,
+                            agent=step.agent,
+                            result_preview=step.result[:120],
+                        )
+                        await self._emit_plan_status(
+                            plan,
+                            f"❓ `[{step.agent}]` needs user input — "
+                            f"pausing for knowledge gap: {step.result[:120]}",
+                        )
+                        await self._handle_knowledge_gap(
+                            Event(
+                                type=EventType.KNOWLEDGE_GAP,
+                                source=step.agent,
+                                payload={
+                                    "task_id": plan.task_id,
+                                    "what": step.result[:500],
+                                    "agent": step.agent,
+                                },
+                                task_id=plan.task_id,
+                            )
+                        )
+                        plan._phases_advancing.discard(phase)
+                        return  # plan is now frozen; do not enter fix cycle
 
                     # ── Strategy rotation ──────────────────────────────────
                     # depth 1–3: same agent, error context + explicit prohibition list

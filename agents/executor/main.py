@@ -436,6 +436,12 @@ When done, end with:
 
 Rules: DONE: must be the last line. Never put CMD: after DONE:.
 
+If you cannot proceed without information only the user can provide (credentials, git identity,
+API keys, config values, etc.) use:
+  ASK: <your question for the user>
+The loop will pause, the user will be notified in Discord, and their answer will come back
+as an OBSERVATION. Use the answer to continue the task.
+
 ## Multi-step example — patching a source file
   CMD: cat /workspace/src/agents/executor/main.py
   OBSERVATION: <file content>

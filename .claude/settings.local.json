@@ -53,6 +53,9 @@
       "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' add docker-compose.yml)",
       "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' commit -m ':*)",
       "Bash(git -C 'C:/Users/frigo/Documents/Coding Projects/agent-stack' push)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\frigo\\Documents\\Coding Projects\\agent-stack\\.git"
     ]
   }
 }
