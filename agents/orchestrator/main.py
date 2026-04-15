@@ -622,13 +622,15 @@ Always resolve pronouns and references ("the tool", "it", "that") from conversat
 ## Specialists and routing rules
 
 ### executor
-Runs shell commands, reads/writes files, manages Docker containers.
+Runs shell commands, reads files, manages Docker containers, runs scripts.
 - ALWAYS use for: ls, cat, grep, find, docker ops, running scripts, curl, pip install
 - Safe (no approval): ls, cat, grep, find, head, tail, python3 -c, docker logs/inspect
 - Requires approval: git push/commit, docker restart/rm, tee (file writes), pip install
 - Paths: /workspace/src (agent source), /workspace/user (user home),
          /workspace/projects (coding projects), /workspace/tools (reusable scripts)
 - NEVER use executor to understand or write code — that's developer + code_search
+- NEVER use `echo` or `printf` to write file content — shell quoting breaks multiline text.
+  Route ALL file creation/population steps to developer instead.
 
 ### code_search
 Investigation and analysis of codebases — finding, explaining, and understanding code.
@@ -639,10 +641,10 @@ Investigation and analysis of codebases — finding, explaining, and understandi
 - NEVER route code *modification* tasks to code_search
 
 ### developer
-Writes, edits, refactors, and fixes code. Delegates: reads→code_search, writes→executor.
+Writes, edits, refactors, and fixes code — including creating new files with content.
 - Use for: "add feature X", "fix bug Y", "refactor Z", "write tests for W",
-           "create new agent", "implement this change"
-- developer proposes changes; executor writes files (approval-gated for state-changing ops)
+           "create new agent", "implement this change", "create file X with content Y"
+- developer writes file content directly via Python; executor handles shell/docker ops
 - developer calls code_search for navigation; does NOT run shell commands directly
 - NEVER route "explain what this does" tasks to developer (use code_search)
 
@@ -675,7 +677,7 @@ Runs perf test suite and produces improvement suggestions. Always-on; auto-trigg
 ## Routing decision tree
 1. Shell command / file read / Docker → executor
 2. "What does X code do?" / find patterns / explain code → code_search
-3. Write/fix/refactor code → developer (delegates searches to code_search, writes to executor)
+3. Write/fix/refactor code / create files with content → developer
 4. Web lookup / current info / internet research → research
 5. Questions about docs / generate PDF → document_qa
 6. Complex reasoning / nuanced analysis → claude_code_agent
@@ -772,6 +774,9 @@ class PlanStep:
     error_chain: list = field(default_factory=list)
     dispatched_at: float = 0.0  # monotonic timestamp when step entered "running"
     stall_count: int = 0  # how many times this step has been stalled and reset
+    # step_id of the step this step must wait for before being dispatched.
+    # Empty string means no dependency — dispatch immediately with phase peers.
+    depends_on: str = ""
 
 
 @dataclass
@@ -924,7 +929,14 @@ Only propose 2–5 phases. Each phase should be independently deliverable.
 Return ONLY valid JSON, no markdown fences. Three possible responses:
 
 1. When requirements are clear and task is NOT project-scale — execution plan:
-{"steps": [{"phase": 1, "task": "...", "agent": "...", "expected": "..."}, ...]}
+{"steps": [{"phase": 1, "seq": 1, "task": "...", "agent": "...", "expected": "..."}, ...]}
+
+"seq" is an optional 1-based integer that orders steps within the same phase.
+Steps with the same phase and no seq (or seq 1) run in parallel.
+A step with seq 2 waits for seq 1 to complete before it is dispatched.
+A step with seq 3 waits for seq 2, and so on.
+Use seq when steps in the same phase have a strict dependency (e.g. git init must finish before git commit).
+Steps in different phases never need seq — phases are already sequential.
 
 2. When requirements are too vague to act on safely — clarification request:
 {"clarify": "Your single focused question here"}
@@ -945,7 +957,10 @@ Rules for plans:
 - 1–4 phases, 1–8 steps total
 - discord agent for ANYTHING involving Discord channels/categories/messages/topics
 - When unsure which agent, use executor
-- Steps that depend on results of earlier steps MUST use a later phase number
+- Steps that depend on results of earlier steps MUST use a later phase number OR use "seq" to order within a phase
+- Use "seq" (1, 2, 3…) when steps are in the same phase but must run in order: seq 2 waits for seq 1
+  Example: {"phase": 1, "seq": 1, "task": "git init ...", ...}, {"phase": 1, "seq": 2, "task": "git commit ...", ...}
+- Steps without seq (or with seq 1) run in parallel with all other seq-1 steps in the phase
 - Prefer checking /workspace/tools/ for existing scripts before creating new executor steps
 
 Step quality rules (CRITICAL — failure to follow causes task failures):
@@ -967,6 +982,14 @@ Step quality rules (CRITICAL — failure to follow causes task failures):
 - code_search steps must name the specific function, class, or pattern to find.
 - research steps must state the exact question to research.
 - document_qa steps must state the exact document path or question to answer/validate.
+
+File-write routing rule (CRITICAL):
+- NEVER assign an executor step that uses `echo`, `printf`, or `cat <<EOF` to write file content.
+  Shell quoting cannot reliably handle multiline strings — these commands silently corrupt content.
+  BAD (executor):  "echo 'import asyncio\\n\\nasync def main():\\n    pass' > /workspace/repos/bot/main.py"
+  GOOD (developer): "create /workspace/repos/bot/main.py with content: import asyncio async def main(): pass"
+- executor is for directory creation (mkdir), git ops, docker ops, and running existing scripts.
+- developer is for ALL file creation and population, regardless of content length.
 
 When context contains "User clarification:" after a proposal was made:
 - The user's reply selects which phase(s) to execute (e.g. "1", "1 and 2", "all").
@@ -3800,19 +3823,38 @@ When context contains "User clarification:" after a proposal was made:
             raw = raw[: self._MAX_PLAN_STEPS]
 
         steps = []
+        # Track the last step_id seen per (phase, agent) to wire up sequential deps.
+        # Key: (phase, seq) → step_id, where seq is the 1-based position the planner
+        # emitted in "seq". Seq 1 (or omitted) means "no dependency within this phase".
+        phase_seq_ids: dict[tuple[int, int], str] = {}
+
         for s in raw:
             task = str(s.get("task", "")).strip()
             if not task:
                 continue
             capped = task[:600]
+            phase = max(1, int(s.get("phase", 1)))
+            seq = int(s.get("seq", 1))
+            step_id = str(uuid.uuid4())
+
+            # Resolve depends_on: seq N depends on the step with seq N-1 in the same phase.
+            depends_on = ""
+            if seq > 1:
+                prev_id = phase_seq_ids.get((phase, seq - 1), "")
+                if prev_id:
+                    depends_on = prev_id
+
+            phase_seq_ids[(phase, seq)] = step_id
+
             steps.append(
                 PlanStep(
-                    step_id=str(uuid.uuid4()),
-                    phase=max(1, int(s.get("phase", 1))),
+                    step_id=step_id,
+                    phase=phase,
                     task=capped,
                     agent=str(s.get("agent", "executor")).strip(),
                     expected=str(s.get("expected", "")).strip()[:200],
                     original_subtask=capped,  # frozen at depth 0, never mutated
+                    depends_on=depends_on,
                 )
             )
         return steps
@@ -3918,7 +3960,21 @@ When context contains "User clarification:" after a proposal was made:
                         f"a specific search target (quoted string, symbol name, or file path)"
                     )
 
-        # 5. Explicit self-references — detect "phase N" / "step N" forward references
+        # 5. File-write via echo/printf on executor — always broken for multiline content.
+        #    Detect and reject; the planner must route these to developer instead.
+        _ECHO_FILE_WRITE = re.compile(
+            r"\b(echo|printf|cat\s*<<)\b.*(>|>>)\s*\S+",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for i, step in enumerate(steps, start=1):
+            if step.agent == "executor" and _ECHO_FILE_WRITE.search(step.task):
+                errors.append(
+                    f"step {i} (phase {step.phase}, agent=executor): uses echo/printf/heredoc to write "
+                    f"file content — shell quoting corrupts multiline strings. "
+                    f"Reassign this step to agent=developer with an instruction to write the file using Python."
+                )
+
+        # 6. Explicit self-references — detect "phase N" / "step N" forward references
         #    within a phase that point to the same phase (can never be satisfied)
         phase_steps: dict[int, list[PlanStep]] = {}
         for step in steps:
@@ -3935,7 +3991,7 @@ When context contains "User clarification:" after a proposal was made:
                         f"— outputs from a phase are only available to later phases"
                     )
 
-        # 6. Discord/direct isolation — discord or direct steps must not share a phase
+        # 7. Discord/direct isolation — discord or direct steps must not share a phase
         #    with async agent steps.
         #    discord steps complete via an event callback (_handle_discord_done); if an
         #    async agent step in the same phase hangs, the discord result sits unacted-on
@@ -4137,8 +4193,15 @@ When context contains "User clarification:" after a proposal was made:
     # ── Phase dispatch ───────────────────────────────────────────────────────
 
     async def _dispatch_phase(self, plan: ExecutionPlan, phase: int) -> None:
-        """Dispatch all pending steps in the given phase."""
-        steps = [s for s in plan.steps if s.phase == phase and s.status == "pending"]
+        """Dispatch all pending steps in the given phase whose dependencies are satisfied."""
+        done_ids = {s.step_id for s in plan.steps if s.status == "done"}
+        steps = [
+            s
+            for s in plan.steps
+            if s.phase == phase
+            and s.status == "pending"
+            and (not s.depends_on or s.depends_on in done_ids)
+        ]
         if not steps:
             await self._check_phase_complete(plan)
             return
@@ -4357,6 +4420,21 @@ When context contains "User clarification:" after a proposal was made:
 
             if event.payload.get("promote", False):
                 await self.promote_now(result, topic=event.source, tags=[event.source])
+
+            # If any pending steps in the current phase were waiting on this step,
+            # dispatch them now before checking phase completion.
+            if step and step.status == "done":
+                current_phase = plan.current_phase()
+                waiting = [
+                    s
+                    for s in plan.steps
+                    if s.phase == current_phase
+                    and s.status == "pending"
+                    and s.depends_on == step.step_id
+                ]
+                if waiting:
+                    await self._dispatch_phase(plan, current_phase)
+                    return
 
             await self._check_phase_complete(plan)
             return
@@ -4738,6 +4816,18 @@ When context contains "User clarification:" after a proposal was made:
             return
         running = [s for s in plan.steps if s.phase == phase and s.status == "running"]
         if running:
+            return
+
+        # Still have pending steps in this phase waiting for a dependency to finish?
+        # (sequential deps: seq N is pending until seq N-1 goes done)
+        done_ids = {s.step_id for s in plan.steps if s.status == "done"}
+        waiting = [
+            s
+            for s in plan.steps
+            if s.phase == phase and s.status == "pending" and s.depends_on
+            and s.depends_on not in done_ids
+        ]
+        if waiting:
             return
 
         # Atomically claim this phase — bail if another coroutine already has it.
@@ -5640,6 +5730,29 @@ When context contains "User clarification:" after a proposal was made:
         if len(raw_results) == 1:
             source, result = raw_results[0]
             result = result.strip()
+            if result.startswith("Exit code: 0"):
+                # Successful executor result — render a readable summary without an LLM call.
+                # Strip the "Exit code: 0" line and extract stdout/stderr if present.
+                body = result[len("Exit code: 0"):].strip()
+                stdout_match = re.search(r"STDOUT:\n(.*?)(?=STDERR:|$)", body, re.DOTALL)
+                stderr_match = re.search(r"STDERR:\n(.*)", body, re.DOTALL)
+                stdout_text = stdout_match.group(1).strip() if stdout_match else ""
+                stderr_text = stderr_match.group(1).strip() if stderr_match else ""
+                # Build a short task label from the steps that were run
+                task_label = (
+                    "\n".join(f"• {t}" for t in step_tasks)
+                    if step_tasks
+                    else original_task[:200]
+                )
+                parts = [f"✅ Done:\n{task_label}"]
+                if stdout_text:
+                    parts.append(f"```\n{stdout_text[:1200]}\n```")
+                if stderr_text:
+                    parts.append(f"ℹ️ stderr:\n```\n{stderr_text[:400]}\n```")
+                await self._publish_reply(
+                    "\n\n".join(parts), task_id, discord_message_id, original_task=original_task
+                )
+                return
             if not result.startswith("Exit code:") and len(result) <= 1800:
                 await self._publish_reply(
                     result, task_id, discord_message_id, original_task=original_task

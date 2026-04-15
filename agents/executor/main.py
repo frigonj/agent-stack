@@ -1191,18 +1191,6 @@ class ExecutorAgent(BaseAgent):
                 tags=["executor", "self_modify"],
             )
 
-        # If the result is a bare "Exit code: 0" with no useful content, replace it
-        # with a human-readable summary so the orchestrator can synthesise a real reply.
-        result_stripped = result.strip()
-        if result_stripped == "Exit code: 0" or (
-            result_stripped.startswith("Exit code: 0") and len(result_stripped) < 20
-        ):
-            result = f"Done: {task[:200]}"
-        elif result_stripped.startswith("Exit code: 0\nSTDOUT:\n"):
-            # Successful command with stdout — prepend task context so it reads naturally
-            stdout_body = result_stripped[len("Exit code: 0\nSTDOUT:\n") :]
-            result = f"Done: {task[:120]}\n\nOutput:\n{stdout_body}"
-
         await self.emit(
             EventType.TASK_COMPLETED,
             payload={
@@ -1430,6 +1418,21 @@ class ExecutorAgent(BaseAgent):
         _recovery: bool = False,
     ) -> str:
         """Run a shell command after three-tier trust check."""
+        # Strip the registry invocation prefix so the LLM never accidentally
+        # passes "shell:/path/to/script.sh" as a literal command.
+        if cmd.startswith("shell:"):
+            script_path = cmd[6:]
+            # Validate before converting to a bash invocation
+            ok, reason = self._script_is_valid(script_path)
+            if not ok:
+                return (
+                    f"Exit code: 1\nSTDERR:\nCannot run script — {reason}. "
+                    "The script must be written before it can be run. "
+                    "Use: tee /workspace/tools/<script>.sh << 'EOF' ... EOF "
+                    "then verify with: cat /workspace/tools/<script>.sh"
+                )
+            cmd = f"bash {script_path}"
+
         try:
             parts = shlex.split(cmd)
         except ValueError as e:
