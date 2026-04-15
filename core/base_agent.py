@@ -69,9 +69,14 @@ log = structlog.get_logger()
 
 # ── Agent loop action parsing ─────────────────────────────────────────────────
 # Matches lines like "CMD: docker ps" or "SEARCH: EventType" or "READ: /workspace/docs/x.pdf"
+# For CMD lines that open a heredoc (<< 'EOF' or << EOF), the payload is extended
+# to include all lines through the closing EOF marker so the full heredoc body is
+# passed to the shell rather than just the opening line.
 _ACTION_RE = re.compile(
     r"^(?P<prefix>CMD|SEARCH|READ):\s*(?P<payload>.+)$", re.MULTILINE
 )
+# Matches a heredoc opener: captures the delimiter (e.g. EOF, 'EOF', "EOF")
+_HEREDOC_RE = re.compile(r"<<\s*['\"]?(\w+)['\"]?\s*$")
 # Matches "DONE: <answer>" — the LLM signals it is finished
 _DONE_RE = re.compile(r"^DONE:\s*(?P<answer>.+)", re.MULTILINE | re.DOTALL)
 
@@ -834,6 +839,45 @@ class BaseAgent(ABC):
 
             # ── Parse action lines ─────────────────────────────────────────
             actions = _ACTION_RE.findall(content)
+
+            # Expand heredoc bodies: if a CMD payload opens a heredoc (<< EOF),
+            # replace the single-line capture with the full heredoc text so the
+            # shell receives the complete content instead of just the opening line.
+            if actions:
+                lines = content.splitlines()
+                expanded = []
+                for prefix, payload in actions:
+                    if prefix == "CMD":
+                        hm = _HEREDOC_RE.search(payload)
+                        if hm:
+                            delimiter = hm.group(1)
+                            # Find this CMD line in the raw content
+                            cmd_line = f"{prefix}: {payload}"
+                            try:
+                                start_idx = next(
+                                    i
+                                    for i, ln in enumerate(lines)
+                                    if ln.strip().endswith(payload.rstrip())
+                                    and prefix + ":" in ln
+                                )
+                                body_lines = []
+                                for ln in lines[start_idx + 1 :]:
+                                    if ln.strip() == delimiter:
+                                        break
+                                    body_lines.append(ln)
+                                # Reconstruct the full heredoc command
+                                full_payload = (
+                                    payload
+                                    + "\n"
+                                    + "\n".join(body_lines)
+                                    + f"\n{delimiter}"
+                                )
+                                expanded.append((prefix, full_payload))
+                                continue
+                            except StopIteration:
+                                pass  # couldn't locate — fall through to original
+                    expanded.append((prefix, payload))
+                actions = expanded
 
             # ── Explicit DONE termination ──────────────────────────────────
             # Check DONE *after* actions so that a response with both

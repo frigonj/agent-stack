@@ -659,12 +659,6 @@ Answers questions from /workspace/docs (PDF, markdown). Generates architecture d
 - Use for: questions about project documentation, architecture review, generating reports/PDFs
 - Output goes to /workspace/docs/generated/
 
-### claude_code_agent
-Full Anthropic Claude API with tool use. Best for complex multi-step reasoning requiring
-the highest intelligence — use only when local LLM (Qwen) is insufficient.
-- Use for: complex analysis, nuanced code generation, tasks needing deep reasoning
-- Do NOT use for web lookups (→research), simple shell ops (→executor), or routine code edits (→developer)
-
 ### discord
 Discord server management — channels, categories, topics, messages, pins.
 - Use for: create/rename/delete channels, send messages, manage server structure
@@ -680,9 +674,8 @@ Runs perf test suite and produces improvement suggestions. Always-on; auto-trigg
 3. Write/fix/refactor code / create files with content → developer
 4. Web lookup / current info / internet research → research
 5. Questions about docs / generate PDF → document_qa
-6. Complex reasoning / nuanced analysis → claude_code_agent
-7. Discord server actions → discord
-8. Performance / slow queries → optimizer
+6. Discord server actions → discord
+7. Performance / slow queries → optimizer
 
 ## Stack architecture (for context)
 - Redis Streams     : event bus between agents (streams: agents:{role}, agents:broadcast)
@@ -749,7 +742,7 @@ entry relevant to this task, respect it — do not repeat the failed approach.
 
 Source paths: /workspace/src/agents/<name>/main.py
 Container names: agent_orchestrator, agent_executor, agent_document_qa,
-  agent_code_search, agent_discord_bridge, agent_claude_code, agent_developer,
+  agent_code_search, agent_discord_bridge, agent_developer,
   agent_research, agent_optimizer
 """
 
@@ -1068,12 +1061,6 @@ When context contains "User clarification:" after a proposal was made:
             ["discord", "channel", "message"],
         ),
         (
-            "route-to-claude-code",
-            "Complex coding tasks, code editing, multi-file changes using Claude API",
-            "event:task.assigned:claude_code_agent",
-            ["claude", "code", "edit", "programming"],
-        ),
-        (
             "route-to-research",
             "Research factual questions across the internet — returns sourced, consensus-checked answers",
             "event:task.assigned:research",
@@ -1098,8 +1085,12 @@ When context contains "User clarification:" after a proposal was made:
     async def on_startup(self) -> None:
         log.info("orchestrator.startup")
         self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
-        self._step_timeout_watchdog_task = asyncio.create_task(self._step_timeout_watchdog_loop())
-        self._task_worker_watchdog_task = asyncio.create_task(self._task_worker_watchdog())
+        self._step_timeout_watchdog_task = asyncio.create_task(
+            self._step_timeout_watchdog_loop()
+        )
+        self._task_worker_watchdog_task = asyncio.create_task(
+            self._task_worker_watchdog()
+        )
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -1180,7 +1171,6 @@ When context contains "User clarification:" after a proposal was made:
     _HEARTBEAT_SILENCE_DEFAULTS: dict[str, int] = {
         "executor": 30,  # shell commands return fast
         "developer": 120,  # 10-step ReAct × LLM latency
-        "claude_code_agent": 120,
         "research": 90,  # web fetch + LLM
         "code_search": 60,
         "document_qa": 90,
@@ -3866,7 +3856,6 @@ When context contains "User clarification:" after a proposal was made:
             "code_search",
             "research",
             "document_qa",
-            "claude_code_agent",
             "optimizer",
         }
     )
@@ -4329,15 +4318,12 @@ When context contains "User clarification:" after a proposal was made:
         "document_qa",
         "code_search",
         "executor",
-        "claude_code_agent",
         "research",
         "developer",
     }
 
     # Some agents listen on a different stream than their role name.
-    _AGENT_STREAM = {
-        "claude_code_agent": "claude_code",  # legacy stream name kept for discord-bridge compat
-    }
+    _AGENT_STREAM: dict[str, str] = {}
 
     async def _handle_result(self, event: Event) -> None:
         if event.source not in self.SPECIALIST_ROLES:
@@ -4824,7 +4810,9 @@ When context contains "User clarification:" after a proposal was made:
         waiting = [
             s
             for s in plan.steps
-            if s.phase == phase and s.status == "pending" and s.depends_on
+            if s.phase == phase
+            and s.status == "pending"
+            and s.depends_on
             and s.depends_on not in done_ids
         ]
         if waiting:
@@ -4918,29 +4906,34 @@ When context contains "User clarification:" after a proposal was made:
                         break  # fall through to escalation
 
                     # ── Strategy rotation ──────────────────────────────────
-                    # depth 1–3: same agent, error context appended
-                    # depth 4–6: escalate to claude_code_agent for deeper reasoning
-                    # depth 7–9: orchestrator reformulates the task via LLM,
+                    # depth 1–3: same agent, error context + explicit prohibition list
+                    # depth 4+:  orchestrator reformulates the task via LLM,
                     #            using original_subtask + full attempt history
                     # depth 10:  exhausted — escalated below (not fixable)
                     if new_depth <= 3:
                         fix_agent = step.agent
                         chain_ctx = _fmt_chain(error_chain)
+                        # Build an explicit prohibition list from prior failed tasks
+                        # so the agent cannot blindly repeat the same command.
+                        prior_tasks = [
+                            e["task"][:300]
+                            for e in error_chain
+                            if isinstance(e, dict) and e.get("task")
+                        ]
+                        prohibition = (
+                            "\n\nDo NOT repeat any of the following exact approaches "
+                            "(they have already failed):\n"
+                            + "\n".join(f"  - {t}" for t in prior_tasks)
+                            if prior_tasks
+                            else ""
+                        )
                         fix_task = (
                             f"{original_subtask}\n\n"
                             f"[Fix attempt {new_depth}: previous attempt(s) failed.]\n"
                             f"Attempt history:\n{chain_ctx}\n"
-                            "Try a different approach."
+                            f"Try a different approach.{prohibition}"
                         )
-                    elif new_depth <= 6:
-                        fix_agent = "claude_code_agent"
-                        chain_ctx = _fmt_chain(error_chain)
-                        fix_task = (
-                            f"A previous agent ({step.agent}) failed to complete this subtask.\n"
-                            f"Original subtask: {original_subtask}\n\n"
-                            f"Attempt history (oldest first):\n{chain_ctx}\n\n"
-                            "Please provide a correct solution using your full reasoning capability."
-                        )
+                        new_expected = step.expected
                     else:
                         fix_agent = step.agent
                         # Reformulate via LLM using original_subtask + full history.
@@ -5005,7 +4998,7 @@ When context contains "User clarification:" after a proposal was made:
                         phase=next_phase,
                         task=fix_task[:2000],
                         agent=fix_agent,
-                        expected=new_expected[:200] if new_depth > 6 else step.expected,
+                        expected=new_expected[:200],
                         depth=new_depth,
                         original_subtask=original_subtask,
                         error_chain=error_chain,
@@ -5021,9 +5014,7 @@ When context contains "User clarification:" after a proposal was made:
                             "fix_step_id": fix_step.step_id,
                             "depth": new_depth,
                             "agent": fix_agent,
-                            "strategy": "same"
-                            if new_depth <= 3
-                            else ("escalate" if new_depth <= 6 else "reformulate"),
+                            "strategy": "same" if new_depth <= 3 else "reformulate",
                             "plan_id": plan.plan_id,
                         },
                         target="broadcast",
@@ -5070,13 +5061,9 @@ When context contains "User clarification:" after a proposal was made:
                         f"fix budget exhausted ({s.depth}/{max_depth} attempts)"
                     )
                     strategy_note = (
-                        "tried same agent → escalated to claude_code_agent → reformulated"
-                        if s.depth >= 7
-                        else (
-                            "tried same agent → escalated to claude_code_agent"
-                            if s.depth >= 4
-                            else "retried same agent with error context"
-                        )
+                        "retried same agent → orchestrator reformulated task"
+                        if s.depth >= 4
+                        else "retried same agent with error context"
                     )
                 else:
                     status_note = (
@@ -5183,7 +5170,7 @@ When context contains "User clarification:" after a proposal was made:
                 # with a conclusive outcome. Captures which agent sequence solved this
                 # class of task for faster routing in future sessions.
                 # Use canonical steps (one per original subtask) so fix-step agents
-                # (e.g. claude_code_agent escalations) don't pollute the routing pattern.
+                # (e.g. reformulation fix steps) don't pollute the routing pattern.
                 agent_sequence = " → ".join(
                     dict.fromkeys(s.agent for s in canonical_steps)
                 )
@@ -5353,16 +5340,13 @@ When context contains "User clarification:" after a proposal was made:
         "document_qa",
         "code_search",
         "executor",
-        "claude_code_agent",
         "research",
         "developer",
     }
 
     # Maps agent role name → Docker container_name (for docker start/stop).
     # Defaults to "agent_{role}" for anything not listed here.
-    _CONTAINER_NAME = {
-        "claude_code_agent": "agent_claude_code",
-    }
+    _CONTAINER_NAME: dict[str, str] = {}
 
     # Extra containers that must be running before an agent can do its work.
     # Keyed by agent role name → list of container names to start first.
@@ -5733,8 +5717,10 @@ When context contains "User clarification:" after a proposal was made:
             if result.startswith("Exit code: 0"):
                 # Successful executor result — render a readable summary without an LLM call.
                 # Strip the "Exit code: 0" line and extract stdout/stderr if present.
-                body = result[len("Exit code: 0"):].strip()
-                stdout_match = re.search(r"STDOUT:\n(.*?)(?=STDERR:|$)", body, re.DOTALL)
+                body = result[len("Exit code: 0") :].strip()
+                stdout_match = re.search(
+                    r"STDOUT:\n(.*?)(?=STDERR:|$)", body, re.DOTALL
+                )
                 stderr_match = re.search(r"STDERR:\n(.*)", body, re.DOTALL)
                 stdout_text = stdout_match.group(1).strip() if stdout_match else ""
                 stderr_text = stderr_match.group(1).strip() if stderr_match else ""
@@ -5750,7 +5736,10 @@ When context contains "User clarification:" after a proposal was made:
                 if stderr_text:
                     parts.append(f"ℹ️ stderr:\n```\n{stderr_text[:400]}\n```")
                 await self._publish_reply(
-                    "\n\n".join(parts), task_id, discord_message_id, original_task=original_task
+                    "\n\n".join(parts),
+                    task_id,
+                    discord_message_id,
+                    original_task=original_task,
                 )
                 return
             if not result.startswith("Exit code:") and len(result) <= 1800:

@@ -29,7 +29,25 @@
       "Bash(docker run:*)",
       "Read(//mnt/c/Users/frigo/**)",
       "Bash(ls /mnt/)",
-      "Bash(wsl -e bash -c \"cd ''/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack'' && python3 --version && ls .venv/bin/activate 2>/dev/null && echo ''venv ok'' || echo ''no venv''\")"
+      "Bash(wsl -e bash -c \"cd ''/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack'' && python3 --version && ls .venv/bin/activate 2>/dev/null && echo ''venv ok'' || echo ''no venv''\")",
+      "Bash(wsl -e bash -c \"docker logs agent_orchestrator -f 2>&1 | grep -v 'heartbeat\\\\|think_skipped\\\\|memory.class\\\\|expiry_set'\")",
+      "Bash(wsl -e bash -c \"sleep 5 && docker logs agent_orchestrator 2>&1 | grep -v 'heartbeat\\\\|think_skipped\\\\|memory.class\\\\|expiry_set' | tail -20\")",
+      "Bash(wsl -e bash -c \"sleep 8 && docker logs agent_orchestrator 2>&1 | grep -v 'heartbeat\\\\|think_skipped\\\\|memory.class\\\\|expiry_set\\\\|debug' | tail -15\")",
+      "Bash(wsl -e bash -c \"cd '/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack' && docker compose build orchestrator 2>&1 | tail -5 && docker restart agent_orchestrator\")",
+      "Bash(wsl -e bash -c \"sleep 20 && docker logs agent_orchestrator 2>&1 | grep -v 'heartbeat\\\\|think_skipped\\\\|memory.class\\\\|expiry_set\\\\|debug' | tail -10\")",
+      "Bash(wsl -e bash -c \"sleep 8 && docker logs agent_orchestrator 2>&1 | grep -v 'heartbeat\\\\|think_skipped\\\\|memory.class\\\\|expiry_set\\\\|debug' | tail -20\")",
+      "Bash(wsl -e bash -c \"grep -n 'create_task\\\\|asyncio\\\\.create_task' '/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack/agents/orchestrator/main.py' | head -20\")",
+      "Bash(wsl -e bash -c \"grep -rn 'asyncio.create_task' '/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack/agents/' --include='*.py' | grep -v 'orchestrator' | grep 'on_startup\\\\|startup\\\\|watchdog\\\\|loop\\\\|worker'\")",
+      "Bash(wsl -e bash -c \"grep -n 'async def stop\\\\|on_shutdown\\\\|_running = False\\\\|_stop_event' '/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack/core/base_agent.py'\")",
+      "Bash(wsl -e bash -c \"cd '/mnt/c/Users/frigo/Documents/Coding Projects/agent-stack' && git diff --stat\")",
+      "Bash(wsl -e:*)",
+      "Bash(ls -la whatsapp-spotify-bot/)",
+      "Bash(ls -la workspace/tools/)",
+      "Bash(ls workspace/projects/)",
+      "Bash(ls workspace/src/)",
+      "Bash(ls workspace/repos/)",
+      "Bash(ls workspace/tools/)",
+      "Bash(python -c ':*)"
     ]
   }
 }

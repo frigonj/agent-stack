@@ -311,9 +311,15 @@ class OptimizerAgent(BaseAgent):
 
         # Launch watchdog loops — store references so they are not GC'd and
         # can be cancelled cleanly on shutdown.
-        self._stale_plan_watchdog_task = asyncio.create_task(self._stale_plan_watchdog_loop())
-        self._container_health_watchdog_task = asyncio.create_task(self._container_health_watchdog_loop())
-        self._llm_lock_watchdog_task = asyncio.create_task(self._llm_lock_watchdog_loop())
+        self._stale_plan_watchdog_task = asyncio.create_task(
+            self._stale_plan_watchdog_loop()
+        )
+        self._container_health_watchdog_task = asyncio.create_task(
+            self._container_health_watchdog_loop()
+        )
+        self._llm_lock_watchdog_task = asyncio.create_task(
+            self._llm_lock_watchdog_loop()
+        )
 
         # Run an initial perf pass shortly after startup (5 s delay so infra is ready)
         asyncio.get_event_loop().call_later(
