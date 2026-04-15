@@ -1075,8 +1075,8 @@ When context contains "User clarification:" after a proposal was made:
     async def on_startup(self) -> None:
         log.info("orchestrator.startup")
         self._eval_pipeline = EvalPipeline(memory=self.memory, bus=self.bus)
-        asyncio.create_task(self._step_timeout_watchdog_loop())
-        asyncio.create_task(self._task_worker_watchdog())
+        self._step_timeout_watchdog_task = asyncio.create_task(self._step_timeout_watchdog_loop())
+        self._task_worker_watchdog_task = asyncio.create_task(self._task_worker_watchdog())
         for name, desc, inv, tags in self._OWN_TOOLS:
             await self.memory.register_tool(
                 name, desc, "orchestrator", inv, tags, "orchestrator"
@@ -6182,6 +6182,48 @@ When context contains "User clarification:" after a proposal was made:
 
     async def on_shutdown(self) -> None:
         log.info("orchestrator.shutdown", active_plans=len(self._plans))
+
+        # Cancel background tasks (loops check _running so they exit cleanly,
+        # but cancel ensures they wake immediately rather than after their timeout).
+        for attr in ("_step_timeout_watchdog_task", "_task_worker_watchdog_task"):
+            task = getattr(self, attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        # Drain the in-memory task queue back to the Redis stream so pending
+        # tasks survive the restart and are re-processed on next startup.
+        drained = 0
+        while not self._task_queue.empty():
+            try:
+                task, task_id, discord_message_id = self._task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await self.bus.publish(
+                    Event(
+                        type=EventType.TASK_CREATED,
+                        source="orchestrator",
+                        task_id=task_id,
+                        payload={
+                            "task": task,
+                            "discord_message_id": discord_message_id or "",
+                        },
+                    ),
+                    target="orchestrator",
+                )
+                drained += 1
+            except Exception as exc:
+                log.warning(
+                    "orchestrator.shutdown_requeue_failed",
+                    task_id=task_id,
+                    error=str(exc),
+                )
+        if drained:
+            log.info("orchestrator.shutdown_requeued", count=drained)
 
 
 if __name__ == "__main__":

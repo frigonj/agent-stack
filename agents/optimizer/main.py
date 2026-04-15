@@ -309,10 +309,11 @@ class OptimizerAgent(BaseAgent):
         except Exception as exc:
             log.warning("optimizer.restore_failed", error=str(exc))
 
-        # Launch watchdog loops
-        asyncio.create_task(self._stale_plan_watchdog_loop())
-        asyncio.create_task(self._container_health_watchdog_loop())
-        asyncio.create_task(self._llm_lock_watchdog_loop())
+        # Launch watchdog loops — store references so they are not GC'd and
+        # can be cancelled cleanly on shutdown.
+        self._stale_plan_watchdog_task = asyncio.create_task(self._stale_plan_watchdog_loop())
+        self._container_health_watchdog_task = asyncio.create_task(self._container_health_watchdog_loop())
+        self._llm_lock_watchdog_task = asyncio.create_task(self._llm_lock_watchdog_loop())
 
         # Run an initial perf pass shortly after startup (5 s delay so infra is ready)
         asyncio.get_event_loop().call_later(
@@ -321,6 +322,18 @@ class OptimizerAgent(BaseAgent):
 
     async def on_shutdown(self) -> None:
         log.info("optimizer.shutdown")
+        for attr in (
+            "_stale_plan_watchdog_task",
+            "_container_health_watchdog_task",
+            "_llm_lock_watchdog_task",
+        ):
+            task = getattr(self, attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def think(self) -> None:
         """Periodic proactive perf run — called every think_interval seconds."""

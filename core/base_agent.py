@@ -188,8 +188,8 @@ class BaseAgent(ABC):
         if recovery.get("status") == "CRASH":
             log.warning("agent.crash_recovery", role=self.role, context=recovery)
 
-        await self.on_startup()
         self._running = True
+        await self.on_startup()
 
         # ACK any stale PEL entries from a previous crashed run so they don't
         # permanently block the think loop via _queue_is_idle()
