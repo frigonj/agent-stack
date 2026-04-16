@@ -2103,17 +2103,23 @@ When context contains "User clarification:" after a proposal was made:
         An agent couldn't proceed because it lacks information.
         Freeze the plan (same mechanics as task.paused) and forward the gap
         to Discord so the user can supply a source.
+
+        inline=True means the gap was raised from inside a live agent_loop
+        (ASK: action).  The agent is still running and will resume itself
+        once KNOWLEDGE_TEACH arrives — do NOT freeze or re-dispatch the plan.
         """
         task_id = event.payload.get("task_id") or event.task_id
         what = event.payload.get("what", "unknown")
         agent = event.payload.get("agent", event.source)
+        inline = event.payload.get("inline", False)
 
-        plan = self._plans.pop(task_id, None)
-        if plan is not None:
-            current_phase = plan.current_phase()
-            plan_dict = plan.to_dict()
-            plan_dict["paused_at_phase"] = current_phase
-            await self._persist_plan(plan, "knowledge_gap")
+        if not inline:
+            plan = self._plans.pop(task_id, None)
+            if plan is not None:
+                current_phase = plan.current_phase()
+                plan_dict = plan.to_dict()
+                plan_dict["paused_at_phase"] = current_phase
+                await self._persist_plan(plan, "knowledge_gap")
 
         await self.bus.publish(
             Event(
@@ -2319,15 +2325,29 @@ When context contains "User clarification:" after a proposal was made:
                 target="broadcast",
             )
 
-        # Reload and resume the frozen plan
-        await self._handle_task_resumed(
-            Event(
-                type=EventType.TASK_RESUMED,
-                source="orchestrator",
-                payload={"task_id": task_id},
-                task_id=task_id,
+        # Reload and resume the frozen plan — but only when the gap was raised
+        # by a plan-level failure (needs_user_input bypass).  When inline=True
+        # the gap came from a live agent_loop ASK: action; the agent resumes
+        # itself once KNOWLEDGE_TEACH arrives, so re-dispatching the plan here
+        # would create a duplicate run and an infinite ASK loop.
+        try:
+            gap_record = (
+                await self.memory.get_plan_by_task_id(task_id) if task_id else None
             )
+        except Exception:
+            gap_record = None
+        plan_was_frozen = (
+            gap_record is not None and gap_record.get("status") == "knowledge_gap"
         )
+        if plan_was_frozen:
+            await self._handle_task_resumed(
+                Event(
+                    type=EventType.TASK_RESUMED,
+                    source="orchestrator",
+                    payload={"task_id": task_id},
+                    task_id=task_id,
+                )
+            )
 
     # ── Task updated (user edited original Discord message) ───────────────────
 

@@ -881,11 +881,15 @@ class BaseAgent(ABC):
                     task_id = subtask_id or parent_task_id or self.role
                     try:
                         answer = await self.raise_knowledge_gap(
-                            what=payload.strip(), task_id=task_id
+                            what=payload.strip(), task_id=task_id, inline=True
                         )
                     except Exception as exc:
                         answer = f"(knowledge gap timed out or failed: {exc})"
-                    obs = f"User answered: {answer}" if answer else "(no answer received — proceed with best judgement)"
+                    obs = (
+                        f"User answered: {answer}"
+                        if answer
+                        else "(no answer received — proceed with best judgement)"
+                    )
                     await self.emit(
                         EventType.AGENT_TOOL_RESULT,
                         payload={"step": step, "action": "ASK", "output": obs[:200]},
@@ -1771,6 +1775,7 @@ class BaseAgent(ABC):
         what: str,
         task_id: str,
         timeout: float = 86400.0,
+        inline: bool = False,
     ) -> str:
         """
         Signal that this agent lacks information needed to proceed.
@@ -1779,6 +1784,11 @@ class BaseAgent(ABC):
         to #knowledge-gaps in Discord), then suspends until the user supplies
         a source via knowledge.teach.  Returns the source string the user
         provided (URL, workspace path, or inline text).
+
+        inline=True: the gap was raised from inside a live agent_loop (ASK:
+        action), so the orchestrator must NOT try to resume/re-dispatch the
+        plan — the agent is still running and will continue on its own once
+        the answer arrives.
 
         timeout: seconds to wait before giving up (default 24 h).
         """
@@ -1790,7 +1800,12 @@ class BaseAgent(ABC):
             Event(
                 type=EventType.KNOWLEDGE_GAP,
                 source=self.role,
-                payload={"what": what, "task_id": task_id, "agent": self.role},
+                payload={
+                    "what": what,
+                    "task_id": task_id,
+                    "agent": self.role,
+                    "inline": inline,
+                },
                 task_id=task_id,
             ),
             target="orchestrator",
