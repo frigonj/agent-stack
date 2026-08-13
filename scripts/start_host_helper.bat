@@ -36,7 +36,27 @@ if not defined WSL_SCRIPT (
     exit /b 1
 )
 
+:: Read RESTART_HELPER_TOKEN out of .env so it reaches the helper's
+:: environment — this process isn't launched via docker-compose, which is
+:: what normally injects .env values into the agent containers.
+set "RESTART_HELPER_TOKEN="
+if exist "%REPO_ROOT%\.env" (
+    for /f "usebackq tokens=1,* delims==" %%A in (`findstr /b "RESTART_HELPER_TOKEN=" "%REPO_ROOT%\.env"`) do (
+        set "RESTART_HELPER_TOKEN=%%B"
+    )
+)
+
+if not defined RESTART_HELPER_TOKEN (
+    echo [ERROR] RESTART_HELPER_TOKEN is not set in .env.
+    echo This server can restart containers and destroy Docker volumes, and it
+    echo listens on 0.0.0.0, so it refuses to start without a shared secret.
+    echo Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+    echo and set RESTART_HELPER_TOKEN in %REPO_ROOT%\.env
+    pause
+    exit /b 1
+)
+
 echo Starting host restart helper via WSL on port 7799...
-start "Agent Stack - Host Helper" /min wsl python3 "%WSL_SCRIPT%"
+start "Agent Stack - Host Helper" /min wsl RESTART_HELPER_TOKEN="%RESTART_HELPER_TOKEN%" python3 "%WSL_SCRIPT%"
 
 echo Host helper launched in background WSL window.

@@ -8,8 +8,15 @@ commands from Docker containers via host.docker.internal.
 Usage:
   python scripts/host_restart_helper.py
 
+Auth:
+  This server binds to 0.0.0.0 (Docker Desktop only reaches the host that
+  way), which also exposes it to anything else on the LAN. Every endpoint
+  except /health requires "Authorization: Bearer <RESTART_HELPER_TOKEN>",
+  matched against the RESTART_HELPER_TOKEN env var. The server refuses to
+  start if that env var is unset — see config/.env.example.
+
 Endpoints:
-  GET  /health              — liveness check
+  GET  /health              — liveness check (unauthenticated)
   GET  /status              — docker ps output
   POST /restart/<service>   — restart a service
   POST /relaunch/<mode>     — run scripts/relaunch.sh <mode> (non-interactive)
@@ -40,6 +47,7 @@ To start on Windows login: add to Task Scheduler or drop a .bat in
 
 from __future__ import annotations
 
+import hmac
 import http.server
 import json
 import logging
@@ -58,6 +66,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 PORT = int(os.environ.get("RESTART_HELPER_PORT", "7799"))
+
+# Shared secret required on every POST (Authorization: Bearer <token>). The
+# server binds to 0.0.0.0 so host.docker.internal can reach it from containers,
+# which also exposes it to the LAN — this token is the only auth boundary.
+RESTART_HELPER_TOKEN = os.environ.get("RESTART_HELPER_TOKEN", "")
+if not RESTART_HELPER_TOKEN:
+    log.error(
+        "RESTART_HELPER_TOKEN is not set. Refusing to start: this server can "
+        "restart containers and destroy Docker volumes, and it listens on "
+        "0.0.0.0. Set RESTART_HELPER_TOKEN in your .env (see config/.env.example)."
+    )
+    sys.exit(1)
 
 # Maps friendly service names → Docker container names
 CONTAINER_MAP: dict[str, str] = {
@@ -321,18 +341,31 @@ class RestartHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _is_authorized(self) -> bool:
+        auth = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not auth.startswith(prefix):
+            return False
+        return hmac.compare_digest(auth[len(prefix):], RESTART_HELPER_TOKEN)
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/")
         if path in ("", "/health"):
-            self._send_json(
-                200, {"ok": True, "service": "host_restart_helper", "port": PORT}
-            )
-        elif path == "/status":
+            # Liveness only — no service/container details for unauthenticated callers.
+            self._send_json(200, {"ok": True, "service": "host_restart_helper"})
+            return
+        if not self._is_authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        if path == "/status":
             self._send_json(200, _get_status())
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._is_authorized():
+            self._send_json(401, {"error": "unauthorized"})
+            return
         parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
         if len(parts) >= 2 and parts[0] == "restart":
             service = parts[1].lower()

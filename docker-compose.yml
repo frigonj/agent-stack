@@ -5,7 +5,10 @@ services:
     container_name: agent_redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Loopback-only: this has no auth (no requirepass) and holds the live
+      # event bus / agent memory — publishing it to 0.0.0.0 would let anyone
+      # on the LAN read/write it. Bind to the host for local debugging only.
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -36,7 +39,11 @@ services:
       - POSTGRES_PASSWORD=agent
       - POSTGRES_DB=agentmem
     ports:
-      - "5432:5432"
+      # Loopback-only: default agent:agent credentials — publishing this to
+      # 0.0.0.0 would make that a real, working credential from the LAN.
+      # Bind to the host for local debugging only; change POSTGRES_PASSWORD
+      # if you need this reachable from elsewhere.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -119,6 +126,7 @@ services:
       - DISCORD_VOTES_CHANNEL_ID=${DISCORD_VOTES_CHANNEL_ID:-}                 # Optional — #votes
       - DISCORD_APPROVALS_CHANNEL_ID=${DISCORD_APPROVALS_CHANNEL_ID:-}         # Optional — #approvals
       - CONTROL_HELPER_URL=${CONTROL_HELPER_URL:-http://host.docker.internal:7799}
+      - RESTART_HELPER_TOKEN=${RESTART_HELPER_TOKEN:-}
       - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}                                 # Optional — auto-detected from general channel
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:

@@ -818,6 +818,7 @@ class DiscordBridgeClient(discord.Client):
         knowledge_gap_channel_id: str | None = None,
         eval_queue_channel_id: str | None = None,
         control_helper_url: str = "http://host.docker.internal:7799",
+        restart_helper_token: str | None = None,
         guild_id: str | None = None,
         **kwargs,
     ):
@@ -855,6 +856,7 @@ class DiscordBridgeClient(discord.Client):
             eval_queue_channel_id  # #eval-queue — passive eval review requests
         )
         self.control_helper_url = control_helper_url.rstrip("/")
+        self.restart_helper_token = restart_helper_token
         self.guild_id = int(guild_id) if guild_id else None
         self.redis: aioredis.Redis | None = None
         # Active vote embeds: plan_id → discord.Message (for editing when votes arrive)
@@ -1585,9 +1587,14 @@ class DiscordBridgeClient(discord.Client):
     async def _call_helper(self, method: str, path: str) -> dict:
         """Call the host restart helper over HTTP using async httpx."""
         url = self.control_helper_url + path
+        headers = (
+            {"Authorization": f"Bearer {self.restart_helper_token}"}
+            if self.restart_helper_token
+            else {}
+        )
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.request(method, url)
+                r = await client.request(method, url, headers=headers)
                 return r.json()
         except Exception as e:
             return {"ok": False, "message": str(e)}
@@ -2896,6 +2903,7 @@ def main() -> None:
     control_helper_url = os.environ.get(
         "CONTROL_HELPER_URL", "http://host.docker.internal:7799"
     )
+    restart_helper_token = os.environ.get("RESTART_HELPER_TOKEN")
     guild_id = os.environ.get("DISCORD_GUILD_ID")  # Optional — auto-detected if absent
 
     intents = discord.Intents.default()
@@ -2920,6 +2928,7 @@ def main() -> None:
         knowledge_gap_channel_id=knowledge_gap_channel_id,
         eval_queue_channel_id=eval_queue_channel_id,
         control_helper_url=control_helper_url,
+        restart_helper_token=restart_helper_token,
         guild_id=guild_id,
         intents=intents,
     )
