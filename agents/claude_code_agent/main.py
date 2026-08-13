@@ -228,7 +228,20 @@ async def _list_dir(path: str) -> str:
         return f"Error listing {path}: {e}"
 
 
+# Hard denylist for the most unambiguously destructive patterns, matching
+# agents/executor/main.py's _DANGEROUS check. This agent has no Discord
+# approval gate (unlike executor's REQUIRES_APPROVAL tier) — its tool-use
+# loop runs whatever the LLM decides, so a prompt injection reaching this
+# agent (task text, an ingested document, a Discord message it's asked to
+# act on) could otherwise trigger one of these with no human in the loop.
+_DANGEROUS_SHELL_PATTERNS = ("rm -rf /", "mkfs", "dd if=", ":(){:|:&};:", "chmod 777 /")
+
+
 async def _run_shell(command: str, timeout_seconds: int = 30) -> str:
+    lowered = command.lower()
+    for pattern in _DANGEROUS_SHELL_PATTERNS:
+        if pattern in lowered:
+            return f"Error: refusing to run — matches blocked pattern {pattern!r}"
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
