@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import html.parser
+import ipaddress
 import json
 import os
 import re
+import socket
 import uuid
 from typing import Optional
 from urllib.parse import urlparse
@@ -244,6 +246,33 @@ def _domain(url: str) -> str:
 
 _FETCH_MAX_CHARS = 12_000  # ~3k tokens — enough for a doc page without blowing context
 _FETCH_TIMEOUT = 20.0
+_FETCH_MAX_REDIRECTS = 5
+
+
+class _SSRFBlocked(Exception):
+    """Raised when a fetch target resolves to a private/internal address."""
+
+
+def _assert_public_host(url: str) -> None:
+    """
+    Reject URLs whose host resolves to a private, loopback, link-local, or
+    otherwise non-global address. This is user-triggerable (Discord
+    'fetch-and-learn' / knowledge-gap replies pass arbitrary URLs here), and
+    the research container sits on the same Docker network as redis, postgres,
+    and the host-reachable LM Studio / host_restart_helper ports — without this
+    check, a submitted URL could probe or fetch from those internal services.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        raise _SSRFBlocked(f"no host in URL: {url!r}")
+    try:
+        addrs = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror as exc:
+        raise _SSRFBlocked(f"could not resolve host {host!r}: {exc}") from None
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
+        if not ip.is_global:
+            raise _SSRFBlocked(f"{host!r} resolves to non-public address {addr}")
 
 
 class _TagStripper(html.parser.HTMLParser):
@@ -289,19 +318,33 @@ async def _fetch_url(url: str) -> str:
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
     }
     try:
+        # Re-validate on every hop: httpx's own follow_redirects would only
+        # check the original URL, letting a public URL redirect into an
+        # internal address after the check above already passed.
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=_FETCH_TIMEOUT
+            follow_redirects=False, timeout=_FETCH_TIMEOUT
         ) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
-            if "html" in content_type:
-                stripper = _TagStripper()
-                stripper.feed(resp.text)
-                text = stripper.get_text()
-            else:
-                text = resp.text
-            return text[:_FETCH_MAX_CHARS]
+            current_url = url
+            for _ in range(_FETCH_MAX_REDIRECTS + 1):
+                _assert_public_host(current_url)
+                resp = await client.get(current_url, headers=headers)
+                if resp.has_redirect_location:
+                    current_url = str(
+                        resp.url.join(resp.headers["Location"])
+                    )
+                    continue
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "")
+                if "html" in content_type:
+                    stripper = _TagStripper()
+                    stripper.feed(resp.text)
+                    text = stripper.get_text()
+                else:
+                    text = resp.text
+                return text[:_FETCH_MAX_CHARS]
+            return "[fetch error: too many redirects]"
+    except _SSRFBlocked as exc:
+        return f"[fetch blocked: {exc}]"
     except Exception as exc:
         return f"[fetch error: {exc}]"
 
